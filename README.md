@@ -46,8 +46,8 @@ Agents primarily rely on visual data from their colour and depth cameras.
 They also process vector observations, like IMU and motor feedback.
 
 <p align="center">
-<img src="data/img_rgbcam_05.png" width="49%">
-<img src="data/img_depcam_05.png" width="49%">
+<img src="data/img_rgbcam_00.png" width="49%">
+<img src="data/img_depcam_00.png" width="49%">
 </p>
 
 
