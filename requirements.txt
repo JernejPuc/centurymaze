@@ -1,0 +1,7 @@
+pillow
+numpy
+scipy
+numba
+torch >= 2.0
+tensorboard
+isaacgym

@@ -1,0 +1,341 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot name="tbot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- CONSTANTS -->
+  <xacro:property name="PI" value="3.1415926535"/>
+
+  <!-- DIMENSIONS -->
+  <xacro:property name="DIM_SCALE" value="10"/>
+  <xacro:property name="BDY_X" value="${0.03 * DIM_SCALE}"/>
+  <xacro:property name="BDY_Y" value="${0.03 * DIM_SCALE}"/>
+  <xacro:property name="BDY_Z" value="${0.01 * DIM_SCALE}"/>
+  <xacro:property name="WHL_RAD" value="${0.0055 * DIM_SCALE}"/>
+  <xacro:property name="WHL_W" value="${0.004 * DIM_SCALE}"/>
+  <xacro:property name="DOT_LEN" value="${WHL_RAD / 5}"/>
+  <xacro:property name="DOT_OUT" value="${WHL_W / 10}"/>
+  <xacro:property name="MOT_RAD" value="${0.004 * DIM_SCALE}"/>
+  <xacro:property name="MOT_RAI" value="${WHL_RAD + DOT_OUT}"/>
+  <xacro:property name="MOT_LEN" value="${BDY_Y - WHL_W*2 - DOT_OUT*2}"/>
+  <xacro:property name="MOT_DIAM" value="${2*MOT_RAD}"/>
+  <xacro:property name="MOT_FUS_X" value="${BDY_X - MOT_DIAM}"/>
+  <xacro:property name="BRD_X" value="${MOT_RAD*3}"/>
+  <xacro:property name="BRD_Y" value="${BDY_Y - WHL_W}"/>
+  <xacro:property name="BRD_Z" value="${0.007 * DIM_SCALE}"/>
+  <xacro:property name="CAM_X" value="${MOT_RAD/2}"/>
+  <xacro:property name="CAM_Y" value="${0.006 * DIM_SCALE}"/>
+  <xacro:property name="CAM_Z" value="${CAM_Y}"/>
+
+  <!-- PROPERTIES -->
+  <xacro:property name="M_SCALE" value="150"/>
+  <xacro:property name="BDY_M" value="${0.02 * M_SCALE}"/>
+  <xacro:property name="MOT_FUS_M" value="${0.02 * M_SCALE}"/>
+  <xacro:property name="WHL_M" value="${0.005 * M_SCALE}"/>
+  <xacro:property name="BRD_M" value="${0.0015 * M_SCALE}"/>
+  <xacro:property name="CAM_M" value="${0.001 * M_SCALE}"/>
+  <xacro:property name="MOT_DAMP" value="0.0"/>
+  <xacro:property name="MOT_FRICT" value="0.0"/>
+
+  <!-- INERTIAE -->
+  <xacro:macro name="box_inertia" params="mass x y z">
+    <inertia ixx="${mass*(y*y + z*z)/12}" ixy = "0.0" ixz = "0.0" iyy="${mass*(x*x + z*z)/12}" iyz = "0.0" izz="${mass*(x*x + y*y)/12}"/>
+  </xacro:macro>
+
+  <xacro:macro name="cylinder_inertia" params="mass rad len">
+    <inertia ixx="${mass*(3*rad*rad + len*len)/12}" ixy = "0.0" ixz = "0.0" iyy="${mass*(3*rad*rad + len*len)/12}" iyz = "0.0" izz="${mass*rad*rad/2}"/>
+  </xacro:macro>
+
+  <!-- COLOURS -->
+  <material name="black">
+    <color rgba="0.0 0.0 0.0 1.0"/>
+  </material>
+  <material name="white">
+    <color rgba="1.0 1.0 1.0 1.0"/>
+  </material>
+
+  <material name="darkgrey">
+    <color rgba="0.1 0.1 0.1 1.0"/>
+  </material>
+  <material name="grey">
+    <color rgba="0.3 0.3 0.3 1.0"/>
+  </material>
+  <material name="midgrey">
+    <color rgba="0.5 0.5 0.5 1.0"/>
+  </material>
+  <material name="lightgrey">
+    <color rgba="0.8 0.8 0.8 1.0"/>
+  </material>
+
+  <material name="blue">
+    <color rgba="0.2 0.2 0.8 1.0"/>
+  </material>
+  <material name="green">
+    <color rgba="0.0 0.8 0.0 1.0"/>
+  </material>
+  <material name="red">
+    <color rgba="0.8 0.1 0.1 1.0"/>
+  </material>
+
+  <material name="yellow">
+    <color rgba="0.8 0.8 0.0 1.0"/>
+  </material>
+  <material name="orange">
+    <color rgba="0.9 0.4 0.0 1.0"/>
+  </material>
+  <material name="brown">
+    <color rgba="0.9 0.8 0.7 1.0"/>
+  </material>
+
+  <!-- PARTS -->
+  <link name="body">
+    <inertial>
+      <mass value="${BDY_M}"/>
+      <origin rpy="0 0 0" xyz="0 0 ${(MOT_RAD + BDY_Z)/2 + WHL_RAD}"/>
+      <xacro:box_inertia mass="${BDY_M}" x="${BDY_X}" y="${BDY_Y}" z="${BDY_Z + MOT_RAI}"/>
+    </inertial>
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 ${BDY_Z/2 + MOT_RAI + WHL_RAD}"/>
+      <geometry>
+        <box size="${BDY_X} ${BDY_Y} ${BDY_Z}"/>
+      </geometry>
+    <material name="orange"/>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 ${BDY_Z/2 + MOT_RAI + WHL_RAD}"/>
+      <geometry>
+        <box size="${BDY_X} ${BDY_Y} ${BDY_Z}"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="motors_fused">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 ${-MOT_RAD}"/>
+      <geometry>
+        <box size="${MOT_FUS_X} ${MOT_LEN} ${MOT_DIAM}"/>
+      </geometry>
+    <material name="grey"/>
+    </visual>
+  </link>
+
+ <link name="board">
+    <visual>
+      <origin rpy="0 0 0" xyz="$0 0 ${BRD_Z/2}"/>
+      <geometry>
+        <box size="${BRD_X} ${BRD_Y} ${BRD_Z}"/>
+      </geometry>
+    <material name="lightgrey"/>
+    </visual>
+  </link>
+
+ <link name="sensor">
+    <visual>
+      <origin rpy="0 0 0" xyz="${CAM_X/2} 0 0"/>
+      <geometry>
+        <box size="${CAM_X} ${CAM_Y} ${CAM_Z}"/>
+      </geometry>
+    <material name="midgrey"/>
+    </visual>
+  </link>
+
+  <link name="wheel_1_left">
+  <inertial>
+    <mass value="${WHL_M}"/>
+    <origin rpy="${PI/2} 0 0" xyz="0 ${WHL_W/2} 0.0"/>
+    <xacro:cylinder_inertia mass="${WHL_M}" rad="${WHL_RAD}" len="${WHL_W}"/>
+  </inertial>
+  <visual>
+    <origin rpy="${PI/2} 0 0" xyz="0 ${WHL_W/2} 0.0"/>
+    <geometry>
+      <cylinder radius="${WHL_RAD}" length="${WHL_W}"/>
+    </geometry>
+    <material name="lightgrey"/>
+  </visual>
+  <collision>
+    <origin rpy="${PI/2} 0 0" xyz="0 ${WHL_W/2} 0.0"/>
+    <geometry>
+      <cylinder radius="${WHL_RAD}" length="${WHL_W}" />
+    </geometry>
+  </collision>
+  </link>
+
+  <link name="wheel_2_right">
+  <inertial>
+    <mass value="${WHL_M}"/>
+    <origin rpy="${PI/2} 0 0" xyz="0 ${-WHL_W/2} 0.0"/>
+    <xacro:cylinder_inertia mass="${WHL_M}" rad="${WHL_RAD}" len="${WHL_W}"/>
+  </inertial>
+  <visual>
+    <origin rpy="${PI/2} 0 0" xyz="0 ${-WHL_W/2} 0.0"/>
+    <geometry>
+      <cylinder radius="${WHL_RAD}" length="${WHL_W}"/>
+    </geometry>
+    <material name="lightgrey"/>
+  </visual>
+  <collision>
+    <origin rpy="${PI/2} 0 0" xyz="0 ${-WHL_W/2} 0.0"/>
+    <geometry>
+      <cylinder radius="${WHL_RAD}" length="${WHL_W}"/>
+    </geometry>
+  </collision>
+  </link>
+
+  <link name="wheel_3_left">
+  <inertial>
+    <mass value="${WHL_M}"/>
+    <origin rpy="${PI/2} 0 0" xyz="0 ${WHL_W/2} 0.0"/>
+    <xacro:cylinder_inertia mass="${WHL_M}" rad="${WHL_RAD}" len="${WHL_W}"/>
+  </inertial>
+  <visual>
+    <origin rpy="${PI/2} 0 0" xyz="0 ${WHL_W/2} 0.0"/>
+    <geometry>
+      <cylinder radius="${WHL_RAD}" length="${WHL_W}"/>
+    </geometry>
+    <material name="lightgrey"/>
+  </visual>
+  <collision>
+    <origin rpy="${PI/2} 0 0" xyz="0 ${WHL_W/2} 0.0"/>
+    <geometry>
+      <cylinder radius="${WHL_RAD}" length="${WHL_W}"/>
+    </geometry>
+  </collision>
+  </link>
+
+  <link name="wheel_4_right">
+  <inertial>
+    <mass value="${WHL_M}"/>
+    <origin rpy="${PI/2} 0 0" xyz="0 ${-WHL_W/2} 0.0"/>
+    <xacro:cylinder_inertia mass="${WHL_M}" rad="${WHL_RAD}" len="${WHL_W}"/>
+  </inertial>
+  <visual>
+    <origin rpy="${PI/2} 0 0" xyz="0 ${-WHL_W/2} 0.0"/>
+    <geometry>
+      <cylinder radius="${WHL_RAD}" length="${WHL_W}"/>
+    </geometry>
+    <material name="lightgrey"/>
+  </visual>
+  <collision>
+    <origin rpy="${PI/2} 0 0" xyz="0 ${-WHL_W/2} 0.0"/>
+    <geometry>
+      <cylinder radius="${WHL_RAD}" length="${WHL_W}"/>
+    </geometry>
+  </collision>
+  </link>
+
+  <!-- INDICATORS -->
+  <link name="rotdot_1_left">
+  <visual>
+    <origin rpy="${PI/2} 0 0" xyz="0 ${DOT_OUT/2} 0"/>
+    <geometry>
+      <box size="${DOT_LEN} ${DOT_LEN} ${DOT_OUT}"/>
+    </geometry>
+    <material name="midgrey"/>
+  </visual>
+  </link>
+
+  <link name="rotdot_2_right">
+  <visual>
+    <origin rpy="${PI/2} 0 0" xyz="0 ${-DOT_OUT/2} 0"/>
+    <geometry>
+      <box size="${DOT_LEN} ${DOT_LEN} ${DOT_OUT}"/>
+    </geometry>
+    <material name="midgrey"/>
+  </visual>
+  </link>
+
+  <link name="rotdot_3_left">
+  <visual>
+    <origin rpy="${PI/2} 0 0" xyz="0 ${DOT_OUT/2} 0"/>
+    <geometry>
+      <box size="${DOT_LEN} ${DOT_LEN} ${DOT_OUT}"/>
+    </geometry>
+    <material name="midgrey"/>
+  </visual>
+  </link>
+
+  <link name="rotdot_4_right">
+  <visual>
+    <origin rpy="${PI/2} 0 0" xyz="$0 ${-DOT_OUT/2} 0"/>
+    <geometry>
+      <box size="${DOT_LEN} ${DOT_LEN} ${DOT_OUT}"/>
+    </geometry>
+    <material name="midgrey"/>
+  </visual>
+  </link>
+
+  <!-- FUSIONS -->
+  <joint name="body_motors_glue" type="fixed">
+    <parent link="body"/>
+    <child link="motors_fused"/>
+    <origin xyz="0.0 0.0 ${MOT_RAI + WHL_RAD}"/>
+  </joint>
+
+  <joint name="body_board_glue" type="fixed">
+    <parent link="body"/>
+    <child link="board"/>
+    <origin xyz="${BDY_X/2 - BRD_X/2 - CAM_X - DOT_OUT} 0 ${BDY_Z + MOT_RAI+ WHL_RAD}"/>
+  </joint>
+
+  <joint name="board_sensor_glue" type="fixed">
+    <parent link="board"/>
+    <child link="sensor"/>
+    <origin xyz="${BRD_X/2} 0 ${CAM_Z/2}"/>
+  </joint>
+
+  <joint name="wheel_rotdot_1_glue" type="fixed">
+    <parent link="wheel_1_left"/>
+    <child link="rotdot_1_left"/>
+    <origin xyz="0 ${WHL_W} 0"/>
+  </joint>
+
+  <joint name="wheel_rotdot_2_glue" type="fixed">
+    <parent link="wheel_2_right"/>
+    <child link="rotdot_2_right"/>
+    <origin xyz="0 ${-WHL_W} 0"/>
+  </joint>
+
+  <joint name="wheel_rotdot_3_glue" type="fixed">
+    <parent link="wheel_3_left"/>
+    <child link="rotdot_3_left"/>
+    <origin xyz="0 ${WHL_W} 0"/>
+  </joint>
+
+  <joint name="wheel_rotdot_4_glue" type="fixed">
+    <parent link="wheel_4_right"/>
+    <child link="rotdot_4_right"/>
+    <origin xyz="0 ${-WHL_W} 0"/>
+  </joint>
+
+  <!-- JOINTS -->
+  <joint name="wheel_1_axis" type="continuous">
+    <parent link="body"/>
+    <child link="wheel_1_left"/>
+    <origin xyz="${2*MOT_RAD} ${MOT_LEN/2} ${WHL_RAD}" rpy="0 0 0" />
+    <axis xyz="0 1 0" rpy="0 0 0" />
+    <dynamics damping="${MOT_DAMP}" friction="${MOT_FRICT}" />
+  </joint>
+
+  <joint name="wheel_2_axis" type="continuous">
+    <parent link="body"/>
+    <child link="wheel_2_right"/>
+    <origin xyz="${2*MOT_RAD} ${-MOT_LEN/2} ${WHL_RAD}" rpy="0 0 0" />
+    <axis xyz="0 1 0" rpy="0 0 0" />
+    <dynamics damping="${MOT_DAMP}" friction="${MOT_FRICT}" />
+  </joint>
+
+  <joint name="wheel_3_axis" type="continuous">
+    <parent link="body"/>
+    <child link="wheel_3_left"/>
+    <origin xyz="${-2*MOT_RAD} ${MOT_LEN/2} ${WHL_RAD}" rpy="0 0 0" />
+    <axis xyz="0 1 0" rpy="0 0 0" />
+    <dynamics damping="${MOT_DAMP}" friction="${MOT_FRICT}" />
+  </joint>
+
+  <joint name="wheel_4_axis" type="continuous">
+    <parent link="body"/>
+    <child link="wheel_4_right"/>
+    <origin xyz="${-2*MOT_RAD} ${-MOT_LEN/2} ${WHL_RAD}" rpy="0 0 0" />
+    <axis xyz="0 1 0" rpy="0 0 0" />
+    <dynamics damping="${MOT_DAMP}" friction="${MOT_FRICT}" />
+  </joint>
+
+</robot>
