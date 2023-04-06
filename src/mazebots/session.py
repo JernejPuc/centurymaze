@@ -12,14 +12,16 @@ from isaacgym import gymapi, gymtorch, gymutil
 import torch
 from torch import Tensor
 
+from discit.optim import NAdamW, SoftConstLRScheduler
+from discit.rl import PPG
+from discit.track import CheckpointTracker
+
 import config as cfg
 import maze
 from model import ActorCritic
-from train import PPG
 from accel import OpAccelerator, SessionTensorSignature, SCALE_TIME
 from utils import eval_line_of_sight, get_available_file_idx
 from utils_torch import adjust_depth_range, apply_quat_rot, get_eulz_from_quat
-from utils_train import CheckpointTracker, NAdamW, SoftConstLRScheduler
 
 
 class Interface:

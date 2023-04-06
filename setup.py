@@ -10,7 +10,7 @@ with open(os.path.join(os.path.dirname(__file__), 'requirements.txt'), 'r') as r
 
 setup(
     name='mazebots',
-    version='0.1.0',
+    version='0.1.1',
     description='MazeBots: Multi-robot maze navigation',
     long_description=readme,
     long_description_content_type='text/markdown',
@@ -27,13 +27,11 @@ setup(
         'Topic :: Scientific/Engineering :: Artificial Intelligence',
         'Operating System :: POSIX :: Linux',
         'Programming Language :: Python :: 3 :: Only',
-        'Programming Language :: Python :: 3.8'
-    ],
+        'Programming Language :: Python :: 3.8'],
     platforms=['Linux'],
     packages=['mazebots'],
-    package_dir={'mazebots': 'src/mazebots'},
+    package_dir={'': 'src'},
     package_data={'mazebots': ['assets/*.urdf']},
     python_requires='==3.8.*',
     install_requires=requirements,
-    zip_safe=False
-)
+    zip_safe=False)

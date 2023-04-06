@@ -128,14 +128,18 @@ Setup will check for the following packages:
 - `numba`: accelerating standard Python,
 - `torch >= 2.0`: main processing and AI integration with CUDA graphs,
 - `tensorboard`: tracking training progress,
-- `isaacgym`: physics and rendering.
+- `isaacgym`: physics and rendering,
+- `discit`: accelerated reinforcement learning.
 
 If you already have Python 3.8 on your system, most of these packages should have
 their dependencies handled normally during setup, but it is strongly advised
-that PyTorch and Isaac Gym are installed separately beforehand.
+that PyTorch, Isaac Gym, and Discit are installed separately beforehand.
 
 See the [PyTorch instructions](https://pytorch.org/get-started/locally/)
 and ensure that the installation targets your CUDA device.
+
+Discit is a related repository, branched off from this project for more
+general use. See it [here](https://github.com/JernejPuc/discit#installation).
 
 [Isaac Gym](https://developer.nvidia.com/isaac-gym), on the other hand,
 is not open-source and requires you to sign up for an NVIDIA account

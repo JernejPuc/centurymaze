@@ -1,17 +1,20 @@
-from abc import ABC, abstractmethod
+"""MazeBots AI"""
 
 import torch
 from torch import nn, Tensor
 from torch.nn import Module
 from torch.nn.functional import scaled_dot_product_attention
 
+from discit.distr import IndepNormal, OnlyMean
+from discit.func import symexp
+from discit.rl import ActorCriticTemplate
+
 import config as cfg
-from utils_torch import ActionDistrTemplate, ValueDistrTemplate, DiagNormal, InterpDiscrete
 
 
 VISENC_SIZE = 192
 RNNMEM_SIZE = 256
-CRITIC_VALS = 256
+CRITIC_VALS = 1
 
 
 class VisEncoder(Module):
@@ -392,65 +395,6 @@ class Valuator(Module):
         return x, mem
 
 
-class ActorCriticTemplate(Module, ABC):
-    MODE_LEARNER = 0
-    MODE_COLLECTOR = 1
-    MODE_ACTOR = 2
-    MODE_CRITIC = 3
-
-    def __init__(self):
-        Module.__init__(self)
-
-        self.fwd_map = (self.fwd_learner, self.fwd_collector, self.fwd_actor, self.fwd_critic)
-
-    @abstractmethod
-    def init_mem(self, batch_size: int, detach: bool) -> 'tuple[Tensor, ...]':
-        raise NotImplementedError
-
-    @abstractmethod
-    def reset_mem(self, mem: 'tuple[Tensor, ...]', reset_mask: Tensor, keep_mask: Tensor) -> 'tuple[Tensor, ...]':
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_distr(self, args: 'tuple[Tensor, ...]') -> ActionDistrTemplate:
-        raise NotImplementedError
-
-    @abstractmethod
-    def fwd_actor(
-        self,
-        obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[Tensor, tuple[Tensor, ...]]':
-        raise NotImplementedError
-
-    @abstractmethod
-    def fwd_critic(
-        self,
-        obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[Tensor, tuple[Tensor, ...]]':
-        raise NotImplementedError
-
-    @abstractmethod
-    def fwd_collector(
-        self,
-        obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[tuple[Tensor, ...], ActionDistrTemplate, Tensor, Tensor, tuple[Tensor, ...]]':
-        raise NotImplementedError
-
-    @abstractmethod
-    def fwd_learner(
-        self,
-        obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[ActionDistrTemplate, ValueDistrTemplate, tuple[Tensor, ...]]':
-        raise NotImplementedError
-
-    def forward(self, obs: 'tuple[Tensor, ...]', mem: 'tuple[Tensor, ...]', mode: int = MODE_LEARNER):
-        return self.fwd_map[mode](obs, mem)
-
-
 class ActorCritic(ActorCriticTemplate):
     """Wrapper around the visual encoder, policy, and valuator networks."""
 
@@ -469,8 +413,6 @@ class ActorCritic(ActorCriticTemplate):
         self.visencoder = VisEncoder()
         self.policy = Policy(communicating, guided)
         self.valuator = Valuator(n_agents_per_env)
-
-        self.values = nn.Parameter(torch.arange(CRITIC_VALS, dtype=torch.float32), requires_grad=False)
 
         for param in self.visencoder.parameters():
             param.requires_grad = False
@@ -500,8 +442,8 @@ class ActorCritic(ActorCriticTemplate):
 
         return memp, memv
 
-    def get_distr(self, args: 'tuple[Tensor, ...]') -> DiagNormal:
-        return DiagNormal(*args, pseudo=False)
+    def get_distr(self, args: 'tuple[Tensor, ...]') -> IndepNormal:
+        return IndepNormal(*args, pseudo=False)
 
     def fwd_partial(
         self,
@@ -519,7 +461,7 @@ class ActorCritic(ActorCriticTemplate):
             x, memp = self.policy(obs_vec, obs_aux, memp)
             v, memv = self.valuator(memp, obs_aux, memv)
 
-            val_mean = InterpDiscrete(v, self.values, values_as_indices=True).mean().flatten()
+            val_mean = OnlyMean(symexp(v)).mean.flatten()
 
         return x, val_mean, obs_vec, obs_aux, memp, memv
 
@@ -548,7 +490,7 @@ class ActorCritic(ActorCriticTemplate):
     ) -> 'tuple[Tensor, tuple[Tensor, ...]]':
 
         x = self.fwd_partial_actor(*obs, *mem)
-        act = DiagNormal(*x.split(self.act_out_sizes, dim=1), pseudo=True)
+        act = IndepNormal(*x.split(self.act_out_sizes, dim=1), pseudo=True)
 
         return act.sample() if self.prob_actor else act.loc, mem
 
@@ -570,7 +512,7 @@ class ActorCritic(ActorCriticTemplate):
 
         x, val_mean, obs_vec, obs_aux, memp, memv = self.fwd_partial(*obs, *mem)
 
-        act = DiagNormal(*x.split(self.act_out_sizes, dim=1), pseudo=True)
+        act = IndepNormal(*x.split(self.act_out_sizes, dim=1), pseudo=True)
         act_args = (act.loc, act.scale, act.sample())
 
         return act_args, val_mean, (obs_vec, obs_aux), (memp, memv)
@@ -579,7 +521,7 @@ class ActorCritic(ActorCriticTemplate):
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[DiagNormal, InterpDiscrete, tuple[Tensor, ...]]':
+    ) -> 'tuple[IndepNormal, OnlyMean, tuple[Tensor, ...]]':
 
         obs_vec, obs_aux = obs
         memp, memv = mem
@@ -587,7 +529,7 @@ class ActorCritic(ActorCriticTemplate):
         x, memp = self.policy(obs_vec, obs_aux, memp)
         v, memv = self.valuator(memp, obs_aux, memv)
 
-        act = DiagNormal(*x.split(self.act_out_sizes, dim=1), pseudo=True)
-        val = InterpDiscrete(v, self.values, values_as_indices=True)
+        act = IndepNormal(*x.split(self.act_out_sizes, dim=1), pseudo=True)
+        val = OnlyMean(symexp(v))
 
         return act, val, (memp, memv)

@@ -10,10 +10,13 @@ from torch import Tensor
 from torch.nn import functional
 from torch.utils.tensorboard import SummaryWriter
 
-from accel import build_graph
+from discit.accel import capture_graph
+from discit.data import LoadedDataset, SideLoadingDataset
+from discit.optim import NAdamW, SoftConstLRScheduler
+from discit.track import CheckpointTracker
+
 from config import DATA_DIR, LOG_DIR, N_SEG_CLASSES
 from model import VisNet
-from utils_train import CheckpointTracker, LoadedDataset, SideLoadingDataset, NAdamW, SoftConstLRScheduler
 
 
 class Trainer:
@@ -89,7 +92,7 @@ class Trainer:
             # Capture computational graph
             self.optimiser.zero_grad(set_to_none=True)
 
-            self.update, self.graph = build_graph(
+            self.update, self.graph = capture_graph(
                 self.update,
                 ref_batches[3].clone(),
                 warmup_tensor_list=(),

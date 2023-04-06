@@ -5,3 +5,4 @@ numba
 torch >= 2.0
 tensorboard
 isaacgym
+discit
