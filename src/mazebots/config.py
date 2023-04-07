@@ -78,3 +78,6 @@ N_EPOCHS_MAP = {k: tv[-1] // SECONDS_PER_EPOCH for k, tv in TIME_MILESTONE_MAP.i
 UPDATE_MILESTONE_MAP = {
     k: tuple([v * N_UPDATES_PER_EPOCH // SECONDS_PER_EPOCH for v in tv])
     for k, tv in TIME_MILESTONE_MAP.items()}
+
+LR_MILESTONE_MAP = {
+    1: [1e-4, 1e-3, 1e-6]}

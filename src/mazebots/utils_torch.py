@@ -3,18 +3,19 @@
 import torch
 from torch import Tensor
 
-# Truncated 1/x characteristic (1 at 0, 0 at max distance)
-# Lower K corresponds to steeper slope, i.e. higher sensitivity in close range
-MAX_DIST = 128.
-DIST_NORM_K = 2
-DIST_NORM_ADD = DIST_NORM_K
-DIST_NORM_SUB = DIST_NORM_K/MAX_DIST
-DIST_NORM_MUL = (MAX_DIST+DIST_NORM_ADD)*DIST_NORM_SUB
 
+def norm_depth_range(dep: Tensor, max_dep: float = 128., slope: float = 0.5) -> Tensor:
+    """
+    Truncated 1/x characteristic (1 at 0, 0 at max distance).
+    Lower K corresponds to steeper slope, i.e. higher sensitivity in close range.
+    """
 
-def adjust_depth_range(dep: Tensor):
-    dep = torch.clamp(dep, 0., MAX_DIST)
-    dep = DIST_NORM_MUL / (dep + DIST_NORM_ADD) - DIST_NORM_SUB
+    add_term = 1. / slope
+    sub_term = add_term / max_dep
+    mul_term = (max_dep + add_term) * sub_term
+
+    dep = torch.clamp(dep, 0., max_dep)
+    dep = mul_term / (dep + add_term) - sub_term
 
     return dep
 
