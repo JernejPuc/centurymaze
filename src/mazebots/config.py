@@ -48,7 +48,7 @@ LOG_DIR = 'runs'    # Tracked scalars
 STEPS_PER_SECOND = 4
 N_TRUNCATED_STEPS = STEPS_PER_SECOND * 4
 N_ROLLOUT_STEPS = 256
-N_ROLLOUTS_PER_EPOCH = 8
+N_ROLLOUTS_PER_EPOCH = 2
 N_AUX_ITERS_PER_EPOCH = 6
 SECONDS_PER_EPOCH = N_ROLLOUT_STEPS * N_ROLLOUTS_PER_EPOCH // STEPS_PER_SECOND
 
@@ -57,8 +57,8 @@ N_UPDATES_PER_EPOCH = (
     N_ROLLOUT_STEPS // N_TRUNCATED_STEPS * N_ROLLOUTS_PER_EPOCH
     + N_ROLLOUT_STEPS * N_ROLLOUTS_PER_EPOCH // N_TRUNCATED_STEPS * N_AUX_ITERS_PER_EPOCH)
 
-# Approx. 1 plot point per 10 virtual minutes, 8 per hour, 192 per day, 1344 per week
-LOG_EPOCH_INTERVAL = 10 * 60 // SECONDS_PER_EPOCH
+# Approx. 1 plot point per 2 virtual minutes, 28 per hour, 675 per day, 4725 per week
+LOG_EPOCH_INTERVAL = max(1, 2 * 60 // SECONDS_PER_EPOCH)
 
 # Approx. 1 checkpoint per half virtual hour, 48 per day, 336 per week
 CKPT_EPOCH_INTERVAL = 30 * 60 // SECONDS_PER_EPOCH
@@ -68,10 +68,10 @@ BRANCH_EPOCH_INTERVAL = 120 * 60 // SECONDS_PER_EPOCH
 
 # TODO: Adjust wrt. trials
 TIME_MILESTONE_MAP = {
-    # Approx. half virtual hour to warm up, half day to train, half day to cool down, 1 day total
-    1: (1800, 12 * 3600, 24 * 3600),
-    # Approx. 1 virtual hour to warm up, 5 days to train, 2 days to cool down, 1 week total
-    4: (3600, 5 * 24 * 3600, 7 * 24 * 3600)}
+    # Approx. 2 virtual minutes to warm up, half day to train, half day to cool down, 1 day total
+    1: (120, 12 * 3600, 24 * 3600),
+    # Approx. half virtual hour to warm up, 5 days to train, 2 days to cool down, 1 week total
+    4: (1800, 5 * 24 * 3600, 7 * 24 * 3600)}
 
 N_EPOCHS_MAP = {k: tv[-1] // SECONDS_PER_EPOCH for k, tv in TIME_MILESTONE_MAP.items()}
 
@@ -79,5 +79,4 @@ UPDATE_MILESTONE_MAP = {
     k: tuple([v * N_UPDATES_PER_EPOCH // SECONDS_PER_EPOCH for v in tv])
     for k, tv in TIME_MILESTONE_MAP.items()}
 
-LR_MILESTONE_MAP = {
-    1: [1e-4, 1e-3, 1e-6]}
+MAX_LEARNING_RATE = 4e-4

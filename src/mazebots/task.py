@@ -161,9 +161,9 @@ class MazeTask:
         self.rgb_update_const = 1. - self.rgb_retain_const
 
         # To decorrelate experience/batches, some envs have premature first resets
-        steps_in_ep = max(1, sim.ep_duration * steps_per_second)
-        self.forced_rst_interval = int(np.ceil(steps_in_ep / sim.n_envs))
-        self.forced_rst_n_envs = int(sim.n_envs / steps_in_ep)
+        self.steps_in_ep = max(1, sim.ep_duration * steps_per_second)
+        self.forced_rst_interval = int(np.ceil(self.steps_in_ep / sim.n_envs))
+        self.forced_rst_n_envs = int(sim.n_envs / self.steps_in_ep)
         self.forced_rst_env_idx = 0 if distribute_env_resets else sim.n_envs
         self.forced_rst_step_ctr = 0
 
@@ -728,6 +728,13 @@ class MazeTask:
         # Score of 1 for own, score of 1/n_bots for shared rewards
         reward = bot_done_mask_f + env_done_num / self.sim.n_bots
 
+        # Auxiliary rewards
+        # Max (1 + 1) / steps_in_ep
+        goal_proximity = norm_depth_range(goal_path_len, MAX_DIST)
+        goal_aiming = goal_path_dir[:, 0]
+
+        reward = reward + (goal_proximity + goal_aiming) / self.steps_in_ep
+
         # Assemble hidden state (should only be exposed to critics for better value estimation)
         goal_dir = torch.cat((goal_dir, self.zero_z), dim=-1)
         goal_path_dir = torch.cat((goal_path_dir, self.zero_z), dim=-1)
@@ -739,10 +746,10 @@ class MazeTask:
         obs_aux = torch.stack([
             goal_dir[:, 0],
             goal_dir[:, 1],
-            goal_path_dir[:, 0],
+            goal_aiming,
             goal_path_dir[:, 1],
             norm_depth_range(goal_dist, MAX_DIST),
-            norm_depth_range(goal_path_len, MAX_DIST),
+            goal_proximity,
             goal_in_sight_mask.float(),
             bot_time_at_goal,
             bot_time_on_task * SCALE_TIME,

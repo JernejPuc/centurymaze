@@ -442,7 +442,7 @@ class Session(MazeTask):
                 reward[:, None],
                 rst_mask_f[:, None])
 
-        return obs[1:]
+        return obs[1:] if self.render_segmentation else obs
 
     def update_rec_data_queue(self, seg: Tensor, img: Tensor, *vecs: 'tuple[Tensor]'):
         img_data = torch.cat((img, seg[:, None].float()), dim=1).cpu().numpy()
@@ -502,7 +502,7 @@ class Session(MazeTask):
         model = ActorCritic(self.sim.n_bots, self.model_options['com'], self.model_options['guide'])
         optimiser = NAdamW(
             list(model.policy.parameters()) + list(model.valuator.parameters()),
-            lr=cfg.LR_MILESTONE_MAP[self.sim.level][0])
+            weight_decay=1. / (1e+6 * cfg.MAX_LEARNING_RATE))
 
         model.to(self.ckpter.device)
         model.visencoder.load_state_dict(torch.load(os.path.join(cfg.DATA_DIR, 'visnet', 'encoder_000.pt')))
@@ -515,7 +515,6 @@ class Session(MazeTask):
         scheduler = SoftConstLRScheduler(
             optimiser,
             step_milestones=cfg.UPDATE_MILESTONE_MAP[self.sim.level],
-            lr_milestones=cfg.LR_MILESTONE_MAP[self.sim.level],
             starting_step=self.ckpter.meta['update_step'])
 
         # Half-life of rewards is at 1/8th of an episode
