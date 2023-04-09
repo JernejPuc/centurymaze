@@ -5,7 +5,7 @@ from torch import nn, Tensor
 from torch.nn import Module
 from torch.nn.functional import scaled_dot_product_attention
 
-from discit.distr import IndepNormal, OnlyMean
+from discit.distr import ClipIndepNormal, OnlyMean
 from discit.func import symexp
 from discit.rl import ActorCriticTemplate
 
@@ -442,8 +442,8 @@ class ActorCritic(ActorCriticTemplate):
 
         return memp, memv
 
-    def get_distr(self, args: 'tuple[Tensor, ...]') -> IndepNormal:
-        return IndepNormal(*args, pseudo=False)
+    def get_distr(self, args: 'tuple[Tensor, ...]') -> ClipIndepNormal:
+        return ClipIndepNormal(*args, pseudo=False)
 
     def fwd_partial(
         self,
@@ -490,7 +490,7 @@ class ActorCritic(ActorCriticTemplate):
     ) -> 'tuple[Tensor, tuple[Tensor, ...]]':
 
         x = self.fwd_partial_actor(*obs, *mem)
-        act = IndepNormal(*x.split(self.act_out_sizes, dim=1), pseudo=True)
+        act = ClipIndepNormal(*x.split(self.act_out_sizes, dim=1), pseudo=True)
 
         return act.sample() if self.prob_actor else act.loc, mem
 
@@ -512,7 +512,7 @@ class ActorCritic(ActorCriticTemplate):
 
         x, val_mean, obs_vec, obs_aux, memp, memv = self.fwd_partial(*obs, *mem)
 
-        act = IndepNormal(*x.split(self.act_out_sizes, dim=1), pseudo=True)
+        act = ClipIndepNormal(*x.split(self.act_out_sizes, dim=1), pseudo=True)
         act_args = (act.loc, act.scale, act.sample())
 
         return act_args, val_mean, (obs_vec, obs_aux), (memp, memv)
@@ -521,7 +521,7 @@ class ActorCritic(ActorCriticTemplate):
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[IndepNormal, OnlyMean, tuple[Tensor, ...]]':
+    ) -> 'tuple[ClipIndepNormal, OnlyMean, tuple[Tensor, ...]]':
 
         obs_vec, obs_aux = obs
         memp, memv = mem
@@ -529,7 +529,7 @@ class ActorCritic(ActorCriticTemplate):
         x, memp = self.policy(obs_vec, obs_aux, memp)
         v, memv = self.valuator(memp, obs_aux, memv)
 
-        act = IndepNormal(*x.split(self.act_out_sizes, dim=1), pseudo=True)
+        act = ClipIndepNormal(*x.split(self.act_out_sizes, dim=1), pseudo=True)
         val = OnlyMean(symexp(v))
 
         return act, val, (memp, memv)

@@ -695,8 +695,17 @@ class MazeTask:
         goal_dist: Tensor = torch.linalg.norm(goal_diff, dim=1)
         goal_dir = goal_diff / goal_dist[..., None]
 
-        # Check if any goals are in reach
-        goal_in_reach_mask = (goal_dist < maze.GOAL_RADIUS) & goal_in_sight_mask
+        # Rotate directions to local frame
+        goal_dir = torch.cat((goal_dir, self.zero_z), dim=-1)
+        goal_path_dir = torch.cat((goal_path_dir, self.zero_z), dim=-1)
+
+        loc_ori = bot_ori * self.quat_inv
+        goal_dir = apply_quat_rot(loc_ori, goal_dir)
+        goal_path_dir = apply_quat_rot(loc_ori, goal_path_dir)
+
+        # Check if any goals are in reach and aimed at
+        goal_path_aim = goal_path_dir[:, 0]
+        goal_in_reach_mask = (goal_dist < maze.GOAL_RADIUS) & goal_in_sight_mask & (goal_path_aim > 0.)
 
         # Step time
         # NOTE: In-place ops avoid needless copying between graph outputs and inputs
@@ -730,26 +739,18 @@ class MazeTask:
 
         # Auxiliary rewards
         # Max (1 + 1) / steps_in_ep
-        goal_proximity = norm_depth_range(goal_path_len, MAX_DIST)
-        goal_aiming = goal_path_dir[:, 0]
+        goal_path_proximity = norm_depth_range(goal_path_len, MAX_DIST)
 
-        reward = reward + (goal_proximity + goal_aiming) / self.steps_in_ep
+        reward = reward + (goal_path_proximity + goal_path_aim) / self.steps_in_ep
 
         # Assemble hidden state (should only be exposed to critics for better value estimation)
-        goal_dir = torch.cat((goal_dir, self.zero_z), dim=-1)
-        goal_path_dir = torch.cat((goal_path_dir, self.zero_z), dim=-1)
-
-        loc_ori = bot_ori * self.quat_inv
-        goal_dir = apply_quat_rot(loc_ori, goal_dir)
-        goal_path_dir = apply_quat_rot(loc_ori, goal_path_dir)
-
         obs_aux = torch.stack([
             goal_dir[:, 0],
             goal_dir[:, 1],
-            goal_aiming,
+            goal_path_aim,
             goal_path_dir[:, 1],
             norm_depth_range(goal_dist, MAX_DIST),
-            goal_proximity,
+            goal_path_proximity,
             goal_in_sight_mask.float(),
             bot_time_at_goal,
             bot_time_on_task * SCALE_TIME,
