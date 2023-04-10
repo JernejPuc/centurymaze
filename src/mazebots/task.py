@@ -161,6 +161,7 @@ class MazeTask:
         self.rgb_update_const = 1. - self.rgb_retain_const
 
         # To decorrelate experience/batches, some envs have premature first resets
+        # TODO: Until envs. reach a steady state, the learning rate should be low or 0.
         self.steps_in_ep = max(1, sim.ep_duration * steps_per_second)
         self.forced_rst_interval = int(np.ceil(self.steps_in_ep / sim.n_envs))
         self.forced_rst_n_envs = int(sim.n_envs / self.steps_in_ep)

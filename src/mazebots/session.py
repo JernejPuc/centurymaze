@@ -12,7 +12,7 @@ import torch
 from torch import Tensor
 
 from discit.accel import capture_graph
-from discit.optim import NAdamW, SoftConstLRScheduler
+from discit.optim import NAdamW, AdaptiveLRScheduler
 from discit.rl import PPG
 from discit.track import CheckpointTracker
 
@@ -523,9 +523,8 @@ class Session(MazeTask):
         mem = model.init_mem(self.sim.n_all_bots, detach=True)
         model.fwd_partial_encoded = self.accel_action(model.fwd_partial_encoded, mem, encoded=True)
 
-        scheduler = SoftConstLRScheduler(
+        scheduler = AdaptiveLRScheduler(
             optimiser,
-            step_milestones=cfg.UPDATE_MILESTONE_MAP[self.sim.level],
             lr_milestones=cfg.LR_MILESTONES,
             starting_step=self.ckpter.meta['update_step'])
 
