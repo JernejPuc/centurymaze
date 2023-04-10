@@ -465,6 +465,22 @@ class ActorCritic(ActorCriticTemplate):
 
         return x, val_mean, obs_vec, obs_aux, memp, memv
 
+    def fwd_partial_encoded(
+        self,
+        obs_vec: Tensor,
+        obs_aux: Tensor,
+        memp: Tensor,
+        memv: Tensor
+    ) -> 'tuple[Tensor, ...]':
+
+        with torch.no_grad():
+            x, memp = self.policy(obs_vec, obs_aux, memp)
+            v, memv = self.valuator(memp, obs_aux, memv)
+
+            val_mean = OnlyMean(symexp(v)).mean.flatten()
+
+        return x, val_mean, memp, memv
+
     def fwd_partial_actor(
         self,
         obs_img: Tensor,
@@ -516,6 +532,20 @@ class ActorCritic(ActorCriticTemplate):
         act_args = (act.loc, act.scale, act.sample())
 
         return act_args, val_mean, (obs_vec, obs_aux), (memp, memv)
+
+    def fwd_recollector(
+        self,
+        act: 'tuple[Tensor, ...]',
+        obs: 'tuple[Tensor, ...]',
+        mem: 'tuple[Tensor, ...]'
+    ) -> 'tuple[tuple[Tensor, ...], Tensor, tuple[Tensor, ...]]':
+
+        x, val_mean, memp, memv = self.fwd_partial_encoded(*obs, *mem)
+
+        act = ClipIndepNormal(*x.split(self.act_out_sizes, dim=1), act[-1], pseudo=True)
+        act_args = (act.loc, act.scale, act.sample)
+
+        return act_args, val_mean, (memp, memv)
 
     def fwd_learner(
         self,

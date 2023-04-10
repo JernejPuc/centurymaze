@@ -499,22 +499,34 @@ class Session(MazeTask):
         print('Done.')
 
     def train(self):
+        # Assert that encoder exists
+        encoder_path = os.path.join(cfg.DATA_DIR, 'visnet', 'encoder_000.pt')
+
+        if not os.path.exists(encoder_path):
+            raise FileNotFoundError(f'Visual encoder is missing from presumed path: {encoder_path}')
+
+        # Load model
         model = ActorCritic(self.sim.n_bots, self.model_options['com'], self.model_options['guide'])
         optimiser = NAdamW(
             list(model.policy.parameters()) + list(model.valuator.parameters()),
-            weight_decay=1. / (1e+6 * cfg.MAX_LEARNING_RATE))
+            lr=cfg.LR_MILESTONES[0],
+            weight_decay=cfg.WEIGHT_DECAY_MAP[self.sim.level])
 
         model.to(self.ckpter.device)
-        model.visencoder.load_state_dict(torch.load(os.path.join(cfg.DATA_DIR, 'visnet', 'encoder_000.pt')))
+        model.visencoder.load_state_dict(torch.load(encoder_path))
         self.ckpter.load_model(model, optimiser)
 
-        # Accelerate collector and critic
+        # Accelerate collector, recollector, and critic
         mem = model.init_mem(self.sim.n_all_bots, detach=True)
         model.fwd_partial = self.accel_action(model.fwd_partial, mem)
+
+        mem = model.init_mem(self.sim.n_all_bots, detach=True)
+        model.fwd_partial_encoded = self.accel_action(model.fwd_partial_encoded, mem, encoded=True)
 
         scheduler = SoftConstLRScheduler(
             optimiser,
             step_milestones=cfg.UPDATE_MILESTONE_MAP[self.sim.level],
+            lr_milestones=cfg.LR_MILESTONES,
             starting_step=self.ckpter.meta['update_step'])
 
         # Half-life of rewards is at 1/8th of an episode
@@ -536,7 +548,12 @@ class Session(MazeTask):
             gamma,
             log_dir=cfg.LOG_DIR)
 
-        rl_algo.run()
+        try:
+            rl_algo.run()
+
+        except KeyboardInterrupt:
+            rl_algo.writer.close()
+            raise
 
     def eval(self):
         model = ActorCritic(self.sim.n_bots, self.model_options['com'], self.model_options['guide'])
@@ -574,21 +591,31 @@ class Session(MazeTask):
         self,
         act_fn: Callable,
         aux_tensors: 'tuple[Tensor, ...]' = None,
-        suffix: str = ''
+        encoded: bool = False
     ) -> Callable:
 
         if aux_tensors is None:
             aux_tensors = ()
 
         # Graph 4
-        inputs = (
-            self.graphs['get_image_observations']['out'],
-            self.graphs['get_vector_observations']['out'],
-            self.graphs['eval_state']['out'][-1],
-            *[aux.detach().clone() for aux in aux_tensors])
+        if not encoded:
+            inputs = (
+                self.graphs['get_image_observations']['out'],
+                self.graphs['get_vector_observations']['out'],
+                self.graphs['eval_state']['out'][-1],
+                *[aux.detach().clone() for aux in aux_tensors])
 
-        act_fn, self.graphs[f'act_{suffix}' if suffix else 'act'] = \
-            capture_graph(act_fn, inputs, copy_idcs_in=tuple(range(3, 3+len(aux_tensors))))
+            act_fn, self.graphs['act_partial'] = \
+                capture_graph(act_fn, inputs, copy_idcs_in=tuple(range(len(inputs)-len(aux_tensors), len(inputs))))
+
+        # Graph 5
+        else:
+            inputs = (
+                torch.rand_like(self.graphs['act_partial']['out'][2]),
+                torch.rand_like(self.graphs['act_partial']['out'][3]),
+                *[aux.detach().clone() for aux in aux_tensors])
+
+            act_fn, self.graphs['act_partial_encoded'] = capture_graph(act_fn, inputs)
 
         return act_fn
 
