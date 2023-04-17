@@ -1,13 +1,15 @@
 """MazeBots AI"""
 
+from typing import Callable
+
 import torch
 from torch import nn, Tensor
 from torch.nn import Module
 from torch.nn.functional import scaled_dot_product_attention
 
-from discit.distr import ClipIndepNormal, OnlyMean
+from discit.distr import ClippedNormal, FixedVarNormal, MultiCategorical, MultiMixed
 from discit.func import symexp
-from discit.rl import ActorCriticTemplate
+from discit.rl import ActorCritic as ActorCriticTemplate
 
 import config as cfg
 
@@ -22,7 +24,7 @@ class VisEncoder(Module):
         super().__init__()
 
         # ReLU quickly leads to dying neurons
-        self.act = nn.CELU(0.1)
+        self.activ = nn.CELU(0.1)
 
         # 96x48x4 -> 24x12x16
         self.conv1 = nn.Conv2d(cfg.OBS_IMG_CHANNELS, 16, 4, 4, bias=False)
@@ -54,10 +56,10 @@ class VisEncoder(Module):
         nn.init.zeros_(self.conv4_cw.bias)
 
     def forward(self, x0: Tensor) -> Tensor:
-        x1 = self.act(self.conv1(x0) + self.bias1_h + self.bias1_w)
-        x2 = self.act(self.conv2_cw(self.conv2_dw(x1)) + self.bias2_h + self.bias2_w)
-        x3 = self.act(self.conv3_cw(self.conv3_dw(x2)) + self.bias3_h + self.bias3_w)
-        x4 = self.act(self.conv4_cw(self.conv4_dw(x3)))
+        x1 = self.activ(self.conv1(x0) + self.bias1_h + self.bias1_w)
+        x2 = self.activ(self.conv2_cw(self.conv2_dw(x1)) + self.bias2_h + self.bias2_w)
+        x3 = self.activ(self.conv3_cw(self.conv3_dw(x2)) + self.bias3_h + self.bias3_w)
+        x4 = self.activ(self.conv4_cw(self.conv4_dw(x3)))
 
         return x4, x3, x2, x1
 
@@ -89,7 +91,7 @@ class ResBlock(Module):
     def __init__(self, in_channels: int, mid_channels: int, n_groups: int = 1):
         super().__init__()
 
-        self.act = nn.CELU(0.1)
+        self.activ = nn.CELU(0.1)
 
         self.norm1 = nn.GroupNorm(min(n_groups, in_channels), in_channels)
         self.conv1 = nn.Conv2d(in_channels, mid_channels, 3, padding=1)
@@ -105,8 +107,8 @@ class ResBlock(Module):
         nn.init.zeros_(self.conv2.bias)
 
     def forward(self, x0: Tensor) -> Tensor:
-        x = self.conv1(self.act(self.norm1(x0)))
-        x = self.conv2(self.act(self.norm2(x)))
+        x = self.conv1(self.activ(self.norm1(x0)))
+        x = self.conv2(self.activ(self.norm2(x)))
 
         return x + self.id_mul * x0
 
@@ -120,7 +122,7 @@ class VisDecoderRec(Module):
     def __init__(self):
         super().__init__()
 
-        self.act = nn.SiLU()
+        self.activ = nn.SiLU()
 
         # 1x1xE -> 1x1x512 -> 4x2x64
         # 4x2x64 -> 4x2x128 -> 4x2x64 (2)
@@ -169,7 +171,7 @@ class VisDecoderSeg(Module):
     def __init__(self):
         super().__init__()
 
-        self.act = nn.CELU(0.1)
+        self.activ = nn.CELU(0.1)
 
         # 1x1xE -> 1x1x512 -> 4x2x64
         # 4x2x64 -> 4x2x128 -> 4x2x64 (2)
@@ -236,23 +238,31 @@ class VisNet(Module):
 
 
 class Policy(Module):
-    def __init__(self, communicating: bool = True, guided: bool = False):
+    def __init__(self, visual: bool = True, communicating: bool = True, guided: bool = False):
         super().__init__()
 
-        self.act = nn.Tanh()
+        self.act_in_sizes = (
+            VISENC_SIZE if visual else 0,
+            cfg.OBS_VEC_SIZE - (0 if communicating else cfg.REC_VEC_SIZE),
+            cfg.GUIDE_VEC_SIZE if guided else 0)
 
-        # E + 34|25 + 0|6 -> 256
-        self.fcin = nn.Linear(
-            VISENC_SIZE
-            + cfg.OBS_VEC_SIZE - (0 if communicating else cfg.REC_VEC_SIZE)
-            + (cfg.GUIDE_VEC_SIZE if guided else 0),
-            256)
+        act_values_1 = torch.tensor(cfg.ACT_DOF_MODES_BASE)
+        act_values_2 = torch.tensor(cfg.ACT_DOF_VAL_MODS)
+        act_values = (act_values_1.T.unsqueeze(-1) * act_values_2.T.unsqueeze(-2)).flatten(-2).T
+
+        self.act_values = nn.Parameter(act_values, requires_grad=False)
+        self.act_out_sizes = (len(act_values_1), len(act_values_2), cfg.ACT_VEC_SPLIT[1], cfg.ACT_VEC_SPLIT[1])
+
+        self.activ = nn.Tanh()
+
+        # E|0 + 34|25 + 6|0 -> 256
+        self.fcin = nn.Linear(sum(self.act_in_sizes), 256)
 
         # 256 -> M
         self.rnn = nn.GRUCell(256, RNNMEM_SIZE)
 
-        # M -> 7 + 7
-        self.fcout = nn.Linear(RNNMEM_SIZE, cfg.ACT_VEC_SIZE*2)
+        # M -> 5 + 2 + 3*2
+        self.fcout = nn.Linear(RNNMEM_SIZE, sum(self.act_out_sizes))
 
         # https://r2rt.com/non-zero-initial-states-for-recurrent-neural-networks.html
         self.mem = nn.Parameter(torch.zeros(1, RNNMEM_SIZE).uniform_(-1., 1.))
@@ -272,27 +282,18 @@ class Policy(Module):
             self.rnn.bias_hh[RNNMEM_SIZE:-RNNMEM_SIZE].uniform_(1, max(1, cfg.STEPS_PER_SECOND-1)).log_()
 
         # Policy variations
-        if communicating and not guided:
-            def get_vec_input(x: Tensor, aux: Tensor) -> Tensor:
-                return x
+        # NOTE: Bad practice, but covers all combinations without overhead of branching
+        lambda_input_str = (
+            'lambda img, vec, aux: torch.cat(('
+            f'{"img, " if visual else ""}'
+            f'{"vec, " if communicating else "vec[:, :-cfg.REC_VEC_SIZE], "}'
+            f'{"aux[:, :cfg.GUIDE_VEC_SIZE]" if guided else ""}'
+            '), dim=-1)')
 
-        elif not communicating and guided:
-            def get_vec_input(x: Tensor, aux: Tensor) -> Tensor:
-                return torch.cat((x[:, :-cfg.REC_VEC_SIZE], aux[:, :cfg.GUIDE_VEC_SIZE]), dim=-1)
+        self.get_input: Callable[[Tensor, Tensor, Tensor], Tensor] = eval(lambda_input_str)
 
-        elif not communicating and not guided:
-            def get_vec_input(x: Tensor, aux: Tensor) -> Tensor:
-                return x[:, :-cfg.REC_VEC_SIZE]
-
-        else:
-            def get_vec_input(x: Tensor, aux: Tensor) -> Tensor:
-                return torch.cat((x, aux[:, :cfg.GUIDE_VEC_SIZE]), dim=-1)
-
-        self.get_vec_input = get_vec_input
-
-    def forward(self, x: Tensor, aux: Tensor, mem: Tensor) -> 'tuple[Tensor, Tensor]':
-        x = self.get_vec_input(x, aux)
-        x = self.act(self.fcin(x))
+    def forward(self, x: Tensor, mem: Tensor) -> 'tuple[Tensor, Tensor]':
+        x = self.activ(self.fcin(x))
 
         mem = self.rnn(x, mem)
 
@@ -354,7 +355,7 @@ class Valuator(Module):
     def __init__(self, n_agents_per_env: int):
         super().__init__()
 
-        self.act = nn.Tanh()
+        self.activ = nn.Tanh()
 
         # M + 12 + M -> 256
         self.fcin = nn.Linear(RNNMEM_SIZE*2 + cfg.STATE_VEC_SIZE, 256)
@@ -385,7 +386,7 @@ class Valuator(Module):
 
     def forward(self, x: Tensor, aux: Tensor, mem: Tensor) -> 'tuple[Tensor, Tensor]':
         x = torch.cat((x, aux, mem), dim=-1)
-        x = self.act(self.fcin(x))
+        x = self.activ(self.fcin(x))
 
         x = self.atten(x)
         mem = self.rnn(x, mem)
@@ -401,6 +402,7 @@ class ActorCritic(ActorCriticTemplate):
     def __init__(
         self,
         n_agents_per_env: int = 1,
+        visual: bool = True,
         communicating: bool = True,
         guided: bool = False,
         prob_actor: bool = True
@@ -408,10 +410,10 @@ class ActorCritic(ActorCriticTemplate):
         super().__init__()
 
         self.prob_actor = prob_actor
-        self.act_out_sizes = (cfg.ACT_VEC_SIZE,)*2
+        self.visual_policy = visual
 
         self.visencoder = VisEncoder()
-        self.policy = Policy(communicating, guided)
+        self.policy = Policy(visual, communicating, guided)
         self.valuator = Valuator(n_agents_per_env)
 
         for param in self.visencoder.parameters():
@@ -430,20 +432,24 @@ class ActorCritic(ActorCriticTemplate):
     def reset_mem(
         self,
         mem: 'tuple[Tensor, Tensor]',
-        reset_mask: Tensor,
-        keep_mask: Tensor = None
+        reset_mask: Tensor
     ) -> 'tuple[Tensor, Tensor]':
 
         reset_mask = reset_mask[..., None]
-        keep_mask = (1. - reset_mask) if keep_mask is None else keep_mask[..., None]
+        memp, memv = mem
 
-        memp = keep_mask * mem[0] + reset_mask * self.policy.mem
-        memv = keep_mask * mem[1] + reset_mask * self.valuator.mem
+        memp = torch.lerp(memp, self.policy.mem.expand(len(reset_mask), -1), reset_mask)
+        memv = torch.lerp(memv, self.valuator.mem.expand(len(reset_mask), -1), reset_mask)
 
         return memp, memv
 
-    def get_distr(self, args: 'tuple[Tensor, ...]') -> ClipIndepNormal:
-        return ClipIndepNormal(*args, pseudo=False)
+    def get_distr(self, args: 'tuple[Tensor, ...]') -> MultiMixed:
+        mcat_log_probs, mnor_mean, mnor_log_dev = args
+
+        mcat = MultiCategorical(self.policy.act_values, mcat_log_probs)
+        mnor = ClippedNormal(mnor_mean, mnor_log_dev, low=0., high=1.)
+
+        return MultiMixed(mcat, mnor)
 
     def fwd_partial(
         self,
@@ -455,13 +461,15 @@ class ActorCritic(ActorCriticTemplate):
     ) -> 'tuple[Tensor, ...]':
 
         with torch.no_grad():
-            obs_img = self.visencoder.encode(obs_img)
-            obs_vec = torch.cat((obs_img, obs_vec), dim=-1)
+            if self.visual_policy:
+                obs_img = self.visencoder.encode(obs_img)
 
-            x, memp = self.policy(obs_vec, obs_aux, memp)
+            obs_vec = self.policy.get_input(obs_img, obs_vec, obs_aux)
+
+            x, memp = self.policy(obs_vec, memp)
             v, memv = self.valuator(memp, obs_aux, memv)
 
-            val_mean = OnlyMean(symexp(v)).mean.flatten()
+            val_mean = FixedVarNormal(symexp(v)).mean.flatten()
 
         return x, val_mean, obs_vec, obs_aux, memp, memv
 
@@ -474,10 +482,10 @@ class ActorCritic(ActorCriticTemplate):
     ) -> 'tuple[Tensor, ...]':
 
         with torch.no_grad():
-            x, memp = self.policy(obs_vec, obs_aux, memp)
+            x, memp = self.policy(obs_vec, memp)
             v, memv = self.valuator(memp, obs_aux, memv)
 
-            val_mean = OnlyMean(symexp(v)).mean.flatten()
+            val_mean = FixedVarNormal(symexp(v)).mean.flatten()
 
         return x, val_mean, memp, memv
 
@@ -491,10 +499,12 @@ class ActorCritic(ActorCriticTemplate):
     ) -> Tensor:
 
         with torch.no_grad():
-            obs_img = self.visencoder.encode(obs_img)
-            obs_vec = torch.cat((obs_img, obs_vec), dim=-1)
+            if self.visual_policy:
+                obs_img = self.visencoder.encode(obs_img)
 
-            x, new_memp = self.policy(obs_vec, obs_aux, memp)
+            obs_vec = self.policy.get_input(obs_img, obs_vec, obs_aux)
+
+            x, new_memp = self.policy(obs_vec, memp)
             memp.copy_(new_memp)
 
         return x
@@ -506,9 +516,13 @@ class ActorCritic(ActorCriticTemplate):
     ) -> 'tuple[Tensor, tuple[Tensor, ...]]':
 
         x = self.fwd_partial_actor(*obs, *mem)
-        act = ClipIndepNormal(*x.split(self.act_out_sizes, dim=1), pseudo=True)
+        mcat_logits_1, mcat_logits_2, mnor_mean, mnor_log_dev = x.split(self.policy.act_out_sizes, dim=1)
 
-        return act.sample() if self.prob_actor else act.loc, mem
+        mcat = MultiCategorical.from_raw(mcat_logits_1, mcat_logits_2, values=self.policy.act_values)
+        mnor = ClippedNormal.from_raw(mnor_mean, mnor_log_dev, -1., 0.01, 3., 0., 1.)
+        act = MultiMixed(mcat, mnor)
+
+        return act.sample()[0] if self.prob_actor else act.mean, mem
 
     def fwd_critic(
         self,
@@ -524,26 +538,39 @@ class ActorCritic(ActorCriticTemplate):
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[tuple[Tensor, ...], Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
+    ) -> 'tuple[tuple[Tensor, ...], tuple[Tensor, ...], Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
 
         x, val_mean, obs_vec, obs_aux, memp, memv = self.fwd_partial(*obs, *mem)
+        mcat_logits_1, mcat_logits_2, mnor_mean, mnor_log_dev = x.split(self.policy.act_out_sizes, dim=1)
 
-        act = ClipIndepNormal(*x.split(self.act_out_sizes, dim=1), pseudo=True)
-        act_args = (act.loc, act.scale, act.sample())
+        mcat = MultiCategorical.from_raw(mcat_logits_1, mcat_logits_2, values=self.policy.act_values)
+        mnor = ClippedNormal.from_raw(mnor_mean, mnor_log_dev, -1., 0.01, 3., 0., 1.)
+        act = MultiMixed(mcat, mnor)
 
-        return act_args, val_mean, (obs_vec, obs_aux), (memp, memv)
+        act_args = (act.mcat.log_probs, act.mnor.mean, act.mnor.log_dev)
+
+        return act.sample(), act_args, val_mean, (obs_vec, obs_aux), (memp, memv)
 
     def fwd_recollector(
         self,
-        act: 'tuple[Tensor, ...]',
         obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
+        mem: 'tuple[Tensor, ...]',
+        get_distr: bool = True
     ) -> 'tuple[tuple[Tensor, ...], Tensor, tuple[Tensor, ...]]':
 
         x, val_mean, memp, memv = self.fwd_partial_encoded(*obs, *mem)
 
-        act = ClipIndepNormal(*x.split(self.act_out_sizes, dim=1), act[-1], pseudo=True)
-        act_args = (act.loc, act.scale, act.sample)
+        if get_distr:
+            mcat_logits_1, mcat_logits_2, mnor_mean, mnor_log_dev = x.split(self.policy.act_out_sizes, dim=1)
+
+            mcat = MultiCategorical.from_raw(mcat_logits_1, mcat_logits_2, values=self.policy.act_values)
+            mnor = ClippedNormal.from_raw(mnor_mean, mnor_log_dev, -1., 0.01, 3., 0., 1.)
+            act = MultiMixed(mcat, mnor)
+
+            act_args = (act.mcat.log_probs, act.mnor.mean, act.mnor.log_dev)
+
+        else:
+            act_args = ()
 
         return act_args, val_mean, (memp, memv)
 
@@ -551,15 +578,19 @@ class ActorCritic(ActorCriticTemplate):
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[ClipIndepNormal, OnlyMean, tuple[Tensor, ...]]':
+    ) -> 'tuple[ClippedNormal, FixedVarNormal, tuple[Tensor, ...]]':
 
         obs_vec, obs_aux = obs
         memp, memv = mem
 
-        x, memp = self.policy(obs_vec, obs_aux, memp)
+        x, memp = self.policy(obs_vec, memp)
         v, memv = self.valuator(memp, obs_aux, memv)
 
-        act = ClipIndepNormal(*x.split(self.act_out_sizes, dim=1), pseudo=True)
-        val = OnlyMean(symexp(v))
+        mcat_logits_1, mcat_logits_2, mnor_mean, mnor_log_dev = x.split(self.policy.act_out_sizes, dim=1)
+
+        mcat = MultiCategorical.from_raw(mcat_logits_1, mcat_logits_2, values=self.policy.act_values)
+        mnor = ClippedNormal.from_raw(mnor_mean, mnor_log_dev, -1., 0.01, 3., 0., 1.)
+        act = MultiMixed(mcat, mnor)
+        val = FixedVarNormal(symexp(v))
 
         return act, val, (memp, memv)

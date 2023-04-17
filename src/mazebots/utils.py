@@ -1,12 +1,29 @@
 """Core/numpy utilities"""
 
 import os
+from typing import Any, Callable
+
 import numpy as np
 import numba
 from numpy import ndarray
 from numba.core import types
 from numba.typed import Dict
 from scipy.spatial import Delaunay
+
+
+def get_arg_defaults(fn: Callable) -> 'dict[str, Any]':
+    """Get the input argument defaults of the given function."""
+
+    varnames = fn.__code__.co_varnames
+    defaults = fn.__defaults__
+
+    if defaults is None:
+        defaults = ()
+
+    if len(defaults) < len(varnames):
+        defaults = (None,) * (len(varnames) - len(defaults)) + defaults
+
+    return {k: v for k, v in zip(varnames, defaults)}
 
 
 def get_available_file_idx(data_dir: str, prefix: str) -> int:

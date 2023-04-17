@@ -12,7 +12,7 @@ import torch
 from torch import Tensor
 
 from discit.accel import capture_graph
-from discit.optim import NAdamW, AdaptiveLRScheduler
+from discit.optim import NAdamW, AdaptivePlateauScheduler
 from discit.rl import PPG
 from discit.track import CheckpointTracker
 
@@ -20,7 +20,7 @@ import config as cfg
 import maze
 from task import BasicInterface, MazeTask, MAX_DIST, SCALE_TIME
 from model import ActorCritic
-from utils import get_available_file_idx
+from utils import get_arg_defaults, get_available_file_idx
 from utils_torch import norm_depth_range, apply_quat_rot, get_eulz_from_quat
 
 
@@ -344,26 +344,30 @@ class Session(MazeTask):
     REC_VEC = 1
     REC_NONE = 0
 
-    MDL_FULL = 3
-    MDL_GUIDE = 2
+    MDL_GUIDE = 3
+    MDL_BLIND = 2
     MDL_COM = 1
     MDL_BASE = 0
 
     MODEL_OPTIONS = {
         MDL_BASE: {
             'suffix': 'base',
+            'vis': True,
             'com': False,
             'guide': False},
         MDL_COM: {
             'suffix': 'com',
+            'vis': True,
             'com': True,
             'guide': False},
+        MDL_BLIND: {
+            'suffix': 'blind',
+            'vis': False,
+            'com': True,
+            'guide': True},
         MDL_GUIDE: {
             'suffix': 'guide',
-            'com': False,
-            'guide': True},
-        MDL_FULL: {
-            'suffix': 'full',
+            'vis': True,
             'com': True,
             'guide': True}}
 
@@ -414,8 +418,11 @@ class Session(MazeTask):
             interface,
             self.steps_per_second,
             frames_per_second,
-            render_cameras=self.ctrl_mode > self.CTRL_MAN or self.rec_mode > self.REC_NONE,
+            render_cameras=(
+                (self.ctrl_mode > self.CTRL_MAN and self.model_options['vis'])
+                or self.rec_mode > self.REC_NONE),
             render_segmentation=self.rec_mode > self.REC_NONE,
+            signal_object_rgb=not self.model_options['vis'],
             spawn_with_random_rgb=self.ctrl_mode == self.CTRL_GEN,
             uniform_task_sampling=self.ctrl_mode == self.CTRL_GEN,
             distribute_env_resets=self.ctrl_mode == self.CTRL_RL,
@@ -442,15 +449,20 @@ class Session(MazeTask):
                 reward[:, None],
                 rst_mask_f[:, None])
 
-        return obs[1:] if self.render_segmentation else obs
+            # Remove segmentation channel
+            if self.model_options['vis']:
+                return (obs[0][:, :-1], *obs[1:])
 
-    def update_rec_data_queue(self, seg: Tensor, img: Tensor, *vecs: 'tuple[Tensor]'):
-        img_data = torch.cat((img, seg[:, None].float()), dim=1).cpu().numpy()
-        vec_data = torch.hstack(vecs).cpu().numpy()
+        return obs
+
+    def update_rec_data_queue(self, img: Tensor, *vecs: 'tuple[Tensor, ...]'):
 
         # Images are stored in full or vector form (as means)
         if self.rec_mode == self.REC_VEC:
-            img_data = np.mean(img_data, axis=(-2, -1))
+            img = img.mean((-2, -1))
+
+        img_data = img.cpu().numpy()
+        vec_data = torch.hstack(vecs).cpu().numpy()
 
         self.rec_data_queue.append((img_data, vec_data))
 
@@ -506,15 +518,25 @@ class Session(MazeTask):
             raise FileNotFoundError(f'Visual encoder is missing from presumed path: {encoder_path}')
 
         # Load model
-        model = ActorCritic(self.sim.n_bots, self.model_options['com'], self.model_options['guide'])
+        model = ActorCritic(
+            self.sim.n_bots,
+            self.model_options['vis'],
+            self.model_options['com'],
+            self.model_options['guide'])
+
         optimiser = NAdamW(
             list(model.policy.parameters()) + list(model.valuator.parameters()),
-            lr=cfg.LR_MILESTONES[0],
+            lr=get_arg_defaults(AdaptivePlateauScheduler.__init__)['lr_milestones'][0],
             weight_decay=cfg.WEIGHT_DECAY_MAP[self.sim.level])
 
         model.to(self.ckpter.device)
         model.visencoder.load_state_dict(torch.load(encoder_path))
         self.ckpter.load_model(model, optimiser)
+
+        scheduler = AdaptivePlateauScheduler(
+            optimiser,
+            step_milestones=cfg.UPDATE_MILESTONE_MAP[self.sim.level],
+            starting_step=self.ckpter.meta['update_step'])
 
         # Accelerate collector, recollector, and critic
         mem = model.init_mem(self.sim.n_all_bots, detach=True)
@@ -522,11 +544,6 @@ class Session(MazeTask):
 
         mem = model.init_mem(self.sim.n_all_bots, detach=True)
         model.fwd_partial_encoded = self.accel_action(model.fwd_partial_encoded, mem, encoded=True)
-
-        scheduler = AdaptiveLRScheduler(
-            optimiser,
-            lr_milestones=cfg.LR_MILESTONES,
-            starting_step=self.ckpter.meta['update_step'])
 
         # Half-life of rewards is at 1/8th of an episode
         gamma = 0.5 ** (1. / ((self.sim.ep_duration / 8) * self.steps_per_second))
@@ -545,7 +562,8 @@ class Session(MazeTask):
             cfg.N_ROLLOUTS_PER_EPOCH,
             cfg.N_AUX_ITERS_PER_EPOCH,
             gamma,
-            log_dir=cfg.LOG_DIR)
+            log_dir=cfg.LOG_DIR,
+            update_returns=False)
 
         try:
             rl_algo.run()
@@ -555,7 +573,12 @@ class Session(MazeTask):
             raise
 
     def eval(self):
-        model = ActorCritic(self.sim.n_bots, self.model_options['com'], self.model_options['guide'])
+        model = ActorCritic(
+            self.sim.n_bots,
+            self.model_options['vis'],
+            self.model_options['com'],
+            self.model_options['guide'])
+
         self.ckpter.load_model(model)
 
         # Accelerate actor
@@ -599,9 +622,9 @@ class Session(MazeTask):
         # Graph 4
         if not encoded:
             inputs = (
-                self.graphs['get_image_observations']['out'],
+                self.graphs['get_image_observations']['out'] if self.render_cameras else self.null_obs_img,
                 self.graphs['get_vector_observations']['out'],
-                self.graphs['eval_state']['out'][-1],
+                self.graphs['eval_state']['out'][0],
                 *[aux.detach().clone() for aux in aux_tensors])
 
             act_fn, self.graphs['act_partial'] = \

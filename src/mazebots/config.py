@@ -35,6 +35,21 @@ OBS_IMG_CHANNELS = RGB_VEC_SIZE + 1  # RGB, depth
 ACT_VEC_SIZE = DOF_VEC_SIZE + RGB_VEC_SIZE
 ACT_VEC_SPLIT = (DOF_VEC_SIZE, RGB_VEC_SIZE)
 
+ACT_DOF_MODES_BASE = [
+    [0., 0., 0., 0.],
+    [1., 1., 1., 1.],
+    [-1., -1., -1., -1.],
+    [-1., 1., -1., 1.],
+    [1., -1., 1., -1.]]
+
+ACT_DOF_MODES_EXT = ACT_DOF_MODES_BASE + [
+    [0., 1., 0., 1.],
+    [1., 0., 1., 0.],
+    [0., -1., 0., -1.],
+    [-1., 0., -1., 0.]]
+
+ACT_DOF_VAL_MODS = [[1.], [0.5]]
+
 # 12 total:
 # 6 guide vec., 1 line of sight flag, 1 time at goal, 1 time spent on task,
 # 1 time until end of episode, 1 num. of completed tasks, 1 throughput
@@ -79,8 +94,5 @@ UPDATE_MILESTONE_MAP = {
     k: tuple([v * N_UPDATES_PER_EPOCH // SECONDS_PER_EPOCH for v in tv])
     for k, tv in TIME_MILESTONE_MAP.items()}
 
-LR_MILESTONES = [1e-5, 1e-4, 1e-6]
-MAX_WEIGHT_DECAY = 1. / (1e+6 * LR_MILESTONES[1])
-
-WEIGHT_DECAY_MAP = {i: MAX_WEIGHT_DECAY for i in range(1, 8)}
+WEIGHT_DECAY_MAP = {i: 1e-2 for i in range(1, 8)}
 WEIGHT_DECAY_MAP[1] = WEIGHT_DECAY_MAP[7] = 0.

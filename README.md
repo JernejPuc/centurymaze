@@ -46,8 +46,8 @@ Agents primarily rely on visual data from their colour and depth cameras.
 They also process vector observations, like IMU and motor feedback.
 
 <p align="center">
-<img src="data/img_rgbcam_00.png" width="49%">
-<img src="data/img_depcam_00.png" width="49%">
+<img src="data/img_rgbcam_00.png" width="48%">
+<img src="data/img_depcam_00.png" width="48%">
 </p>
 
 
@@ -64,19 +64,19 @@ This increasing difficulty can facilitate a learning curriculum
 by transferring policies after they master a level.
 
 <p align="center">
-<img src="data/img_viewer_01.png" width="33%">
-<img src="data/img_viewer_02.png" width="33%">
-<img src="data/img_viewer_03.png" width="33%">
+<img src="data/img_viewer_01.png" width="32%">
+<img src="data/img_viewer_02.png" width="32%">
+<img src="data/img_viewer_03.png" width="32%">
 </p>
 
 <p align="center">
-<img src="data/img_viewer_04.png" width="33%">
-<img src="data/img_viewer_05.png" width="33%">
-<img src="data/img_viewer_06.png" width="33%">
+<img src="data/img_viewer_04.png" width="32%">
+<img src="data/img_viewer_05.png" width="32%">
+<img src="data/img_viewer_06.png" width="32%">
 </p>
 
 <p align="center">
-<img src="data/img_viewer_07.png" width="33%">
+<img src="data/img_viewer_07.png" width="32%">
 </p>
 
 
