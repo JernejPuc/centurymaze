@@ -83,8 +83,8 @@ BRANCH_EPOCH_INTERVAL = 120 * 60 // SECONDS_PER_EPOCH
 
 # TODO: Adjust wrt. trials
 TIME_MILESTONE_MAP = {
-    # Approx. 2 virtual minutes to warm up, half day to train, half day to cool down, 1 day total
-    1: (120, 12 * 3600, 24 * 3600),
+    # Approx. 2 virtual minutes to warm up, 6 hours to train, half hour to cool down, 6.5 hours total
+    1: (120, 6 * 3600, 6 * 3600 + 1800),
     # Approx. half virtual hour to warm up, 5 days to train, 2 days to cool down, 1 week total
     4: (1800, 5 * 24 * 3600, 7 * 24 * 3600)}
 

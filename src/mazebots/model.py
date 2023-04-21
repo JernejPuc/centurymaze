@@ -419,13 +419,9 @@ class ActorCritic(ActorCriticTemplate):
         for param in self.visencoder.parameters():
             param.requires_grad = False
 
-    def init_mem(self, batch_size: int = 1, detach: bool = False) -> 'tuple[Tensor, Tensor]':
-        memp = self.policy.mem.expand(batch_size, -1)
-        memv = self.valuator.mem.expand(batch_size, -1)
-
-        if detach:
-            memp = memp.detach().clone()
-            memv = memv.detach().clone()
+    def init_mem(self, batch_size: int = 1) -> 'tuple[Tensor, Tensor]':
+        memp = self.policy.mem.detach().expand(batch_size, -1).clone()
+        memv = self.valuator.mem.detach().expand(batch_size, -1).clone()
 
         return memp, memv
 
@@ -435,61 +431,30 @@ class ActorCritic(ActorCriticTemplate):
         reset_mask: Tensor
     ) -> 'tuple[Tensor, Tensor]':
 
-        reset_mask = reset_mask[..., None]
+        reset_mask = reset_mask.unsqueeze(-1)
         memp, memv = mem
 
-        memp = torch.lerp(memp, self.policy.mem.expand(len(reset_mask), -1), reset_mask)
-        memv = torch.lerp(memv, self.valuator.mem.expand(len(reset_mask), -1), reset_mask)
+        memp = torch.lerp(memp, self.policy.mem, reset_mask)
+        memv = torch.lerp(memv, self.valuator.mem, reset_mask)
 
         return memp, memv
 
-    def get_distr(self, args: 'tuple[Tensor, ...]') -> MultiMixed:
-        mcat_log_probs, mnor_mean, mnor_log_dev = args
+    def get_distr(self, args: 'Tensor | tuple[Tensor, ...]', from_raw: bool) -> MultiMixed:
+        if from_raw:
+            mcat_logits_1, mcat_logits_2, mnor_mean, mnor_log_dev = args.split(self.policy.act_out_sizes, dim=1)
 
-        mcat = MultiCategorical(self.policy.act_values, mcat_log_probs)
-        mnor = ClippedNormal(mnor_mean, mnor_log_dev, low=0., high=1.)
+            mcat = MultiCategorical.from_raw(mcat_logits_1, mcat_logits_2, values=self.policy.act_values)
+            mnor = ClippedNormal.from_raw(mnor_mean, mnor_log_dev, -1., 0.01, 3., low=0., high=1.)
+
+        else:
+            mcat_log_probs, mnor_mean, mnor_log_dev = args
+
+            mcat = MultiCategorical(self.policy.act_values, mcat_log_probs)
+            mnor = ClippedNormal(mnor_mean, mnor_log_dev, low=0., high=1.)
 
         return MultiMixed(mcat, mnor)
 
-    def fwd_partial(
-        self,
-        obs_img: Tensor,
-        obs_vec: Tensor,
-        obs_aux: Tensor,
-        memp: Tensor,
-        memv: Tensor
-    ) -> 'tuple[Tensor, ...]':
-
-        with torch.no_grad():
-            if self.visual_policy:
-                obs_img = self.visencoder.encode(obs_img)
-
-            obs_vec = self.policy.get_input(obs_img, obs_vec, obs_aux)
-
-            x, memp = self.policy(obs_vec, memp)
-            v, memv = self.valuator(memp, obs_aux, memv)
-
-            val_mean = FixedVarNormal(symexp(v)).mean.flatten()
-
-        return x, val_mean, obs_vec, obs_aux, memp, memv
-
-    def fwd_partial_encoded(
-        self,
-        obs_vec: Tensor,
-        obs_aux: Tensor,
-        memp: Tensor,
-        memv: Tensor
-    ) -> 'tuple[Tensor, ...]':
-
-        with torch.no_grad():
-            x, memp = self.policy(obs_vec, memp)
-            v, memv = self.valuator(memp, obs_aux, memv)
-
-            val_mean = FixedVarNormal(symexp(v)).mean.flatten()
-
-        return x, val_mean, memp, memv
-
-    def fwd_partial_actor(
+    def act_partial(
         self,
         obs_img: Tensor,
         obs_vec: Tensor,
@@ -507,90 +472,96 @@ class ActorCritic(ActorCriticTemplate):
             x, new_memp = self.policy(obs_vec, memp)
             memp.copy_(new_memp)
 
+            act = self.get_distr(x, from_raw=True)
+            x = act.sample()[0] if self.prob_actor else act.mode
+
         return x
 
-    def fwd_actor(
-        self,
-        obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[Tensor, tuple[Tensor, ...]]':
-
-        x = self.fwd_partial_actor(*obs, *mem)
-        mcat_logits_1, mcat_logits_2, mnor_mean, mnor_log_dev = x.split(self.policy.act_out_sizes, dim=1)
-
-        mcat = MultiCategorical.from_raw(mcat_logits_1, mcat_logits_2, values=self.policy.act_values)
-        mnor = ClippedNormal.from_raw(mnor_mean, mnor_log_dev, -1., 0.01, 3., 0., 1.)
-        act = MultiMixed(mcat, mnor)
-
-        return act.sample()[0] if self.prob_actor else act.mean, mem
-
-    def fwd_critic(
-        self,
-        obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[Tensor, tuple[Tensor, ...]]':
-
-        _, val_mean, _, _, memp, memv = self.fwd_partial(*obs, *mem)
-
-        return val_mean, (memp, memv)
-
-    def fwd_collector(
-        self,
-        obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[tuple[Tensor, ...], tuple[Tensor, ...], Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
-
-        x, val_mean, obs_vec, obs_aux, memp, memv = self.fwd_partial(*obs, *mem)
-        mcat_logits_1, mcat_logits_2, mnor_mean, mnor_log_dev = x.split(self.policy.act_out_sizes, dim=1)
-
-        mcat = MultiCategorical.from_raw(mcat_logits_1, mcat_logits_2, values=self.policy.act_values)
-        mnor = ClippedNormal.from_raw(mnor_mean, mnor_log_dev, -1., 0.01, 3., 0., 1.)
-        act = MultiMixed(mcat, mnor)
-
-        act_args = (act.mcat.log_probs, act.mnor.mean, act.mnor.log_dev)
-
-        return act.sample(), act_args, val_mean, (obs_vec, obs_aux), (memp, memv)
-
-    def fwd_recollector(
+    def act(
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]',
-        get_distr: bool = True
-    ) -> 'tuple[tuple[Tensor, ...], Tensor, tuple[Tensor, ...]]':
+        _sample: bool = None
+    ) -> 'tuple[Tensor, tuple[Tensor, ...]]':
 
-        x, val_mean, memp, memv = self.fwd_partial_encoded(*obs, *mem)
+        return self.act_partial(*obs, *mem), mem
 
-        if get_distr:
-            mcat_logits_1, mcat_logits_2, mnor_mean, mnor_log_dev = x.split(self.policy.act_out_sizes, dim=1)
-
-            mcat = MultiCategorical.from_raw(mcat_logits_1, mcat_logits_2, values=self.policy.act_values)
-            mnor = ClippedNormal.from_raw(mnor_mean, mnor_log_dev, -1., 0.01, 3., 0., 1.)
-            act = MultiMixed(mcat, mnor)
-
-            act_args = (act.mcat.log_probs, act.mnor.mean, act.mnor.log_dev)
-
-        else:
-            act_args = ()
-
-        return act_args, val_mean, (memp, memv)
-
-    def fwd_learner(
+    def fwd_partial(
         self,
-        obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[ClippedNormal, FixedVarNormal, tuple[Tensor, ...]]':
-
-        obs_vec, obs_aux = obs
-        memp, memv = mem
+        obs_vec: Tensor,
+        obs_aux: Tensor,
+        memp: Tensor,
+        memv: Tensor,
+        detach: bool
+    ) -> 'tuple[Tensor, ...]':
 
         x, memp = self.policy(obs_vec, memp)
-        v, memv = self.valuator(memp, obs_aux, memv)
+        v, memv = self.valuator(memp.detach() if detach else memp, obs_aux, memv)
 
-        mcat_logits_1, mcat_logits_2, mnor_mean, mnor_log_dev = x.split(self.policy.act_out_sizes, dim=1)
+        return x, v, memp, memv
 
-        mcat = MultiCategorical.from_raw(mcat_logits_1, mcat_logits_2, values=self.policy.act_values)
-        mnor = ClippedNormal.from_raw(mnor_mean, mnor_log_dev, -1., 0.01, 3., 0., 1.)
-        act = MultiMixed(mcat, mnor)
+    def collect_static(
+        self,
+        obs_img: Tensor,
+        obs_vec: Tensor,
+        obs_aux: Tensor,
+        memp: Tensor,
+        memv: Tensor
+    ) -> 'tuple[Tensor, ...]':
+
+        with torch.no_grad():
+            if self.visual_policy:
+                obs_img = self.visencoder.encode(obs_img)
+
+            obs_vec = self.policy.get_input(obs_img, obs_vec, obs_aux)
+
+            x, v, memp, memv = self.fwd_partial(obs_vec, obs_aux, memp, memv, detach=False)
+
+            val_mean = FixedVarNormal(symexp(v)).mean.flatten()
+
+        return x, val_mean, obs_vec, obs_aux, memp, memv
+
+    def collect_copied(
+        self,
+        obs_vec: Tensor,
+        obs_aux: Tensor,
+        memp: Tensor,
+        memv: Tensor
+    ) -> 'tuple[Tensor, ...]':
+
+        with torch.no_grad():
+            x, v, memp, memv = self.fwd_partial(obs_vec, obs_aux, memp, memv, detach=False)
+
+            val_mean = FixedVarNormal(symexp(v)).mean.flatten()
+
+        return x, val_mean, memp, memv
+
+    def collect(
+        self,
+        obs: 'tuple[Tensor, ...]',
+        mem: 'tuple[Tensor, ...]',
+        encode: bool
+    ) -> 'tuple[Tensor, Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
+
+        if encode:
+            x, val_mean, obs_vec, obs_aux, memp, memv = self.collect_static(*obs, *mem)
+            obs = obs_vec, obs_aux
+
+        else:
+            x, val_mean, memp, memv = self.collect_copied(*obs, *mem)
+
+        return x, val_mean, obs, (memp, memv)
+
+    def forward(
+        self,
+        obs: 'tuple[Tensor, ...]',
+        mem: 'tuple[Tensor, ...]',
+        detach: bool = False
+    ) -> 'tuple[ClippedNormal, FixedVarNormal, tuple[Tensor, ...]]':
+
+        x, v, memp, memv = self.fwd_partial(*obs, *mem, detach=detach)
+
+        act = self.get_distr(x, from_raw=True)
         val = FixedVarNormal(symexp(v))
 
         return act, val, (memp, memv)

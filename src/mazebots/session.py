@@ -539,11 +539,11 @@ class Session(MazeTask):
             starting_step=self.ckpter.meta['update_step'])
 
         # Accelerate collector, recollector, and critic
-        mem = model.init_mem(self.sim.n_all_bots, detach=True)
-        model.fwd_partial = self.accel_action(model.fwd_partial, mem)
+        mem = model.init_mem(self.sim.n_all_bots)
+        model.collect_static = self.accel_action(model.collect_static, mem)
 
-        mem = model.init_mem(self.sim.n_all_bots, detach=True)
-        model.fwd_partial_encoded = self.accel_action(model.fwd_partial_encoded, mem, encoded=True)
+        mem = model.init_mem(self.sim.n_all_bots)
+        model.collect_copied = self.accel_action(model.collect_copied, mem, encode=False)
 
         # Half-life of rewards is at 1/8th of an episode
         gamma = 0.5 ** (1. / ((self.sim.ep_duration / 8) * self.steps_per_second))
@@ -563,7 +563,7 @@ class Session(MazeTask):
             cfg.N_AUX_ITERS_PER_EPOCH,
             gamma,
             log_dir=cfg.LOG_DIR,
-            update_returns=False)
+            detach_critic=False)
 
         try:
             rl_algo.run()
@@ -577,13 +577,14 @@ class Session(MazeTask):
             self.sim.n_bots,
             self.model_options['vis'],
             self.model_options['com'],
-            self.model_options['guide'])
+            self.model_options['guide'],
+            prob_actor=False)
 
         self.ckpter.load_model(model)
 
         # Accelerate actor
-        mem = model.init_mem(self.sim.n_all_bots, detach=True)
-        model.fwd_partial_actor = self.accel_action(model.fwd_partial_actor, mem)
+        mem = model.init_mem(self.sim.n_all_bots)
+        model.act_partial = self.accel_action(model.act_partial, mem)
 
         # Reinit. tensors modified in-place during warm-up and capture
         mem = model.init_mem(self.sim.n_all_bots)
@@ -593,7 +594,7 @@ class Session(MazeTask):
             step_ctr = -1
 
             while (step_ctr := step_ctr + 1) != self.end_step:
-                actions, mem = model.fwd_actor(obs, mem)
+                actions, mem = model.act(obs, mem)
 
                 obs, reward, rst_mask_f, _ = self.step(actions, get_info=False)
                 obs = self.post_step(obs, reward, rst_mask_f, None)
@@ -613,14 +614,14 @@ class Session(MazeTask):
         self,
         act_fn: Callable,
         aux_tensors: 'tuple[Tensor, ...]' = None,
-        encoded: bool = False
+        encode: bool = True
     ) -> Callable:
 
         if aux_tensors is None:
             aux_tensors = ()
 
         # Graph 4
-        if not encoded:
+        if encode:
             inputs = (
                 self.graphs['get_image_observations']['out'] if self.render_cameras else self.null_obs_img,
                 self.graphs['get_vector_observations']['out'],
