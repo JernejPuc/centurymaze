@@ -244,7 +244,7 @@ class Policy(Module):
         self.act_in_sizes = (
             VISENC_SIZE if visual else 0,
             cfg.OBS_VEC_SIZE - (0 if communicating else cfg.REC_VEC_SIZE),
-            cfg.GUIDE_VEC_SIZE if guided else 0)
+            cfg.STATE_VEC_SIZE if guided else 0)
 
         act_values_1 = torch.tensor(cfg.ACT_DOF_MODES_BASE)
         act_values_2 = torch.tensor(cfg.ACT_DOF_VAL_MODS)
@@ -255,7 +255,7 @@ class Policy(Module):
 
         self.activ = nn.Tanh()
 
-        # E|0 + 34|25 + 6|0 -> 256
+        # E|0 + 34|25 + 16|0 -> 256
         self.fcin = nn.Linear(sum(self.act_in_sizes), 256)
 
         # 256 -> M
@@ -287,7 +287,7 @@ class Policy(Module):
             'lambda img, vec, aux: torch.cat(('
             f'{"img, " if visual else ""}'
             f'{"vec, " if communicating else "vec[:, :-cfg.REC_VEC_SIZE], "}'
-            f'{"aux[:, :cfg.GUIDE_VEC_SIZE]" if guided else ""}'
+            f'{"aux" if guided else ""}'
             '), dim=-1)')
 
         self.get_input: Callable[[Tensor, Tensor, Tensor], Tensor] = eval(lambda_input_str)
@@ -405,12 +405,14 @@ class ActorCritic(ActorCriticTemplate):
         visual: bool = True,
         communicating: bool = True,
         guided: bool = False,
-        prob_actor: bool = True
+        prob_actor: bool = True,
+        ignore_com: bool = False
     ):
         super().__init__()
 
         self.prob_actor = prob_actor
         self.visual_policy = visual
+        self.ignore_com = ignore_com
 
         self.visencoder = VisEncoder()
         self.policy = Policy(visual, communicating, guided)
@@ -443,6 +445,10 @@ class ActorCritic(ActorCriticTemplate):
         if from_raw:
             mcat_logits_1, mcat_logits_2, mnor_mean, mnor_log_dev = args.split(self.policy.act_out_sizes, dim=1)
 
+            if self.ignore_com:
+                mnor_mean = torch.ones_like(mnor_mean.detach())
+                mnor_log_dev = -3. * torch.ones_like(mnor_log_dev.detach())
+
             mcat = MultiCategorical.from_raw(mcat_logits_1, mcat_logits_2, values=self.policy.act_values)
             mnor = ClippedNormal.from_raw(mnor_mean, mnor_log_dev, -1., 0.01, 3., low=0., high=1.)
 
@@ -469,13 +475,9 @@ class ActorCritic(ActorCriticTemplate):
 
             obs_vec = self.policy.get_input(obs_img, obs_vec, obs_aux)
 
-            x, new_memp = self.policy(obs_vec, memp)
-            memp.copy_(new_memp)
+            x, memp = self.policy(obs_vec, memp)
 
-            act = self.get_distr(x, from_raw=True)
-            x = act.sample()[0] if self.prob_actor else act.mode
-
-        return x
+        return x, memp
 
     def act(
         self,
@@ -484,7 +486,11 @@ class ActorCritic(ActorCriticTemplate):
         _sample: bool = None
     ) -> 'tuple[Tensor, tuple[Tensor, ...]]':
 
-        return self.act_partial(*obs, *mem), mem
+        x, memp = self.act_partial(*obs, *mem)
+        act = self.get_distr(x, from_raw=True)
+        x = act.sample()[0] if self.prob_actor else act.mode
+
+        return x, (memp, mem[1])
 
     def fwd_partial(
         self,

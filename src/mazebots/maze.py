@@ -573,8 +573,8 @@ class MazeConstructor:
                 # Check distance to edges
                 if grid_edges is not None:
                     sqr_idx, sqr_idy = np.digitize(point, self.open_grid_delims)
-                    sqr_idx = max(1, min(len(self.open_grid_delims)-1, sqr_idx))
-                    sqr_idy = max(1, min(len(self.open_grid_delims)-1, sqr_idy))
+                    sqr_idx = max(1, min(len(self.open_grid_delims), sqr_idx))
+                    sqr_idy = max(1, min(len(self.open_grid_delims), sqr_idy))
 
                     edge_subset = grid_edges[sqr_idx-1:sqr_idx+2, sqr_idy-1:sqr_idy+2].reshape(-1, 2, 2)
 
@@ -951,7 +951,9 @@ class MazeSim:
         sim_params.physx.max_depenetration_velocity = 7.5       # 100. default seemed a bit too violent
         sim_params.physx.rest_offset = 0.                       # 0.001 by default
         sim_params.physx.contact_offset = 0.005                 # 0.02 default is relatively large wrt. bot dimensions
-        sim_params.physx.contact_collection = gymapi.CC_NEVER   # All substeps by default; no tracking needed here
+
+        # All substeps by default, but that produces noisy and nondeterministic results
+        sim_params.physx.contact_collection = gymapi.CC_LAST_SUBSTEP
 
         self.handle = gym.create_sim(args.compute_device_id, args.graphics_device_id, gymapi.SIM_PHYSX, sim_params)
 

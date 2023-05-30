@@ -50,10 +50,11 @@ ACT_DOF_MODES_EXT = ACT_DOF_MODES_BASE + [
 
 ACT_DOF_VAL_MODS = [[1.], [0.5]]
 
-# 12 total:
-# 6 guide vec., 1 line of sight flag, 1 time at goal, 1 time spent on task,
-# 1 time until end of episode, 1 num. of completed tasks, 1 throughput
-STATE_VEC_SIZE = GUIDE_VEC_SIZE + 6
+# 16 total:
+# 2 air xy direction, 2 a* xy direction, 1 air proximity, 1 a* path proximity,
+# 1 goal in sight flag, 1 colliding flag, 1 nearest bot_proximity, 2 nearest bot direction,
+# 1 time at goal, 1 time spent on task, 1 time until end of episode, 1 num. of completed tasks, 1 throughput
+STATE_VEC_SIZE = 2 + 2 + 5 + 2 + 5
 
 # Training setup
 DATA_DIR = 'data'   # Training meta data and model checkpoints
@@ -64,7 +65,7 @@ STEPS_PER_SECOND = 4
 N_TRUNCATED_STEPS = STEPS_PER_SECOND * 4
 N_ROLLOUT_STEPS = 256
 N_ROLLOUTS_PER_EPOCH = 2
-N_AUX_ITERS_PER_EPOCH = 3
+N_AUX_ITERS_PER_EPOCH = 8
 SECONDS_PER_EPOCH = N_ROLLOUT_STEPS * N_ROLLOUTS_PER_EPOCH // STEPS_PER_SECOND
 
 # Main + aux. updates
@@ -85,6 +86,8 @@ BRANCH_EPOCH_INTERVAL = 120 * 60 // SECONDS_PER_EPOCH
 TIME_MILESTONE_MAP = {
     # Approx. 2 virtual minutes to warm up, 6 hours to train, half hour to cool down, 6.5 hours total
     1: (120, 6 * 3600, 6 * 3600 + 1800),
+    # Approx. 2 virtual minutes to warm up, 6 hours to train, half hour to cool down, 6.5 hours total
+    2: (120, 6 * 3600, 6 * 3600 + 1800),
     # Approx. half virtual hour to warm up, 5 days to train, 2 days to cool down, 1 week total
     4: (1800, 5 * 24 * 3600, 7 * 24 * 3600)}
 

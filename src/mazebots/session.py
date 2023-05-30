@@ -383,6 +383,7 @@ class Session(MazeTask):
         {'name': '--rec_mode', 'type': int, 'default': REC_NONE, 'help': 'Data category to record.'},
         {'name': '--headless', 'type': int, 'default': 0, 'help': 'Option to run without a viewer.'},
         {'name': '--act_freq', 'type': int, 'default': cfg.STEPS_PER_SECOND, 'help': 'Inference steps per second.'},
+        {'name': '--transfer_name', 'type': str, 'default': '', 'help': 'Base model name/ID string.'},
         {'name': '--model_name', 'type': str, 'default': 'mazeai', 'help': 'Model name/ID string.'},
         {'name': '--model_type', 'type': int, 'default': MDL_COM, 'help': 'Communication and guidance options.'},
         {'name': '--rng_seed', 'type': int, 'default': 42, 'help': 'Seed for numpy and torch RNGs.'}]
@@ -399,7 +400,7 @@ class Session(MazeTask):
         self.model_options = self.MODEL_OPTIONS[args.model_type]
         model_name = f'{args.model_name}_{self.model_options["suffix"]}'
 
-        self.ckpter = CheckpointTracker(model_name, cfg.DATA_DIR, device, args.rng_seed)
+        self.ckpter = CheckpointTracker(model_name, cfg.DATA_DIR, device, args.rng_seed, args.transfer_name)
         rng = self.ckpter.rng if args.level < args.keep_level else None
 
         # Init IsaacGym and generate initial envs
@@ -427,6 +428,7 @@ class Session(MazeTask):
             uniform_task_sampling=self.ctrl_mode == self.CTRL_GEN,
             distribute_env_resets=self.ctrl_mode == self.CTRL_RL,
             full_env_regeneration=bool(args.regen),
+            reward_sharing=args.model_type == self.MDL_COM,
             device=device)
 
         self.accelerate()
@@ -522,7 +524,8 @@ class Session(MazeTask):
             self.sim.n_bots,
             self.model_options['vis'],
             self.model_options['com'],
-            self.model_options['guide'])
+            self.model_options['guide'],
+            ignore_com=not self.reward_sharing)
 
         optimiser = NAdamW(
             list(model.policy.parameters()) + list(model.valuator.parameters()),
@@ -562,8 +565,8 @@ class Session(MazeTask):
             cfg.N_ROLLOUTS_PER_EPOCH,
             cfg.N_AUX_ITERS_PER_EPOCH,
             gamma,
-            log_dir=cfg.LOG_DIR,
-            detach_critic=False)
+            entropy_weight=4e-3,
+            log_dir=cfg.LOG_DIR)
 
         try:
             rl_algo.run()
@@ -578,16 +581,15 @@ class Session(MazeTask):
             self.model_options['vis'],
             self.model_options['com'],
             self.model_options['guide'],
-            prob_actor=False)
+            prob_actor=True,
+            ignore_com=not self.reward_sharing)
 
+        model.to(self.ckpter.device)
         self.ckpter.load_model(model)
 
         # Accelerate actor
         mem = model.init_mem(self.sim.n_all_bots)
         model.act_partial = self.accel_action(model.act_partial, mem)
-
-        # Reinit. tensors modified in-place during warm-up and capture
-        mem = model.init_mem(self.sim.n_all_bots)
 
         with torch.inference_mode():
             obs = self.step(get_info=False)[0]

@@ -48,8 +48,8 @@ SCALE_TIME = 1./60.
 # Task completion confirmed after 1 second at goal
 T_TASK_CONFIRM = 1.
 
-# Max depth range
-MAX_DIST = 128.
+# Max depth range (34 * sqrt(2) / 2)
+MAX_DIST = 24.
 
 
 class BasicInterface:
@@ -138,6 +138,7 @@ class MazeTask:
         uniform_task_sampling: bool = False,
         distribute_env_resets: bool = False,
         full_env_regeneration: bool = False,
+        reward_sharing: bool = False,
         device: str = 'cuda'
     ):
         self.sim = sim
@@ -150,6 +151,8 @@ class MazeTask:
         self.uniform_task_sampling = uniform_task_sampling
         self.distribute_env_resets = distribute_env_resets
         self.full_env_regeneration = full_env_regeneration
+        self.reward_sharing = reward_sharing
+
         self.rst_env_indices: 'list[int]' = []
 
         steps_per_second = min(steps_per_second, frames_per_second)
@@ -219,12 +222,20 @@ class MazeTask:
         # Physics
         actor_states = gym.acquire_actor_root_state_tensor(sim.handle)
         dof_states = gym.acquire_dof_state_tensor(sim.handle)
+        net_contacts = gym.acquire_net_contact_force_tensor(sim.handle)
 
         gym.refresh_dof_state_tensor(sim.handle)
         gym.refresh_actor_root_state_tensor(sim.handle)
+        gym.refresh_net_contact_force_tensor(sim.handle)
 
         self.actor_states: Tensor = gymtorch.wrap_tensor(actor_states)
         self.dof_states: Tensor = gymtorch.wrap_tensor(dof_states)
+        self.net_contacts: Tensor = gymtorch.wrap_tensor(net_contacts)
+
+        self.collider_indices = torch.tensor([
+            gym.find_actor_rigid_body_index(env.handle, bot_handle, 'body', gymapi.DOMAIN_SIM)
+            for env in sim.envs
+            for bot_handle in env.bot_handles], dtype=torch.int64, device=device)
 
         # Views of data with fixed memory address
         asr = self.actor_states.reshape(sim.n_envs, -1, 13)
@@ -596,6 +607,7 @@ class MazeTask:
         self.gym.fetch_results(self.sim.handle, True)
         self.gym.refresh_actor_root_state_tensor(self.sim.handle)
         self.gym.refresh_dof_state_tensor(self.sim.handle)
+        self.gym.refresh_net_contact_force_tensor(self.sim.handle)
 
         self.bot_pos.copy_(self.env_bot_pos.reshape(-1, 2))
         self.bot_ori.copy_(self.env_bot_ori.reshape(-1, 4))
@@ -673,18 +685,51 @@ class MazeTask:
         bot_rst_mask = rst_env_mask.repeat_interleave(self.sim.n_bots, output_size=self.sim.n_all_bots)
 
         throughput = throughput.repeat_interleave(self.sim.n_bots, output_size=self.sim.n_all_bots)
-        env_done_num = bot_done_mask_f.reshape(self.sim.n_envs, -1).sum(-1)
-        env_done_num = env_done_num.repeat_interleave(self.sim.n_bots, output_size=self.sim.n_all_bots)
 
         # Evalute rewards
-        # Score of 1 for own, score of 1/n_bots for shared rewards
-        reward = bot_done_mask_f + env_done_num / self.sim.n_bots
+        if self.reward_sharing:
+            env_done_num = bot_done_mask_f.reshape(self.sim.n_envs, -1).sum(-1)
+            env_done_num = env_done_num.repeat_interleave(self.sim.n_bots, output_size=self.sim.n_all_bots)
+
+            # Score of 1 for own, score of 1/n_bots for shared rewards
+            reward = bot_done_mask_f + env_done_num / self.sim.n_bots
+
+        else:
+            reward = bot_done_mask_f
 
         # Auxiliary rewards
-        # Max (1 + 1) / steps_in_ep
-        goal_path_proximity = norm_depth_range(self.goal_path_len, MAX_DIST)
+        # TODO: Computation is repeated in sense_bot_colours
+        bot_pos_loc = self.bot_pos.reshape(self.sim.n_envs, -1, 2)
+        bot_pos_diff_loc = bot_pos_loc.unsqueeze(1) - bot_pos_loc.unsqueeze(2)
 
-        reward = reward + (goal_path_proximity + goal_path_aim) / self.steps_in_ep
+        for pos_diff_i in bot_pos_diff_loc:
+            pos_diff_i[..., 0].fill_diagonal_(MAX_DIST)
+
+        bot_pos_diff = bot_pos_diff_loc.reshape(self.sim.n_all_bots, -1, 2)
+        bot_dist: Tensor = torch.linalg.norm(bot_pos_diff, dim=-1)
+        bot_dist, bot_idx = bot_dist.min(-1)
+        bot_pos_diff = bot_pos_diff[torch.arange(self.sim.n_all_bots, device=self.device), bot_idx]
+
+        bot_dir = bot_pos_diff / bot_dist.unsqueeze(-1)
+        bot_dir = torch.cat((bot_dir, self.zero_z), dim=-1)
+        bot_dir = apply_quat_rot(loc_ori, bot_dir)
+
+        bot_proximity = norm_depth_range(bot_dist, self.sim.env_width * 2**0.5)
+        goal_path_proximity = norm_depth_range(self.goal_path_len, self.sim.env_width * 2**0.5)
+        colliding = (self.net_contacts[self.collider_indices, :2].abs().sum(-1) != 0.).float()
+
+        # Max (1 - 0 - 0), min (-1 - 1 - 2) / steps_in_ep
+        aux_reward = goal_path_proximity * goal_path_aim - bot_proximity * bot_dir[:, 0].clip(0.) - colliding * 2.
+        reward = reward + aux_reward / self.steps_in_ep
+
+        # Block weight updates to features that become relevant past level 1
+        if self.sim.level == 1:
+            goal_dir = goal_dir * 0.
+            goal_dist = goal_dist + MAX_DIST
+            goal_in_sight = torch.zeros_like(goal_dist)
+
+        else:
+            goal_in_sight = self.goal_in_sight_mask.float()
 
         # Assemble hidden state (should only be exposed to critics for better value estimation)
         obs_aux = torch.stack([
@@ -694,7 +739,11 @@ class MazeTask:
             goal_path_dir[:, 1],
             norm_depth_range(goal_dist, MAX_DIST),
             goal_path_proximity,
-            self.goal_in_sight_mask.float(),
+            goal_in_sight,
+            colliding,
+            bot_proximity,
+            bot_dir[:, 0],
+            bot_dir[:, 1],
             self.bot_time_at_goal,
             self.bot_time_on_task * SCALE_TIME,
             time_left * SCALE_TIME,
