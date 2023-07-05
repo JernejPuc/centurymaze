@@ -14,7 +14,7 @@ N_SEG_CLASSES = 7
 DOF_VEC_SIZE = 4
 IMU_VEC_SIZE = 3*3
 RGB_VEC_SIZE = 3
-REC_VEC_SIZE = RGB_VEC_SIZE*3
+REC_VEC_SIZE = (RGB_VEC_SIZE+1)*(3+1)
 DIR_VEC_SIZE = 2
 
 # 6 total: 2 air xy direction, 2 a* xy direction, 1 air distance, 1 a* path length
@@ -85,11 +85,7 @@ BRANCH_EPOCH_INTERVAL = 120 * 60 // SECONDS_PER_EPOCH
 # TODO: Adjust wrt. trials
 TIME_MILESTONE_MAP = {
     # Approx. 2 virtual minutes to warm up, 6 hours to train, half hour to cool down, 6.5 hours total
-    1: (120, 6 * 3600, 6 * 3600 + 1800),
-    # Approx. 2 virtual minutes to warm up, 6 hours to train, half hour to cool down, 6.5 hours total
-    2: (120, 6 * 3600, 6 * 3600 + 1800),
-    # Approx. half virtual hour to warm up, 5 days to train, 2 days to cool down, 1 week total
-    4: (1800, 5 * 24 * 3600, 7 * 24 * 3600)}
+    i: (120, 6 * 3600, 6 * 3600 + 1800) for i in range(1, 8)}
 
 N_EPOCHS_MAP = {k: tv[-1] // SECONDS_PER_EPOCH for k, tv in TIME_MILESTONE_MAP.items()}
 

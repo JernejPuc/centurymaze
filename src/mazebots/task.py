@@ -13,7 +13,7 @@ from discit.accel import capture_graph
 import config as cfg
 import maze
 from utils import eval_line_of_sight
-from utils_torch import apply_quat_rot, get_eulz_from_quat, norm_depth_range
+from utils_torch import apply_quat_rot, clip_angle_range, get_eulz_from_quat, norm_depth_range
 
 
 # Mag. units are nT / 100
@@ -24,9 +24,8 @@ MAG_REF = [[0.220967, 0.017385, 0.428883]]
 ACC_REF = [[0., 0., -0.980624]]
 
 # RGB receiver phases
-_RAD_120 = 120./180. * torch.pi
-RCVR_REL_PHASES = [[0., -_RAD_120, _RAD_120]]
-_2PI = 2.*torch.pi
+_RAD_90 = 90./180. * torch.pi
+RCVR_REL_PHASES = [[0., -_RAD_90, torch.pi, _RAD_90]]
 
 # Limited to 10 in the worst case, but usually it should be much lower
 # Implemented with tanh(x/10)*10 to keep sensitivity in the average case
@@ -704,22 +703,26 @@ class MazeTask:
 
         for pos_diff_i in bot_pos_diff_loc:
             pos_diff_i[..., 0].fill_diagonal_(MAX_DIST)
+            pos_diff_i[..., 1].fill_diagonal_(MAX_DIST)
 
         bot_pos_diff = bot_pos_diff_loc.reshape(self.sim.n_all_bots, -1, 2)
-        bot_dist: Tensor = torch.linalg.norm(bot_pos_diff, dim=-1)
-        bot_dist, bot_idx = bot_dist.min(-1)
-        bot_pos_diff = bot_pos_diff[torch.arange(self.sim.n_all_bots, device=self.device), bot_idx]
+        obj_pos_diff = self.obj_pos - self.bot_pos.unsqueeze(1)
+        all_pos_diff = torch.cat((bot_pos_diff, obj_pos_diff), dim=1)
 
-        bot_dir = bot_pos_diff / bot_dist.unsqueeze(-1)
-        bot_dir = torch.cat((bot_dir, self.zero_z), dim=-1)
-        bot_dir = apply_quat_rot(loc_ori, bot_dir)
+        all_sig = torch.ones((1, self.sim.n_bots + self.sim.n_objects, 1), device=self.device)
+        rcvr_angles = clip_angle_range(get_eulz_from_quat(self.bot_ori) + self.rcvr_rel_phases)
+        sum_dist = self.sense_colours(all_sig, all_pos_diff, rcvr_angles, 1.).squeeze(-1)
 
-        bot_proximity = norm_depth_range(bot_dist, self.sim.env_width * 2**0.5)
+        sum_axes = sum_dist[:, :2] - sum_dist[:, 2:]
+        sum_dir = sum_axes / torch.linalg.norm(sum_axes, dim=-1, keepdim=True).clip(1e-3)
+        sum_proximity = torch.linalg.norm(sum_dist, dim=-1)
+        sum_proximity = torch.tanh(sum_proximity / SCALE_RCVR) * SCALE_RCVR
+
         goal_path_proximity = norm_depth_range(self.goal_path_len, self.sim.env_width * 2**0.5)
         colliding = (self.net_contacts[self.collider_indices, :2].abs().sum(-1) != 0.).float()
 
-        # Max (1 - 0 - 0), min (-1 - 1 - 2) / steps_in_ep
-        aux_reward = goal_path_proximity * goal_path_aim - bot_proximity * bot_dir[:, 0].clip(0.) - colliding * 2.
+        # Max (1 - 0 - 0), min (-1 - 1 - 4) / steps_in_ep
+        aux_reward = goal_path_proximity * goal_path_aim - sum_proximity * sum_dir[:, 0].clip(0.) - colliding * 4.
         reward = reward + aux_reward / self.steps_in_ep
 
         # Block weight updates to features that become relevant past level 1
@@ -741,9 +744,9 @@ class MazeTask:
             goal_path_proximity,
             goal_in_sight,
             colliding,
-            bot_proximity,
-            bot_dir[:, 0],
-            bot_dir[:, 1],
+            sum_proximity,
+            sum_dir[:, 0],
+            sum_dir[:, 1],
             self.bot_time_at_goal,
             self.bot_time_on_task * SCALE_TIME,
             time_left * SCALE_TIME,
@@ -777,7 +780,7 @@ class MazeTask:
         obs_imu = self.imu(bot_vel)
 
         # RGB sense
-        rcvr_angles = get_eulz_from_quat(self.bot_ori) + self.rcvr_rel_phases
+        rcvr_angles = clip_angle_range(get_eulz_from_quat(self.bot_ori) + self.rcvr_rel_phases)
         obs_rgb = self.sense_bot_colours(act_rgb, rcvr_angles)
 
         # Compensate lack of vision
@@ -823,6 +826,7 @@ class MazeTask:
         # Set high value on diagonal to suppress own signal in distance calculation
         for pos_diff_i in pos_diff_loc:
             pos_diff_i[..., 0].fill_diagonal_(MAX_DIST)
+            pos_diff_i[..., 1].fill_diagonal_(MAX_DIST)
 
         # ExBxBx2 -> NxBx2
         pos_diff = pos_diff_loc.reshape(self.sim.n_all_bots, -1, 2)
@@ -830,6 +834,11 @@ class MazeTask:
         # Nx3 -> Ex1xBx3 -> ExBxBx3 -> NxBx3 (repeat_interleave does not work directly)
         act_rgb = act_rgb.reshape(self.sim.n_envs, 1, -1, 3).expand(-1, self.sim.n_bots, -1, -1)
         act_rgb = act_rgb.reshape(self.sim.n_all_bots, -1, 3).contiguous()
+
+        # Add constant component
+        # NxBx3 -> NxBx4
+        act_rgb = torch.cat(
+            (act_rgb, torch.ones((self.sim.n_all_bots, self.sim.n_bots, 1), device=self.device)), dim=-1)
 
         return self.sense_colours(act_rgb, pos_diff, rcvr_angles)
 
@@ -839,10 +848,15 @@ class MazeTask:
         # NxLx2, Nx2 -> NxLx2 - Nx1x2 -> NxLx2
         pos_diff = self.obj_pos - self.bot_pos.unsqueeze(1)
 
-        return self.sense_colours(self.obj_rgb, pos_diff, rcvr_angles)
+        # Add constant component
+        # NxLx3 -> NxLx4
+        rgb_sig = torch.cat(
+            (self.obj_rgb, torch.ones((self.sim.n_all_bots, self.sim.n_objects, 1), device=self.device)), dim=-1)
+
+        return self.sense_colours(rgb_sig, pos_diff, rcvr_angles)
 
     @staticmethod
-    def sense_colours(rgb_sig: Tensor, pos_diff: Tensor, rcvr_angles: Tensor) -> Tensor:
+    def sense_colours(rgb_sig: Tensor, pos_diff: Tensor, rcvr_angles: Tensor, max_dist: float = MAX_DIST) -> Tensor:
         """
         Weigh RGB signal transmissions of other entities by distance and sech filters
         wrt. 3 oriented receivers, each covering an angle of 120 degrees,
@@ -860,23 +874,23 @@ class MazeTask:
         # Weigh by distance
         # NxMx2 -> NxM
         dist: Tensor = torch.linalg.norm(pos_diff, dim=-1)
-        dist = norm_depth_range(dist, MAX_DIST)
+        dist = norm_depth_range(dist, max_dist)
 
-        # NxM, (1|N)xMx3 -> NxMx1 * (1|N)xMx3 -> NxMx3
+        # NxM, (1|N)xMxS -> NxMx1 * (1|N)xMxS -> NxMxS
         rgb_sig = dist.unsqueeze(-1) * rgb_sig
 
         # Weigh by phase-shifted filters
         # NOTE: Own angles are arbitrary, but the weight should already be suppressed via distance
         incoming_angle = torch.atan2(pos_diff[..., 1], pos_diff[..., 0])
 
-        # NxM, Nx3 -> NxMx1 - Nx1x3 -> NxMx3
+        # NxM, Nx4 -> NxMx1 - Nx1x4 -> NxMx4
         rel_angles = incoming_angle.unsqueeze(-1) - rcvr_angles.unsqueeze(1)
-        rel_angles = rel_angles + ((rel_angles < -torch.pi).float() - (rel_angles > torch.pi).float()) * _2PI
+        rel_angles = clip_angle_range(rel_angles)
 
-        # 1/cosh is naturally low at 120 degrees
-        rel_weights = 1. / torch.cosh(rel_angles)
+        # Phase filters
+        rel_weights = torch.cos(rel_angles).clip(0.)
 
-        # NxMx3, NxMx3 -> Nx3x3 -> Nx9
+        # NxMx4, NxMxS -> Nx4xS -> Nx(4xS)
         rgb_agg = torch.einsum('ijk,ijl->ikl', rel_weights, rgb_sig).flatten(1)
 
         return rgb_agg

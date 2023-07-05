@@ -364,7 +364,29 @@ class MazeConstructor:
         self.n_bots = n_bots
         self.n_objects = n_objects
 
-        self.rng = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
+        if isinstance(rng, np.random.Generator):
+            self.rng = rng
+            self.same_state_init = False
+
+        else:
+            self.rng = np.random.default_rng(rng)
+            self.same_state_init = True
+
+        self.rng_state_init = self.rng.__getstate__().copy()
+
+    def reset_rng(self) -> 'ndarray | None':
+        if self.same_state_init:
+            rng_state = self.rng.__getstate__().copy()
+            self.rng.__setstate__(self.rng_state_init)
+
+        else:
+            rng_state = None
+
+        return rng_state
+
+    def resume_rng(self, rng_state: 'ndarray | None'):
+        if self.same_state_init:
+            self.rng.__setstate__(rng_state)
 
     def prune_grid(
         self,
@@ -416,11 +438,15 @@ class MazeConstructor:
 
         while True:
             if data is None:
+                rng_state = self.reset_rng()
+
                 # Generate graph vertices
                 graph_points = self.rng.uniform(
                     low=-self.env_halfwidth,
                     high=self.env_halfwidth,
                     size=(self.n_graph_points, 2))
+
+                self.resume_rng(rng_state)
 
                 # Construct a cyclical, connected graph
                 graph_edges = urquhart(graph_points)
@@ -497,6 +523,8 @@ class MazeConstructor:
 
             return data
 
+        rng_state = self.reset_rng()
+
         # Sample wall colours
         wall_colour_idx_order = self.rng.permutation(len(MazeEnv.WALL_COLOURS))
 
@@ -511,6 +539,8 @@ class MazeConstructor:
 
         closest_centroid_idx = np.argmin(np.linalg.norm(wall_positions[None] - centroids[:, None], axis=-1), axis=0)
         wall_colour_idcs = wall_colour_idx_order[closest_centroid_idx]
+
+        self.resume_rng(rng_state)
 
         # Node positions for A*
         grid_square_centres = (self.grid_delims[1:] + self.grid_delims[:-1]) / 2.

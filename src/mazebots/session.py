@@ -400,7 +400,7 @@ class Session(MazeTask):
         self.model_options = self.MODEL_OPTIONS[args.model_type]
         model_name = f'{args.model_name}_{self.model_options["suffix"]}'
 
-        self.ckpter = CheckpointTracker(model_name, cfg.DATA_DIR, device, args.rng_seed, args.transfer_name)
+        self.ckpter = CheckpointTracker(model_name, cfg.DATA_DIR, device, args.rng_seed, args.transfer_name, 0, True)
         rng = self.ckpter.rng if args.level < args.keep_level else None
 
         # Init IsaacGym and generate initial envs
@@ -423,7 +423,7 @@ class Session(MazeTask):
                 (self.ctrl_mode > self.CTRL_MAN and self.model_options['vis'])
                 or self.rec_mode > self.REC_NONE),
             render_segmentation=self.rec_mode > self.REC_NONE,
-            signal_object_rgb=not self.model_options['vis'],
+            signal_object_rgb=self.model_options['guide'],
             spawn_with_random_rgb=self.ctrl_mode == self.CTRL_GEN,
             uniform_task_sampling=self.ctrl_mode == self.CTRL_GEN,
             distribute_env_resets=self.ctrl_mode == self.CTRL_RL,
@@ -576,6 +576,9 @@ class Session(MazeTask):
             raise
 
     def eval(self):
+        if not self.headless:
+            self.interface.update_top_view()
+
         model = ActorCritic(
             self.sim.n_bots,
             self.model_options['vis'],
@@ -604,13 +607,107 @@ class Session(MazeTask):
                 if rst_mask_f.any().item():
                     mem = model.reset_mem(mem, rst_mask_f)
 
+    # TODO: Body repeated from eval
+    def eval_(self):
+        if not self.headless:
+            self.interface.update_top_view()
+
+        model = ActorCritic(
+            self.sim.n_bots,
+            self.model_options['vis'],
+            self.model_options['com'],
+            self.model_options['guide'],
+            prob_actor=True,
+            ignore_com=not self.reward_sharing)
+
+        model.to(self.ckpter.device)
+        self.ckpter.load_model(model)
+
+        # Accelerate actor
+        mem = model.init_mem(self.sim.n_all_bots)
+        model.act_partial = self.accel_action(model.act_partial, mem)
+
+        # Track performance, collisions, and pathing
+        throughput = 0.
+        tput_ctr = 0.
+
+        contacts = 0.
+        cont_ctr = 0
+
+        # Track pathing
+        file_idx = get_available_file_idx(cfg.DATA_DIR, 'pos')
+        filename = os.path.join(cfg.DATA_DIR, f'pos_{file_idx:02d}.npy')
+        positions = torch.zeros((self.end_step, self.sim.n_all_bots, 2), device=self.device)
+
+        with torch.inference_mode():
+            obs = self.step(get_info=False)[0]
+            step_ctr = -1
+
+            while (step_ctr := step_ctr + 1) != self.end_step:
+                actions, mem = model.act(obs, mem)
+
+                obs, reward, rst_mask_f, _ = self.step(actions, get_info=False)
+                obs = self.post_step(obs, reward, rst_mask_f, None)
+
+                if rst_mask_f.any().item():
+                    mem = model.reset_mem(mem, rst_mask_f)
+
+                tput_mask = (self.throughput != 0.).float()
+                tput_ctr = tput_ctr + tput_mask
+                throughput = throughput + self.throughput * tput_mask
+
+                cont_ctr += 1
+                contacts = contacts + (self.net_contacts[self.collider_indices, :2].abs().sum(-1) != 0.).float()
+
+                positions[step_ctr] = self.bot_pos
+
+        tput_ctr = tput_ctr.clip(1.)
+        throughput = (throughput / tput_ctr).mean().item()
+
+        cont_ctr = max(cont_ctr, 1)
+        contacts = (contacts / cont_ctr).mean().item()
+
+        positions = positions.cpu().numpy()
+        np.save(filename, positions)
+
+        print(f'\nFinal avg. throughput: {throughput:.4f}')
+        print(f'\nFinal avg. contacts: {contacts:.4f}')
+        print(f'\nPositions saved to {filename}.')
+
     def play(self):
+        if not self.headless:
+            self.interface.update_top_view()
+
         with torch.inference_mode():
             self.step(get_info=False)
             step_ctr = -1
 
             while (step_ctr := step_ctr + 1) != self.end_step:
                 self.post_step(*self.step(self.actions, get_info=False))
+
+    # TODO: Body repeated from play
+    def play_(self):
+        if not self.headless:
+            self.interface.update_top_view()
+
+        throughput = 0.
+        tput_ctr = 0.
+
+        with torch.inference_mode():
+            self.step(get_info=False)
+            step_ctr = -1
+
+            while (step_ctr := step_ctr + 1) != self.end_step:
+                self.post_step(*self.step(self.actions, get_info=False))
+
+                tput_mask = (self.throughput != 0.).float()
+                tput_ctr = tput_ctr + tput_mask
+                throughput = throughput + self.throughput * tput_mask
+
+        tput_ctr = tput_ctr.clip(1.)
+        throughput = (throughput / tput_ctr).mean().item()
+
+        print(f'\nFinal avg. throughput: {throughput:.4f}')
 
     def accel_action(
         self,
