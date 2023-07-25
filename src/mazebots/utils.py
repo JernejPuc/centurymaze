@@ -84,7 +84,7 @@ def any_intersections(p1: ndarray, p2: ndarray, edges: ndarray) -> bool:
     return any(intersection(p1, p2, q1, q2) for q1, q2 in edges)
 
 
-@numba.njit
+@numba.jit(nopython=True, nogil=True, cache=True)
 def intersection(p1: ndarray, p2: ndarray, q1: ndarray, q2: ndarray) -> bool:
     """Check for an intersection between two line segments."""
 
@@ -105,7 +105,7 @@ def intersection(p1: ndarray, p2: ndarray, q1: ndarray, q2: ndarray) -> bool:
         (o4 == 0 and on_segment(q1, q2, p2)))
 
 
-@numba.njit
+@numba.jit(nopython=True, nogil=True, cache=True)
 def orientation(p: ndarray, q: ndarray, r: ndarray) -> int:
     """Get the orientation (order class) of a pqr point triplet."""
 
@@ -114,7 +114,7 @@ def orientation(p: ndarray, q: ndarray, r: ndarray) -> int:
     return 1 if val > 0 else (2 if val < 0 else 0)
 
 
-@numba.njit
+@numba.jit(nopython=True, nogil=True, cache=True)
 def on_segment(p: ndarray, q: ndarray, r: ndarray) -> bool:
     """Check if point r lies on the segment of points pq."""
 
@@ -123,7 +123,7 @@ def on_segment(p: ndarray, q: ndarray, r: ndarray) -> bool:
         min(p[1], q[1]) <= r[1] <= max(p[1], q[1]))
 
 
-@numba.njit
+@numba.jit(nopython=True, nogil=True, cache=True)
 def min_distance(p: ndarray, q: ndarray, r: ndarray) -> float:
     """Get the distance of point r to the segment of points pq."""
 
@@ -144,7 +144,7 @@ def min_distance(p: ndarray, q: ndarray, r: ndarray) -> float:
     return abs(pq[0]*pr[1] - pq[1]*pr[0]) / np.linalg.norm(pq)
 
 
-@numba.njit
+@numba.jit(nopython=True, nogil=True, cache=True)
 def ray_trace(
     i0: ndarray,
     i1: ndarray,
@@ -199,7 +199,7 @@ def ray_trace(
     return True
 
 
-@numba.njit
+@numba.jit(nopython=True, nogil=True, cache=True)
 def eval_line_of_sight(
     origin_pos: ndarray,
     target_pos: ndarray,
@@ -230,7 +230,7 @@ def get_numba_dict(tuple_as_key: bool = False) -> 'dict[int | tuple[int, int], n
     return Dict.empty(key_type=key_type, value_type=types.int64[:])
 
 
-@numba.njit
+@numba.jit(nopython=True, nogil=True, cache=True)
 def astar(
     graph: 'dict[int, ndarray]',
     node_pos: ndarray,
@@ -308,7 +308,7 @@ def astar(
     return np.array([exit_node, entry_node])
 
 
-@numba.njit
+@numba.jit(nopython=True, nogil=True, cache=True)
 def reconstruct_paths(
     origin_pos: ndarray,
     target_pos: ndarray,
@@ -367,7 +367,7 @@ def reconstruct_paths(
     return dists, dirs
 
 
-@numba.njit
+@numba.jit(nopython=True, nogil=True, cache=True)
 def eval_path(
     path: ndarray,
     origin_pos: ndarray,
@@ -400,7 +400,7 @@ def eval_path(
     return dist_sum, dir_to_next
 
 
-@numba.njit
+@numba.jit(nopython=True, nogil=True, cache=True)
 def prune_path_forward(
     path: ndarray,
     entry_idcs: ndarray,
@@ -434,7 +434,7 @@ def prune_path_forward(
     return path[:entry_ptr+1]
 
 
-@numba.njit
+@numba.jit(nopython=True, nogil=True, cache=True)
 def prune_path_backward(
     path: ndarray,
     exit_idcs: ndarray,
