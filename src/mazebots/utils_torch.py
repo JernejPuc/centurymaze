@@ -42,7 +42,7 @@ def apply_quat_rot(q: Tensor, v: Tensor) -> Tensor:
     uv = torch.cross(qvec, v, dim=1)
     uuv = torch.cross(qvec, uv, dim=1)
 
-    return (v + 2. * (q[:, -1:] * uv + uuv))
+    return v + 2. * (q[:, -1:] * uv + uuv)
 
 
 def get_eulz_from_quat(q: Tensor, keepdim: bool = True) -> Tensor:
@@ -66,3 +66,34 @@ def get_eulz_from_quat(q: Tensor, keepdim: bool = True) -> Tensor:
     eulz = torch.atan2(2. * (q0 * q3 - q1 * q2), 1. - 2.*(q2 * q2 + q3 * q3))
 
     return eulz.unsqueeze(-1) if keepdim else eulz
+
+
+def rgb_to_hsv(img: Tensor, unstack_dim: int = -1, stack_dim: int = -1) -> Tensor:
+    """
+    See: https://github.com/pytorch/vision/blob/main/torchvision/transforms/_functional_tensor.py#L262
+    """
+
+    r, g, b = img.unbind(dim=unstack_dim)
+    max_val = torch.ones_like(r)
+
+    max_channel_val = torch.max(img, dim=-1).values
+    min_channel_val = torch.min(img, dim=-1).values
+
+    eq_channel_mask_f = (max_channel_val == min_channel_val).float()
+    channel_diff = max_channel_val - min_channel_val
+
+    masked_diff = torch.lerp(channel_diff, max_val, eq_channel_mask_f)
+    sat = channel_diff / torch.lerp(max_channel_val, max_val, eq_channel_mask_f)
+
+    r_diff = (max_channel_val - r) / masked_diff
+    g_diff = (max_channel_val - g) / masked_diff
+    b_diff = (max_channel_val - b) / masked_diff
+
+    r_hue = (max_channel_val == r) * (b_diff - g_diff)
+    g_hue = ((max_channel_val == g) & (max_channel_val != r)) * (2. + r_diff - b_diff)
+    b_hue = ((max_channel_val != g) & (max_channel_val != r)) * (4. + g_diff - r_diff)
+
+    hue = r_hue + g_hue + b_hue
+    hue = torch.fmod((hue / 6. + 1.), 1.)
+
+    return torch.stack((hue, sat, max_channel_val), dim=stack_dim)

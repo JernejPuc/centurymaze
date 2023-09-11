@@ -5,4 +5,4 @@ numba
 torch >= 2.0
 tensorboard
 isaacgym
-discit == 0.1.5
+discit @ git+https://github.com/jernejpuc/discit@main

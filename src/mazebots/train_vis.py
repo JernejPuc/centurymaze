@@ -7,15 +7,15 @@ from time import perf_counter
 
 import torch
 from torch import Tensor
-from torch.nn import functional
+from torch.nn.functional import log_softmax, one_hot
 from torch.utils.tensorboard import SummaryWriter
 
 from discit.accel import capture_graph
 from discit.data import LoadedDataset, SideLoadingDataset
-from discit.optim import NAdamW, SoftConstLRScheduler
+from discit.optim import NAdamW, PlateauScheduler
 from discit.track import CheckpointTracker
 
-from config import DATA_DIR, LOG_DIR, N_SEG_CLASSES
+import config as cfg
 from model import VisNet
 
 
@@ -46,13 +46,13 @@ class Trainer:
         if device.startswith('cuda'):
             torch.backends.cudnn.benchmark = True
 
-        self.ckpter = CheckpointTracker(model_name, DATA_DIR, device, rng_seed)
+        self.ckpter = CheckpointTracker(model_name, cfg.DATA_DIR, device, rng_seed)
 
         self.model = VisNet()
         self.optimiser = NAdamW(self.model.parameters(), lr=2e-5, weight_decay=0.)
         self.ckpter.load_model(self.model, self.optimiser)
 
-        self.scheduler = SoftConstLRScheduler(
+        self.scheduler = PlateauScheduler(
             self.optimiser,
             step_milestones=[lr_main_start_epoch, lr_main_end_epoch, self.n_epochs],
             starting_step=self.ckpter.meta['update_step'])
@@ -67,7 +67,7 @@ class Trainer:
             'dep_wmse': new_zero_tensor(),
             'seg_fce': new_zero_tensor()}
 
-        self.writer = SummaryWriter(log_dir=os.path.join(LOG_DIR, model_name))
+        self.writer = SummaryWriter(log_dir=os.path.join(cfg.LOG_DIR, model_name))
         self.write = self.writer.add_scalar
 
         # Dataset
@@ -75,7 +75,7 @@ class Trainer:
             SideLoadingDataset
             if device.startswith('cuda') and sideload
             else LoadedDataset)(
-                os.path.join(DATA_DIR, file_name), batch_size, device)
+                os.path.join(cfg.DATA_DIR, file_name), batch_size, device)
 
         self.n_steps_per_epoch = max(1, len(self.dataset) // batch_size)
 
@@ -119,7 +119,7 @@ class Trainer:
                 self.print_progress(progress, remaining_time, epoch_step, iter_step)
 
                 # Mirror batch
-                if self.ckpter.rng.random() < self.mirror_prob:
+                if self.mirror_prob and self.ckpter.rng.random() < self.mirror_prob:
                     batch = batch.flip(-1)
 
                 if self.graph is None:
@@ -170,37 +170,45 @@ class Trainer:
 
         self.ckpter.checkpoint(epoch_step, update_step, ckpt_increment, self.loss.item())
 
-    def update(self, targets: Tensor):
-        rgbdep, seg = self.model(targets[:, :4])
+    def update(self, batch: Tensor):
 
-        # Split RGB and depth
-        rgb = rgbdep[:, :3]
-        dep = rgbdep[:, 3]
+        # Unpack inputs and targets
+        ipt, clr_target, seg_target, px_weights = batch.split(cfg.DEC_IMG_CHANNEL_SPLIT, dim=1)
+
+        dep_target = ipt[:, -1]
+        clr_target = clr_target.long()
+        seg_target = seg_target.long()
+
+        # Unpack model outputs
+        out = self.model(ipt)
+
+        clr_logits, seg_logits, dep = out.split(cfg.DEC_IMG_CHANNEL_SPLIT[1:], dim=1)
 
         # Logits to probs.
-        log_prob = functional.log_softmax(seg, dim=1)
-        prob = functional.softmax(seg, dim=1)
+        clr_log_probs = log_softmax(clr_logits, dim=1)
+        clr_probs = clr_logits.softmax(dim=1)
 
-        rgb_target = targets[:, :3]
-        dep_target = targets[:, 3]
-        seg_target = targets[:, 4].long()
-        px_weights = targets[:, 5:]
+        seg_log_probs = log_softmax(seg_logits, dim=1)
+        seg_probs = seg_logits.softmax(dim=1)
 
-        # Expand segmentation to probs. (one-hot)
-        prob_target = functional.one_hot(seg_target, N_SEG_CLASSES).neg_()
-        prob_target = torch.movedim(prob_target, -1, 1)
+        # Expand indices to probs. (one-hot)
+        clr_probs_target = one_hot(clr_target, cfg.N_CLR_CLASSES).neg_()
+        clr_probs_target = torch.movedim(clr_probs_target, -1, 1)
 
-        # Weighted mean absolute error (external weights)
-        rgb_wmae = ((rgb - rgb_target).abs() * px_weights).mean()
+        seg_probs_target = one_hot(seg_target, cfg.N_SEG_CLASSES).neg_()
+        seg_probs_target = torch.movedim(seg_probs_target, -1, 1)
 
-        # Weighted mean squared error
-        dep_mse = ((dep - dep_target).square() * px_weights).mean()
+        # Weighted mean squared error (external weights)
+        dep_wmse = ((dep - dep_target).square() * px_weights).mean()
 
         # Focal cross entropy (gamma 1)
-        seg_fce = ((1. - prob) * (log_prob * prob_target)).mean()
+        clr_fce = ((1. - clr_probs) * (clr_log_probs * clr_probs_target)).mean()
+
+        # Focal cross entropy (gamma 1)
+        seg_fce = ((1. - seg_probs) * (seg_log_probs * seg_probs_target)).mean()
 
         # Update params.
-        loss = rgb_wmae + dep_mse + seg_fce
+        loss = dep_wmse + clr_fce + seg_fce
         loss.backward()
 
         self.optimiser.step()
@@ -212,8 +220,8 @@ class Trainer:
             self.loss += loss
 
             self.stats['loss'] += loss
-            self.stats['rgb_wmae'] += rgb_wmae
-            self.stats['dep_wmse'] += dep_mse
+            self.stats['dep_wmse'] += dep_wmse
+            self.stats['clr_fce'] += clr_fce
             self.stats['seg_fce'] += seg_fce
 
 
@@ -261,7 +269,7 @@ if __name__ == '__main__':
         '--batch_size', type=int, default=64,
         help='Number of images processed simultaneously per update.')
     parser.add_argument(
-        '--mirror_prob', type=float, default=0.1,
+        '--mirror_prob', type=float, default=0.,
         help='Probability of flipping images in a batch over the horizontal dimension.')
 
     args = parser.parse_args()

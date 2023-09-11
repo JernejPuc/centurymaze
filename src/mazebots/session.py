@@ -2,7 +2,6 @@
 
 import os
 from argparse import Namespace
-from collections import deque
 from typing import Any, Callable
 
 import numpy as np
@@ -17,9 +16,9 @@ from discit.rl import PPG
 from discit.track import CheckpointTracker
 
 import config as cfg
-import maze
-from task import BasicInterface, MazeTask, MAX_DIST, SCALE_TIME
-from model import ActorCritic
+from sim import MazeSim, CAM_OFFSET, MOT_MAX_TORQUE
+from task import BasicInterface, MazeTask, MAX_IMG_DEPTH, SCALE_TIME
+from model import ActorCritic, Policy
 from utils import get_arg_defaults, get_available_file_idx
 from utils_torch import norm_depth_range, apply_quat_rot, get_eulz_from_quat
 
@@ -38,11 +37,11 @@ class Interface(BasicInterface):
         np.arctan2(-1, -1): [0., -1., 0., -1.],
         np.arctan2(1, -1): [-1., 0., -1., 0.]}
 
-    OFFSET_BOT_AHEAD = [[maze.CAM_OFFSET[0], 0., 0.]]
-    OFFSET_BOT_ABOVE = [[0., 0., maze.CAM_OFFSET[2]]]
+    OFFSET_BOT_AHEAD = [[CAM_OFFSET[0], 0., 0.]]
+    OFFSET_BOT_ABOVE = [[0., 0., CAM_OFFSET[2]]]
 
-    OFFSET_3RD_AHEAD = [[-maze.BOT_WIDTH*2, 0., 0.]]
-    OFFSET_3RD_ABOVE = [[0., 0., maze.WALL_HALFHEIGHT]]
+    OFFSET_3RD_AHEAD = [[-cfg.BOT_WIDTH*2, 0., 0.]]
+    OFFSET_3RD_ABOVE = [[0., 0., cfg.WALL_HALFHEIGHT]]
 
     OBS_EVENTS = [
         (gymapi.KEY_ESCAPE, 'end_session'), (gymapi.KEY_L, 'lvl_reset'),
@@ -65,7 +64,7 @@ class Interface(BasicInterface):
     VIEW_TOP = 1
     VIEW_3RD = 0
 
-    def __init__(self, session: 'Session', sim: maze.MazeSim, device: str):
+    def __init__(self, session: 'Session', sim: MazeSim, device: str):
         super().__init__(sim.gym, sim.handle)
 
         self.session = session
@@ -144,7 +143,7 @@ class Interface(BasicInterface):
 
         mvmt_forw = self.key_vec[0:2].sum()
         mvmt_left = self.key_vec[2:4].sum()
-        scale = (maze.MOT_MAX_TORQUE / 2.) if self.key_vec[4] else maze.MOT_MAX_TORQUE
+        scale = (MOT_MAX_TORQUE / 2.) if self.key_vec[4] else MOT_MAX_TORQUE
 
         if not (mvmt_forw or mvmt_left):
             return self.torque_states[np.nan]
@@ -155,9 +154,12 @@ class Interface(BasicInterface):
         if self.session.async_temp_result is None:
             return 'State not yet evaluated.\n'
 
-        obs_vec, obs_aux = self.session.async_temp_result
+        obs_img, obs_vec, com_weights = self.session.async_temp_result
+        obs_com = Policy.weigh_signals(self.sim, obs_vec[:, cfg.OBS_RGB_SLICE], com_weights)
+
+        obs_img = obs_img[self.all_bot_idx].cpu().mean((-2, -1)).numpy()
         obs_vec = obs_vec[self.all_bot_idx].cpu().numpy()
-        obs_aux = obs_aux[self.all_bot_idx].cpu().numpy()
+        obs_com = obs_com[self.all_bot_idx].cpu().flatten().numpy()
 
         time_left = (self.sim.ep_duration - self.session.env_run_times[self.env_idx]).item()
         tput = self.session.get_throughput()
@@ -171,39 +173,47 @@ class Interface(BasicInterface):
             f'Ori. angle (z)  | {z_angle: .0f}\n\n'
 
             'GUIDE\n'
-            f'Air direction   | Front: {obs_aux[0]: .2f} | Left: {obs_aux[1]: .2f}\n'
-            f'A*  direction   | Front: {obs_aux[2]: .2f} | Left: {obs_aux[3]: .2f}\n'
-            f'Air proximity   |        {obs_aux[4]: .2f}\n'
-            f'A*  proximity   |        {obs_aux[5]: .2f}\n'
-            f'Goal in sight   | {"TRUE" if obs_aux[6] else "FALSE"}\n\n'
+            f'Goal position   | Front: {obs_vec[24]: .2f} | Left: {obs_vec[25]: .2f}\n'
+            f'Bot position    | Front: {obs_vec[26]: .2f} | Left: {obs_vec[27]: .2f}\n'
+            f'Air direction   | Front: {obs_vec[28]: .2f} | Left: {obs_vec[29]: .2f}\n'
+            f'A*  direction   | Front: {obs_vec[30]: .2f} | Left: {obs_vec[31]: .2f}\n'
+            f'Air proximity   |        {obs_vec[32]: .2f}\n'
+            f'A*  proximity   |        {obs_vec[33]: .2f}\n'
+            f'Goal in sight   | {"TRUE" if obs_vec[32] == obs_vec[33] else "FALSE"}\n\n'
 
-            'AUXILIARY\n'
-            f'Time at goal    | {obs_aux[7]: .2f}s\n'
-            f'Time on task    | {obs_aux[8] / SCALE_TIME: .2f}s\n'
-            f'Time to ep. end | {obs_aux[9] / SCALE_TIME: .2f}s\n'
-            f'New/done tasks  | {obs_aux[10]: .0f}\n'
-            f'Avg. throughput | {obs_aux[11]: .2f}\n\n'
+            'OBSTRUCTION\n'
+            f'Prox. channels  | Front: {obs_vec[34]: .2f} | Right: {obs_vec[35]: .2f}\n'
+            f'                | Back:  {obs_vec[36]: .2f} | Left:  {obs_vec[37]: .2f}\n'
+            f'Contact flag    | {"TRUE" if obs_vec[38] else "FALSE"}\n\n'
+
+            'TASK\n'
+            f'Time at goal    | {obs_vec[39]: .2f}s\n'
+            f'Time on task    | {obs_vec[40] / SCALE_TIME: .2f}s\n'
+            f'Time to ep. end | {obs_vec[41] / SCALE_TIME: .2f}s\n'
+            f'New/done tasks  | {obs_vec[42]: .0f}\n'
+            f'Avg. throughput | {obs_vec[43]: .2f} (per bot per 10s)\n\n'
 
             'OBSERVATION\n'
-            f'Time at goal    | {obs_vec[0]: .2f}s\n'
-            f'Avg. throughput | {obs_vec[1]: .2f} (per bot per 6s)\n'
-            f'Act. torques    | {obs_vec[2]: .2f}, {obs_vec[3]: .2f}, {obs_vec[4]: .2f}, {obs_vec[5]: .2f}\n'
-            f'DOF vel.        | {obs_vec[6]: .2f}, {obs_vec[7]: .2f}, {obs_vec[8]: .2f}, {obs_vec[9]: .2f}\n'
-            f'IMU ang. vel.   | {obs_vec[10]: .2f}, {obs_vec[11]: .2f}, {obs_vec[12]: .2f}\n'
-            f'IMU accel.      | {obs_vec[13]: .2f}, {obs_vec[14]: .2f}, {obs_vec[15]: .2f}\n'
-            f'IMU magnet.     | {obs_vec[16]: .2f}, {obs_vec[17]: .2f}, {obs_vec[18]: .2f}\n'
-            f'Act. RGB        | {obs_vec[19]: .2f}, {obs_vec[20]: .2f}, {obs_vec[21]: .2f}\n'
-            f'RGB goal        | {obs_vec[22]: .2f}, {obs_vec[23]: .2f}, {obs_vec[24]: .2f}\n'
-            f'RGB receiver F  | {obs_vec[25]: .2f}, {obs_vec[26]: .2f}, {obs_vec[27]: .2f}\n'
-            f'RGB receiver L  | {obs_vec[28]: .2f}, {obs_vec[29]: .2f}, {obs_vec[30]: .2f}\n'
-            f'RGB receiver R  | {obs_vec[31]: .2f}, {obs_vec[32]: .2f}, {obs_vec[33]: .2f}\n')
+            f'Avg. img. chan. | R: {obs_img[0]: .2f} | G: {obs_img[1]: .2f} | B: {obs_img[2]: .2f}\n'
+            f'                | D: {obs_img[3]: .2f}\n'
+            f'Act. torques    | {obs_vec[1]: .2f}, {obs_vec[2]: .2f}, {obs_vec[3]: .2f}, {obs_vec[4]: .2f}\n'
+            f'DOF vel.        | {obs_vec[5]: .2f}, {obs_vec[6]: .2f}, {obs_vec[7]: .2f}, {obs_vec[8]: .2f}\n'
+            f'IMU ang. vel.   | X: {obs_vec[9]: .2f} | Y: {obs_vec[10]: .2f} | Z: {obs_vec[11]: .2f}\n'
+            f'IMU accel.      | X: {obs_vec[12]: .2f} | Y: {obs_vec[13]: .2f} | Z: {obs_vec[14]: .2f}\n'
+            f'IMU magnet.     | X: {obs_vec[15]: .2f} | Y: {obs_vec[16]: .2f} | Z: {obs_vec[17]: .2f}\n'
+            f'Goal colour     | R: {obs_vec[18]: .2f} | G: {obs_vec[19]: .2f} | B: {obs_vec[20]: .2f}\n'
+            f'Act. colour     | R: {obs_vec[21]: .2f} | G: {obs_vec[22]: .2f} | B: {obs_vec[23]: .2f}\n\n'
+            f'RGB rcvr. Front | R: {obs_com[0]: .2f} | G: {obs_com[1]: .2f} | B: {obs_com[2]: .2f}\n'
+            f'RGB rcvr. Right | R: {obs_com[3]: .2f} | G: {obs_com[4]: .2f} | B: {obs_com[5]: .2f}\n'
+            f'RGB rcvr. Back  | R: {obs_com[6]: .2f} | G: {obs_com[7]: .2f} | B: {obs_com[8]: .2f}\n'
+            f'RGB rcvr. Left  | R: {obs_com[9]: .2f} | G: {obs_com[10]: .2f} | B: {obs_com[11]: .2f}\n')
 
     def save_camera_images(self) -> 'tuple[str, str]':
         self.gym.render_all_camera_sensors(self.sim_handle)
         self.gym.start_access_image_tensors(self.sim_handle)
 
         rgb = self.session.img_rgb_list[self.all_bot_idx][..., :3].cpu().numpy()
-        dep = 255. * norm_depth_range(-self.session.img_dep_list[self.all_bot_idx], MAX_DIST).cpu().numpy()
+        dep = 255. * norm_depth_range(-self.session.img_dep_list[self.all_bot_idx], MAX_IMG_DEPTH).cpu().numpy()
 
         self.gym.end_access_image_tensors(self.sim_handle)
 
@@ -340,40 +350,14 @@ class Session(MazeTask):
     CTRL_GEN = 1
     CTRL_MAN = 0
 
-    REC_ALL = 2
+    REC_ALL = 3
+    REC_IMG = 2
     REC_VEC = 1
     REC_NONE = 0
 
-    MDL_GUIDE = 3
-    MDL_BLIND = 2
-    MDL_COM = 1
-    MDL_BASE = 0
-
-    MODEL_OPTIONS = {
-        MDL_BASE: {
-            'suffix': 'base',
-            'vis': True,
-            'com': False,
-            'guide': False},
-        MDL_COM: {
-            'suffix': 'com',
-            'vis': True,
-            'com': True,
-            'guide': False},
-        MDL_BLIND: {
-            'suffix': 'blind',
-            'vis': False,
-            'com': True,
-            'guide': True},
-        MDL_GUIDE: {
-            'suffix': 'guide',
-            'vis': True,
-            'com': True,
-            'guide': True}}
-
     ARGS = [
         {'name': '--level', 'type': int, 'default': 4, 'help': 'Maze complexity level.'},
-        {'name': '--keep_level', 'type': int, 'default': 4, 'help': 'Min. level that keeps its preset structure.'},
+        {'name': '--level_name', 'type': str, 'default': '', 'help': 'Name of file containing preset level data.'},
         {'name': '--regen', 'type': int, 'default': 0, 'help': 'Option to fully regenerate environments on reset.'},
         {'name': '--n_bots', 'type': int, 'default': -1, 'help': 'Number of agents per environment.'},
         {'name': '--n_envs', 'type': int, 'default': -1, 'help': 'Number of parallel environments.'},
@@ -383,31 +367,40 @@ class Session(MazeTask):
         {'name': '--rec_mode', 'type': int, 'default': REC_NONE, 'help': 'Data category to record.'},
         {'name': '--headless', 'type': int, 'default': 0, 'help': 'Option to run without a viewer.'},
         {'name': '--act_freq', 'type': int, 'default': cfg.STEPS_PER_SECOND, 'help': 'Inference steps per second.'},
-        {'name': '--transfer_name', 'type': str, 'default': '', 'help': 'Base model name/ID string.'},
+        {'name': '--transfer_name', 'type': str, 'default': '', 'help': 'Starting model name/ID string.'},
+        {'name': '--transfer_ver', 'type': int, 'default': 0, 'help': 'Starting model ckpt. version.'},
         {'name': '--model_name', 'type': str, 'default': 'mazeai', 'help': 'Model name/ID string.'},
-        {'name': '--model_type', 'type': int, 'default': MDL_COM, 'help': 'Communication and guidance options.'},
+        {'name': '--model_com', 'type': int, 'default': 1, 'help': 'Option to use communication I/O.'},
+        {'name': '--model_guide', 'type': int, 'default': 0, 'help': 'Option to use hidden state inputs.'},
+        {'name': '--model_prob', 'type': int, 'default': 1, 'help': 'Option to keep probabilistic inference.'},
+        {'name': '--model_share', 'type': int, 'default': 0, 'help': 'Option to enable reward sharing.'},
         {'name': '--rng_seed', 'type': int, 'default': 42, 'help': 'Seed for numpy and torch RNGs.'}]
 
     def __init__(self, args: Namespace):
         self.end_step: int = args.end_step
         self.ctrl_mode: int = args.ctrl_mode
         self.rec_mode: int = args.rec_mode
-        self.rec_data_queue: 'deque[tuple[Tensor, Tensor]]' = deque()
+        self.rec_data_queue: 'list[tuple[Tensor, Tensor]]' = []
 
         # Resume model state
         device = 'cuda' if args.use_gpu_pipeline else 'cpu'
 
-        self.model_options = self.MODEL_OPTIONS[args.model_type]
-        model_name = f'{args.model_name}_{self.model_options["suffix"]}'
+        self.model_options = {
+            'communicating': args.model_com,
+            'guided': args.model_guide,
+            'prob_actor': args.model_prob}
 
-        self.ckpter = CheckpointTracker(model_name, cfg.DATA_DIR, device, args.rng_seed, args.transfer_name, 0, True)
-        rng = self.ckpter.rng if args.level < args.keep_level else None
+        self.ckpter = CheckpointTracker(
+            args.model_name, cfg.DATA_DIR, device, args.rng_seed, args.transfer_name, args.transfer_ver,
+            reset_step_on_transfer=True)
 
         # Init IsaacGym and generate initial envs
         self.steps_per_second: int = min(args.act_freq, 64)
         frames_per_second = self.steps_per_second if args.headless else 64
 
-        sim = maze.MazeSim(args.level, args.n_bots, args.n_envs, frames_per_second, args, rng)
+        data_path = os.path.join(cfg.DATA_DIR, args.level_name) if args.level_name else None
+
+        sim = MazeSim(args.level, args.n_bots, args.n_envs, frames_per_second, args, self.ckpter.rng, data_path)
         interface = Interface(self, sim, device) if not args.headless else None
 
         # Extend or diminish standard episode duration
@@ -419,16 +412,13 @@ class Session(MazeTask):
             interface,
             self.steps_per_second,
             frames_per_second,
-            render_cameras=(
-                (self.ctrl_mode > self.CTRL_MAN and self.model_options['vis'])
-                or self.rec_mode > self.REC_NONE),
+            render_cameras=self.ctrl_mode > self.CTRL_MAN or self.rec_mode > self.REC_NONE,
             render_segmentation=self.rec_mode > self.REC_NONE,
-            signal_object_rgb=self.model_options['guide'],
             spawn_with_random_rgb=self.ctrl_mode == self.CTRL_GEN,
             uniform_task_sampling=self.ctrl_mode == self.CTRL_GEN,
             distribute_env_resets=self.ctrl_mode == self.CTRL_RL,
-            full_env_regeneration=bool(args.regen),
-            reward_sharing=args.model_type == self.MDL_COM,
+            full_env_regeneration=data_path is None and args.regen,
+            reward_sharing=bool(args.model_share),
             device=device)
 
         self.accelerate()
@@ -438,35 +428,40 @@ class Session(MazeTask):
         obs: 'tuple[Tensor, ...]',
         reward: Tensor,
         rst_mask_f: Tensor,
+        _vals: 'tuple[Tensor, ...]',
         _info: 'dict[str, Any]'
     ) -> 'tuple[Tensor, ...]':
 
         # Keep data for debugging via interface
-        self.async_temp_result = obs[-2:]
+        self.async_temp_result = obs
 
         # Keep data to save
         if self.rec_mode:
-            self.update_rec_data_queue(
-                *obs,
-                reward[:, None],
-                rst_mask_f[:, None])
+            self.update_rec_data_queue(obs, reward, rst_mask_f)
 
             # Remove segmentation channel
-            if self.model_options['vis']:
-                return (obs[0][:, :-1], *obs[1:])
+            return (obs[0][:, :-1], *obs[1:])
 
         return obs
 
-    def update_rec_data_queue(self, img: Tensor, *vecs: 'tuple[Tensor, ...]'):
+    def update_rec_data_queue(self, obs: 'tuple[Tensor, ...]', rew: Tensor, rst: Tensor):
+
+        img, vec, com = obs
 
         # Images are stored in full or vector form (as means)
         if self.rec_mode == self.REC_VEC:
             img = img.mean((-2, -1))
 
+        vecs = (vec, rew.unsqueeze(-1), rst.unsqueeze(-1))
+
+        if self.rec_mode < self.REC_ALL:
+            com = Policy.weigh_signals(self.sim, vec[:, cfg.OBS_RGB_SLICE], com)
+
         img_data = img.cpu().numpy()
         vec_data = torch.hstack(vecs).cpu().numpy()
+        com_data = com.cpu().numpy()
 
-        self.rec_data_queue.append((img_data, vec_data))
+        self.rec_data_queue.append((img_data, vec_data, com_data))
 
     def save_rec_data(self):
         if self.rec_mode == self.REC_NONE or not self.rec_data_queue:
@@ -477,11 +472,13 @@ class Session(MazeTask):
 
         img = np.stack([x[0] for x in self.rec_data_queue])
         vec = np.stack([x[1] for x in self.rec_data_queue])
+        com = np.stack([x[2] for x in self.rec_data_queue])
         self.rec_data_queue.clear()
 
-        np.savez_compressed(filename, img=img, vec=vec)
+        np.savez_compressed(filename, img=img, vec=vec, com=com)
 
         print(f'Saved data to: {filename}')
+        vec = np.stack([x[1] for x in self.rec_data_queue])
 
     def run(self):
         print(f'Data logging is {"ON" if self.rec_mode else "OFF"}.')
@@ -520,15 +517,10 @@ class Session(MazeTask):
             raise FileNotFoundError(f'Visual encoder is missing from presumed path: {encoder_path}')
 
         # Load model
-        model = ActorCritic(
-            self.sim.n_bots,
-            self.model_options['vis'],
-            self.model_options['com'],
-            self.model_options['guide'],
-            ignore_com=not self.reward_sharing)
+        model = ActorCritic(self.sim.n_bots, **self.model_options)
 
         optimiser = NAdamW(
-            list(model.policy.parameters()) + list(model.valuator.parameters()),
+            (param for param in model.parameters() if param.requires_grad),
             lr=get_arg_defaults(AdaptivePlateauScheduler.__init__)['lr_milestones'][0],
             weight_decay=cfg.WEIGHT_DECAY_MAP[self.sim.level])
 
@@ -565,6 +557,7 @@ class Session(MazeTask):
             cfg.N_ROLLOUTS_PER_EPOCH,
             cfg.N_AUX_ITERS_PER_EPOCH,
             gamma,
+            aux_weight=1e-2,
             entropy_weight=4e-3,
             log_dir=cfg.LOG_DIR)
 
@@ -579,13 +572,7 @@ class Session(MazeTask):
         if not self.headless:
             self.interface.update_top_view()
 
-        model = ActorCritic(
-            self.sim.n_bots,
-            self.model_options['vis'],
-            self.model_options['com'],
-            self.model_options['guide'],
-            prob_actor=True,
-            ignore_com=not self.reward_sharing)
+        model = ActorCritic(self.sim.n_bots, **self.model_options)
 
         model.to(self.ckpter.device)
         self.ckpter.load_model(model)
@@ -601,78 +588,11 @@ class Session(MazeTask):
             while (step_ctr := step_ctr + 1) != self.end_step:
                 actions, mem = model.act(obs, mem)
 
-                obs, reward, rst_mask_f, _ = self.step(actions, get_info=False)
+                obs, reward, rst_mask_f, _, _ = self.step(actions, get_info=False)
                 obs = self.post_step(obs, reward, rst_mask_f, None)
 
                 if rst_mask_f.any().item():
                     mem = model.reset_mem(mem, rst_mask_f)
-
-    # TODO: Body repeated from eval
-    def eval_(self):
-        if not self.headless:
-            self.interface.update_top_view()
-
-        model = ActorCritic(
-            self.sim.n_bots,
-            self.model_options['vis'],
-            self.model_options['com'],
-            self.model_options['guide'],
-            prob_actor=True,
-            ignore_com=not self.reward_sharing)
-
-        model.to(self.ckpter.device)
-        self.ckpter.load_model(model)
-
-        # Accelerate actor
-        mem = model.init_mem(self.sim.n_all_bots)
-        model.act_partial = self.accel_action(model.act_partial, mem)
-
-        # Track performance, collisions, and pathing
-        throughput = 0.
-        tput_ctr = 0.
-
-        contacts = 0.
-        cont_ctr = 0
-
-        # Track pathing
-        file_idx = get_available_file_idx(cfg.DATA_DIR, 'pos')
-        filename = os.path.join(cfg.DATA_DIR, f'pos_{file_idx:02d}.npy')
-        positions = torch.zeros((self.end_step, self.sim.n_all_bots, 2), device=self.device)
-
-        with torch.inference_mode():
-            obs = self.step(get_info=False)[0]
-            step_ctr = -1
-
-            while (step_ctr := step_ctr + 1) != self.end_step:
-                actions, mem = model.act(obs, mem)
-
-                obs, reward, rst_mask_f, _ = self.step(actions, get_info=False)
-                obs = self.post_step(obs, reward, rst_mask_f, None)
-
-                if rst_mask_f.any().item():
-                    mem = model.reset_mem(mem, rst_mask_f)
-
-                tput_mask = (self.throughput != 0.).float()
-                tput_ctr = tput_ctr + tput_mask
-                throughput = throughput + self.throughput * tput_mask
-
-                cont_ctr += 1
-                contacts = contacts + (self.net_contacts[self.collider_indices, :2].abs().sum(-1) != 0.).float()
-
-                positions[step_ctr] = self.bot_pos
-
-        tput_ctr = tput_ctr.clip(1.)
-        throughput = (throughput / tput_ctr).mean().item()
-
-        cont_ctr = max(cont_ctr, 1)
-        contacts = (contacts / cont_ctr).mean().item()
-
-        positions = positions.cpu().numpy()
-        np.save(filename, positions)
-
-        print(f'\nFinal avg. throughput: {throughput:.4f}')
-        print(f'\nFinal avg. contacts: {contacts:.4f}')
-        print(f'\nPositions saved to {filename}.')
 
     def play(self):
         if not self.headless:
@@ -685,30 +605,6 @@ class Session(MazeTask):
             while (step_ctr := step_ctr + 1) != self.end_step:
                 self.post_step(*self.step(self.actions, get_info=False))
 
-    # TODO: Body repeated from play
-    def play_(self):
-        if not self.headless:
-            self.interface.update_top_view()
-
-        throughput = 0.
-        tput_ctr = 0.
-
-        with torch.inference_mode():
-            self.step(get_info=False)
-            step_ctr = -1
-
-            while (step_ctr := step_ctr + 1) != self.end_step:
-                self.post_step(*self.step(self.actions, get_info=False))
-
-                tput_mask = (self.throughput != 0.).float()
-                tput_ctr = tput_ctr + tput_mask
-                throughput = throughput + self.throughput * tput_mask
-
-        tput_ctr = tput_ctr.clip(1.)
-        throughput = (throughput / tput_ctr).mean().item()
-
-        print(f'\nFinal avg. throughput: {throughput:.4f}')
-
     def accel_action(
         self,
         act_fn: Callable,
@@ -719,22 +615,22 @@ class Session(MazeTask):
         if aux_tensors is None:
             aux_tensors = ()
 
-        # Graph 4
+        # Graph 3
         if encode:
             inputs = (
-                self.graphs['get_image_observations']['out'] if self.render_cameras else self.null_obs_img,
-                self.graphs['get_vector_observations']['out'],
-                self.graphs['eval_state']['out'][0],
+                self.graphs['prepare_images']['out'] if self.render_cameras else self.null_obs_img,
+                *self.graphs['eval_state']['out'][:2],
                 *[aux.detach().clone() for aux in aux_tensors])
 
             act_fn, self.graphs['act_partial'] = \
                 capture_graph(act_fn, inputs, copy_idcs_in=tuple(range(len(inputs)-len(aux_tensors), len(inputs))))
 
-        # Graph 5
+        # Graph 4
         else:
             inputs = (
                 torch.rand_like(self.graphs['act_partial']['out'][2]),
                 torch.rand_like(self.graphs['act_partial']['out'][3]),
+                self.graphs['eval_state']['out'][2].detach().clone(),
                 *[aux.detach().clone() for aux in aux_tensors])
 
             act_fn, self.graphs['act_partial_encoded'] = capture_graph(act_fn, inputs)
