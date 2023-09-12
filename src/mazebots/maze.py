@@ -50,23 +50,26 @@ class MazeData:
     bot_spawn_points: ndarray
     bot_spawn_angles: ndarray
 
-    n_subzone_segments: int
-    subzone_idcs: 'tuple[int, int]'
-    subzone_idx_list: 'list[tuple[int, int]]'
+    subenv_idcs: 'tuple[int, int]'
+    subenv_idx_list: 'list[tuple[int, int]]'
 
-    def __init__(self, **kwargs):
+    def __init__(self, constructor: 'MazeConstructor', **kwargs):
+        self.constructor = constructor
+        self.grid_delims = constructor.grid_delims
+        self.open_grid_delims = constructor.open_grid_delims
+
+        # NOTE: Constructor views level params. as the points of reference
+        self.n_grid_segments = constructor.n_supgrid_segments
+        self.n_subgrid_segments = constructor.n_grid_segments
+
         for key, val in kwargs.items():
             setattr(self, key, val)
 
-        self.n_segments = len(self.grid_delims) - 1
-        self.open_grid_delims = self.grid_delims[1:-1]
-        self.env_halfwidth = (self.grid_delims[-1] - self.grid_delims[0]) / 2.
+        if 'subenv_idcs' not in kwargs:
+            self.subenv_idcs = (0, 0)
 
-        if 'subzone_idcs' not in kwargs:
-            self.subzone_idcs = (0, 0)
-
-        if 'subzone_idx_list' not in kwargs:
-            self.init_sublevel_zones()
+        if 'subenv_idx_list' not in kwargs:
+            self.init_subenv_indices()
 
         if 'regcon_graph_map' not in kwargs or 'regcon_graph_points' not in kwargs:
             self.init_connection_map()
@@ -74,14 +77,14 @@ class MazeData:
         if 'regcon_graph_paths' not in kwargs and 'obj_points' in kwargs:
             self.init_path_map()
 
-    def init_sublevel_zones(self):
+    def init_subenv_indices(self):
         """
-        Get the upper-left indices of all zones within a larger env. area
+        Get the upper-left indices of all subenvs. within a larger env. area
         which have enough open squares and no disconnected paths between them.
         """
 
-        if np.isclose(self.n_subzone_segments * cfg.WALL_HALFLENGTH, self.env_halfwidth, rtol=1e-3, atol=1e-3):
-            self.subzone_idx_list = [(0, 0)]
+        if self.n_subgrid_segments == self.n_grid_segments:
+            self.subenv_idx_list = [self.subenv_idcs]
             return
 
         def spread_open_squares(sqr_open_mask: ndarray, hor_wall_mask: ndarray, ver_wall_mask: ndarray, i: int, j: int):
@@ -110,24 +113,24 @@ class MazeData:
             if (i-1) >= 0 and sqr_open_mask[i-1, j] != 1 and not hor_wall_mask[i, j]:
                 spread_open_squares(sqr_open_mask, hor_wall_mask, ver_wall_mask, i-1, j)
 
-        self.subzone_idx_list = []
+        self.subenv_idx_list = []
 
         sqr_open_mask = ~self.sqr_roof_mask
-        zone_width = self.n_subzone_segments
-        n_min_open_squares = round(zone_width**2 * 0.6975)
+        n_segments = self.n_subgrid_segments
+        n_min_open_squares = round(n_segments**2 * 0.6975)
 
-        for i in range(sqr_open_mask.shape[0] - (zone_width-1)):
-            for j in range(sqr_open_mask.shape[1] - (zone_width-1)):
-                sqr_open_submask = sqr_open_mask[i:i+zone_width, j:j+zone_width]
+        for i in range(sqr_open_mask.shape[0] - (n_segments-1)):
+            for j in range(sqr_open_mask.shape[1] - (n_segments-1)):
+                sqr_open_submask = sqr_open_mask[i:i+n_segments, j:j+n_segments]
                 n_open_squares = sqr_open_submask.sum()
 
                 if n_open_squares < n_min_open_squares:
                     continue
 
-                sqr_con_open_submask = np.zeros((zone_width, zone_width), dtype=np.int64)
+                sqr_con_open_submask = np.zeros((n_segments, n_segments), dtype=np.int64)
 
-                hor_wall_submask = self.hor_wall_mask[i:i+zone_width+1, j:j+zone_width]
-                ver_wall_submask = self.ver_wall_mask[i:i+zone_width, j:j+zone_width+1]
+                hor_wall_submask = self.hor_wall_mask[i:i+n_segments+1, j:j+n_segments]
+                ver_wall_submask = self.ver_wall_mask[i:i+n_segments, j:j+n_segments+1]
 
                 sqr_open_idcs = np.nonzero(sqr_open_submask)
                 start_i, start_j = sqr_open_idcs[0][0], sqr_open_idcs[1][0]
@@ -136,17 +139,17 @@ class MazeData:
                 n_con_open_squares = sqr_con_open_submask.sum()
 
                 if n_open_squares == n_con_open_squares:
-                    self.subzone_idx_list.append((i, j))
+                    self.subenv_idx_list.append((i, j))
 
     def init_connection_map(self):
         """Build a graph of connections between connected squares on the grid."""
 
-        n_segments = self.n_segments
+        n_segments = self.n_grid_segments
 
         hor_con_mask = ~self.hor_wall_mask
         ver_con_mask = ~self.ver_wall_mask
 
-        delim_centres = np.round((self.grid_delims[1:] + self.grid_delims[:-1]) / 2., 6)
+        delim_centres = self.constructor.grid_delim_centres
 
         regcon_graph_map: 'dict[int, list[int]]' = {
             (i*n_segments+j): []
@@ -237,7 +240,7 @@ class MazeData:
         self.regcon_graph_paths = get_numba_dict(tuple_as_key=True)
 
         exit_idcs = np.digitize(self.obj_points, self.open_grid_delims)
-        flattened_exit_idcs = self.n_segments * exit_idcs[:, 0] + exit_idcs[:, 1]
+        flattened_exit_idcs = self.n_grid_segments * exit_idcs[:, 0] + exit_idcs[:, 1]
 
         for entry_node, v in self.regcon_graph_map.items():
             if len(v) == 0:
@@ -252,7 +255,7 @@ class MazeData:
                     self.obj_points[i],
                     self.grid_square_centres,
                     self.grid_wall_pairs,
-                    self.n_segments)
+                    self.n_grid_segments)
 
     def get_path_estimate(
         self,
@@ -280,8 +283,8 @@ class MazeData:
         entry_idcs = np.digitize(start_pt, self.open_grid_delims)
         exit_idcs = np.digitize(end_pt, self.open_grid_delims)
 
-        entry_node = self.n_segments * entry_idcs[0] + entry_idcs[1]
-        exit_node = self.n_segments * exit_idcs[0] + exit_idcs[1]
+        entry_node = self.n_grid_segments * entry_idcs[0] + entry_idcs[1]
+        exit_node = self.n_grid_segments * exit_idcs[0] + exit_idcs[1]
 
         path = prune_path_forward(
             self.regcon_graph_paths[entry_node, exit_node],
@@ -289,7 +292,7 @@ class MazeData:
             start_pt,
             self.grid_square_centres,
             self.grid_wall_pairs,
-            self.n_segments)
+            self.n_grid_segments)
 
         path_pts = self.grid_square_centres[path]
 
@@ -311,21 +314,34 @@ class MazeConstructor:
         n_graph_points: int,
         n_bots: int,
         n_objects: int,
-        rng: 'None | int | np.random.Generator' = None
+        rng: 'None | int | np.random.Generator' = None,
+        supenv_width: int = None,
+        n_supgrid_segments: int = None
     ):
         self.env_width = env_width
         self.env_halfwidth = env_width / 2.
+        self.n_grid_segments = n_grid_segments
+
+        if supenv_width is None:
+            supenv_width = env_width if n_supgrid_segments is None else (n_supgrid_segments * cfg.WALL_LENGTH)
+
+        if n_supgrid_segments is None:
+            n_supgrid_segments = n_grid_segments if supenv_width is env_width else round(supenv_width / cfg.WALL_LENGTH)
+
+        self.supenv_halfwidth = supenv_width / 2.
+        self.n_supgrid_segments = n_supgrid_segments
+
         self.min_object_spacing = max(env_width / 3., cfg.GOAL_RADIUS*2 + cfg.MIN_BUFFER)
 
         # Grid delimiters
-        self.grid_delims = np.linspace(-self.env_halfwidth, self.env_halfwidth, n_grid_segments+1)
+        self.grid_delims = np.linspace(-self.supenv_halfwidth, self.supenv_halfwidth, n_supgrid_segments+1)
         self.open_grid_delims = self.grid_delims[1:-1]
-        delim_centres = np.round((self.grid_delims[1:] + self.grid_delims[:-1]) / 2., 6)
+        self.grid_delim_centres = np.round((self.grid_delims[1:] + self.grid_delims[:-1]) / 2., 6)
 
-        y_roof, x_roof = np.meshgrid(delim_centres, delim_centres)
+        y_roof, x_roof = np.meshgrid(self.grid_delim_centres, self.grid_delim_centres)
         y_link, x_link = np.meshgrid(self.grid_delims, self.grid_delims)
-        y_hor, x_hor = np.meshgrid(delim_centres, self.grid_delims)
-        y_ver, x_ver = np.meshgrid(self.grid_delims, delim_centres)
+        y_hor, x_hor = np.meshgrid(self.grid_delim_centres, self.grid_delims)
+        y_ver, x_ver = np.meshgrid(self.grid_delims, self.grid_delim_centres)
 
         # Link and wall centres
         self.roof_grid = np.stack((x_roof, y_roof), axis=-1)
@@ -368,7 +384,7 @@ class MazeConstructor:
         """Mask edges that intersect any edge of the given graph."""
 
         n_delims = len(self.grid_delims)
-        n_segments = n_delims - 1
+        n_segments = self.n_supgrid_segments
 
         # NOTE: [(0., 0.), (0., 0.)] is considered a null edge (clearing)
         grid_wall_pairs = np.zeros((n_delims, n_delims, 2, 2, 2))
@@ -502,7 +518,7 @@ class MazeConstructor:
         hor_wall_clr_idcs = hor_wall_clr_idcs.reshape(hor_shape)
         ver_wall_clr_idcs = ver_wall_clr_idcs.reshape(ver_shape)
 
-        n_squares_per_row = len(self.grid_delims) - 1
+        n_squares_per_row = self.n_supgrid_segments
         sqr_roof_clr_idcs = np.zeros((n_squares_per_row, n_squares_per_row), dtype=np.int64)
 
         # Roofs inherit the majority class of the underlying wall colours
@@ -518,9 +534,9 @@ class MazeConstructor:
         grid_square_centres = self.roof_grid.reshape(-1, 2)
 
         return MazeData(
+            self,
             con_graph_points=con_graph_points,
             con_graph_edges=con_graph_edges,
-            grid_delims=self.grid_delims,
             grid_square_centres=grid_square_centres,
             grid_wall_pairs=grid_wall_pairs,
             hor_wall_mask=hor_wall_mask,
@@ -534,14 +550,13 @@ class MazeConstructor:
             ver_wall_clr_idcs=ver_wall_clr_idcs,
             sqr_roof_clr_idcs=sqr_roof_clr_idcs,
             bot_spawn_points=bot_spawn_points,
-            bot_spawn_angles=bot_spawn_angles,
-            n_subzone_segments=len(self.grid_delims)-1)
+            bot_spawn_angles=bot_spawn_angles)
 
     def reposition(self, data: MazeData) -> MazeData:
         """Move spawns and objects around, but keep the overall maze structure."""
 
         while True:
-            candidate_points, data.subzone_idcs = self.sample_zone_points(
+            candidate_points, data.subenv_idcs = self.sample_env_points(
                 data,
                 n_to_sample=(self.n_objects + self.n_bots) * 3,
                 max_dist_to_graph_pts=cfg.WALL_HALFLENGTH - cfg.OBJECT_TO_WALL_BUFFER)
@@ -637,47 +652,47 @@ class MazeConstructor:
 
         raise AssertionError
 
-    def sample_zone_points(
+    def sample_env_points(
         self,
         data: MazeData,
         n_to_sample: int,
         max_dist_to_graph_pts: float
     ) -> 'tuple[ndarray, tuple[int, int]]':
         """
-        Prune nodes of the regular connection graph if they exceed sublevel
+        Prune nodes of the regular connection graph if they exceed subenv.
         boundaries, then sample points around the remaining nodes.
         """
 
         pts = None
 
         # Nothing to prune
-        if len(data.subzone_idx_list) == 1:
-            i, j = subzone_idcs = data.subzone_idx_list[0]
+        if len(data.subenv_idx_list) == 1:
+            i, j = env_idcs = data.subenv_idx_list[0]
 
             if i == j == 0:
                 pts = data.regcon_graph_points
 
-        # Sample zone and filter nodes
+        # Sample env. and filter nodes
         if pts is None:
-            i, j = subzone_idcs = self.rng.choice(data.subzone_idx_list)
+            i, j = env_idcs = self.rng.choice(data.subenv_idx_list)
             pts = data.regcon_graph_points
 
-            min_x = -data.env_halfwidth + i * cfg.WALL_LENGTH
+            min_x = -self.supenv_halfwidth + i * cfg.WALL_LENGTH
             max_x = min_x + self.env_width
 
-            min_y = -data.env_halfwidth + j * cfg.WALL_LENGTH
+            min_y = -self.supenv_halfwidth + j * cfg.WALL_LENGTH
             max_y = min_y + self.env_width
 
             pts = pts[(pts[:, 0] > min_x) & (pts[:, 0] < max_x) & (pts[:, 1] > min_y) & (pts[:, 1] < max_y)]
 
-        # Sample nodes from within the zone, with replacement
+        # Sample nodes from within the env., with replacement
         candidate_indices = self.rng.choice(len(pts), n_to_sample, replace=True)
 
         # Get more varied points by adding random offsets to sampled nodes
         candidate_points = pts[candidate_indices] + \
             self.rng.uniform(-max_dist_to_graph_pts, max_dist_to_graph_pts, (n_to_sample, 2))
 
-        return candidate_points, subzone_idcs
+        return candidate_points, env_idcs
 
 
 if __name__ == '__main__':
@@ -704,27 +719,37 @@ if __name__ == '__main__':
     del kwargs['rng_seed']
     del kwargs['ep_duration']
 
-    cons = MazeConstructor(**kwargs)
-    data = cons.generate(
-        None if data_path is None else
-        MazeData(**np.load(data_path), n_subzone_segments=len(cons.grid_delims)-1))
+    if data_path is None:
+        cons = MazeConstructor(**kwargs)
+        data = cons.generate()
+
+    else:
+        data_dict = np.load(data_path)
+        supgrid_delims = data_dict['grid_delims']
+        supenv_width = supgrid_delims[-1] - supgrid_delims[0]
+        n_supgrid_segments = len(supgrid_delims) - 1
+
+        cons = MazeConstructor(**kwargs, supenv_width=supenv_width, n_supgrid_segments=n_supgrid_segments)
+        data = cons.generate(MazeData(cons, **data_dict))
 
     # Setup
-    subzone_slice = (slice(data.subzone_idcs[0], None), slice(data.subzone_idcs[1], None))
+    subenv_slice = (slice(data.subenv_idcs[0], None), slice(data.subenv_idcs[1], None))
 
     obj_clrs = np.array(cfg.COLOURS['basic'])[data.obj_clr_idcs]
-    hor_wall_clrs = np.array(cfg.COLOURS['pastel'])[data.hor_wall_clr_idcs][subzone_slice]
-    ver_wall_clrs = np.array(cfg.COLOURS['pastel'])[data.ver_wall_clr_idcs][subzone_slice]
-    sqr_roof_clrs = np.array(cfg.COLOURS['pastel'])[data.sqr_roof_clr_idcs][subzone_slice]
+    hor_wall_clrs = np.array(cfg.COLOURS['pastel'])[data.hor_wall_clr_idcs][subenv_slice]
+    ver_wall_clrs = np.array(cfg.COLOURS['pastel'])[data.ver_wall_clr_idcs][subenv_slice]
+    sqr_roof_clrs = np.array(cfg.COLOURS['pastel'])[data.sqr_roof_clr_idcs][subenv_slice]
 
-    zone_offsets = np.array(data.subzone_idcs)[None, None] * cfg.WALL_LENGTH - data.env_halfwidth
-    cons.hor_grid += zone_offsets - cons.hor_grid.min()
-    cons.ver_grid += zone_offsets - cons.ver_grid.min()
+    subenv_offsets = np.array(data.subenv_idcs) * cfg.WALL_LENGTH - cons.supenv_halfwidth
+
+    hor_grid = cons.hor_grid[subenv_slice]
+    ver_grid = cons.ver_grid[subenv_slice]
+    roof_grid = cons.roof_grid[subenv_slice]
 
     wall_halflen = (((0., cfg.WALL_HALFLENGTH),),)
-    hor_wall_edges = np.stack((cons.hor_grid - wall_halflen, cons.hor_grid + wall_halflen), axis=-1)
+    hor_wall_edges = np.stack((hor_grid - wall_halflen, hor_grid + wall_halflen), axis=-1)
     wall_halflen = (((cfg.WALL_HALFLENGTH, 0.),),)
-    ver_wall_edges = np.stack((cons.ver_grid - wall_halflen, cons.ver_grid + wall_halflen), axis=-1)
+    ver_wall_edges = np.stack((ver_grid - wall_halflen, ver_grid + wall_halflen), axis=-1)
 
     grid_edges = data.grid_wall_pairs.reshape(-1, 2, 2)
     grid_edges = grid_edges[np.any((grid_edges[:, 0, :] != grid_edges[:, 1, :]), axis=1)]
@@ -747,8 +772,8 @@ if __name__ == '__main__':
     (ax0, ax1, ax2, ax3) = axes.flatten()
 
     # Wall clusters
-    n_rows, n_cols = cons.hor_grid.shape[:-1]
-    mask = data.hor_wall_mask[subzone_slice]
+    n_rows, n_cols = hor_grid.shape[:-1]
+    mask = data.hor_wall_mask[subenv_slice]
 
     for i in range(n_rows):
         for j in range(n_cols):
@@ -756,8 +781,8 @@ if __name__ == '__main__':
                 edge_x, edge_y = hor_wall_edges[i, j]
                 ax0.plot(edge_x, edge_y, color=hor_wall_clrs[i, j], linewidth=3)
 
-    n_rows, n_cols = cons.ver_grid.shape[:-1]
-    mask = data.ver_wall_mask[subzone_slice]
+    n_rows, n_cols = ver_grid.shape[:-1]
+    mask = data.ver_wall_mask[subenv_slice]
 
     for i in range(n_rows):
         for j in range(n_cols):
@@ -765,8 +790,8 @@ if __name__ == '__main__':
                 edge_x, edge_y = ver_wall_edges[i, j]
                 ax0.plot(edge_x, edge_y, color=ver_wall_clrs[i, j], linewidth=3)
 
-    n_rows, n_cols = cons.roof_grid.shape[:-1]
-    mask = data.sqr_roof_mask[subzone_slice]
+    n_rows, n_cols = roof_grid.shape[:-1]
+    mask = data.sqr_roof_mask[subenv_slice]
 
     for i in range(n_rows):
         for j in range(n_cols):
@@ -776,8 +801,8 @@ if __name__ == '__main__':
                 ax0.fill_between(edge_x, edge_yl, edge_yu, color=sqr_roof_clrs[i, j])
 
     ax0.set_facecolor('grey')
-    ax0.set_xlim((zone_offsets[0, 0, 0] - 5*cfg.WALL_WIDTH, zone_offsets[0, 0, 0] + 5*cfg.WALL_WIDTH + cons.env_width))
-    ax0.set_ylim((zone_offsets[0, 0, 1] - 5*cfg.WALL_WIDTH, zone_offsets[0, 0, 1] + 5*cfg.WALL_WIDTH + cons.env_width))
+    ax0.set_xlim((subenv_offsets[0] - 5*cfg.WALL_WIDTH, subenv_offsets[0] + 5*cfg.WALL_WIDTH + cons.env_width))
+    ax0.set_ylim((subenv_offsets[1] - 5*cfg.WALL_WIDTH, subenv_offsets[1] + 5*cfg.WALL_WIDTH + cons.env_width))
 
     # Base graph
     ax1.plot(grid_edges[..., 0].T, grid_edges[..., 1].T, 'b')
@@ -813,7 +838,7 @@ if __name__ == '__main__':
     ax3.plot(start_pt[None, 0], start_pt[None, 1], 'kx')
     ax3.plot(end_pt[None, 0], end_pt[None, 1], 'wx')
 
-    ax0.set_title('Subzone clusters')
+    ax0.set_title('Subenv. clusters')
     ax1.set_title('Base connection graph')
     ax2.set_title('Reg. connection graph')
     ax3.set_title(f'Reg. A* path ex.: {dist:.2f}')

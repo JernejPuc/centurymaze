@@ -308,8 +308,7 @@ class Interface(BasicInterface):
 
                 elif cmd_key == 'recolour':
                     if cmd_press:
-                        self.session.actions[:, -cfg.RGB_VEC_SIZE:] = \
-                            torch.rand((self.sim.n_all_bots, cfg.RGB_VEC_SIZE), device=self.session.device)
+                        self.session.actions[:, -cfg.RGB_VEC_SIZE:] = self.session.sample_colours()
 
                     continue
 
@@ -357,7 +356,7 @@ class Session(MazeTask):
 
     ARGS = [
         {'name': '--level', 'type': int, 'default': 4, 'help': 'Maze complexity level.'},
-        {'name': '--level_name', 'type': str, 'default': '', 'help': 'Name of file containing preset level data.'},
+        {'name': '--level_name', 'type': str, 'default': 'env7', 'help': 'Name of file containing preset level data.'},
         {'name': '--regen', 'type': int, 'default': 0, 'help': 'Option to fully regenerate environments on reset.'},
         {'name': '--n_bots', 'type': int, 'default': -1, 'help': 'Number of agents per environment.'},
         {'name': '--n_envs', 'type': int, 'default': -1, 'help': 'Number of parallel environments.'},
@@ -398,7 +397,7 @@ class Session(MazeTask):
         self.steps_per_second: int = min(args.act_freq, 64)
         frames_per_second = self.steps_per_second if args.headless else 64
 
-        data_path = os.path.join(cfg.DATA_DIR, args.level_name) if args.level_name else None
+        data_path = os.path.join(cfg.DATA_DIR, args.level_name + '.npz') if args.level_name else None
 
         sim = MazeSim(args.level, args.n_bots, args.n_envs, frames_per_second, args, self.ckpter.rng, data_path)
         interface = Interface(self, sim, device) if not args.headless else None

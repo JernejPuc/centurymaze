@@ -192,7 +192,7 @@ class Trainer:
         seg_probs = seg_logits.softmax(dim=1)
 
         # Expand indices to probs. (one-hot)
-        clr_probs_target = one_hot(clr_target, cfg.N_CLR_CLASSES).neg_()
+        clr_probs_target = one_hot(clr_target, cfg.N_ALL_CLR_CLASSES).neg_()
         clr_probs_target = torch.movedim(clr_probs_target, -1, 1)
 
         seg_probs_target = one_hot(seg_target, cfg.N_SEG_CLASSES).neg_()

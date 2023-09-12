@@ -61,7 +61,7 @@ class MazeEnv:
         self.group_id = group_id
 
         # Place environment onto the grid
-        env_bbox_halfwidth = data.env_halfwidth + self.ENV_HALFSPACING
+        env_bbox_halfwidth = sim.constructor.supenv_halfwidth + self.ENV_HALFSPACING
 
         env_bbox_vertex_low = gymapi.Vec3(-env_bbox_halfwidth, -env_bbox_halfwidth, 0.)
         env_bbox_vertex_high = gymapi.Vec3(env_bbox_halfwidth, env_bbox_halfwidth, 1.)
@@ -454,13 +454,19 @@ class MazeSim:
         plane_params.segmentation_id = cfg.SEG_CLS_PLANE
         gym.add_ground(self.handle, plane_params)
 
-        # Override lighting to get rid of some weird light from below
-        # 0, (0.5, 0.5, 0.5), (0., 0., 0.), (1., 1., 1.)
-        # 1, (0.5, 0.5, 0.5), (0., 0., 0.), (1., -1., 1.)
-        # 2, (0.2, 0.2, 0.2), (0., 0., 0.), (-1., 1., -1.)
+        # Override lighting to normalise viewing conditions
+        # 0, (1., 1., 1.), (0.1, 0.1, 0.1), (1., 1., 4.)
+        # 1, (0.5, 0.5, 0.5), (0.1, 0.1, 0.1), (1., -1., 4.)
+        # 2, (0., 0., 0.), (0., 0., 0.), (0., 0., 0.)
         # 3, (0., 0., 0.), (0., 0., 0.), (0., 0., 0.)
         gym.set_light_parameters(
-            self.handle, 2, gymapi.Vec3(0.6, 0.6, 0.6), gymapi.Vec3(0., 0., 0.), gymapi.Vec3(-1., 0.33, 1.))
+            self.handle, 0, gymapi.Vec3(0.2, 0.2, 0.2), gymapi.Vec3(0.8, 0.8, 0.8), gymapi.Vec3(1., 1., 2.))
+        gym.set_light_parameters(
+            self.handle, 1, gymapi.Vec3(0.2, 0.2, 0.2), gymapi.Vec3(0.8, 0.8, 0.8), gymapi.Vec3(1., -1., 2.))
+        gym.set_light_parameters(
+            self.handle, 2, gymapi.Vec3(0.2, 0.2, 0.2), gymapi.Vec3(0.8, 0.8, 0.8), gymapi.Vec3(-1., 0.33, 2.))
+        gym.set_light_parameters(
+            self.handle, 3, gymapi.Vec3(0.2, 0.2, 0.2), gymapi.Vec3(0.8, 0.8, 0.8), gymapi.Vec3(-1., -0.33, 2.))
 
         # Assign level params
         self.level = level
@@ -474,21 +480,31 @@ class MazeSim:
         self.n_all_bots: int = self.n_envs * self.n_bots
 
         # Parallel environments are created with the same base parameters
+        if data_path is None:
+            supenv_width = None
+            n_supgrid_segments = None
+            level_data = None
+
+        else:
+            data_dict = np.load(data_path)
+            supgrid_delims = data_dict['grid_delims']
+            supenv_width = supgrid_delims[-1] - supgrid_delims[0]
+            n_supgrid_segments = len(supgrid_delims) - 1
+
         self.constructor = MazeConstructor(
             self.env_width,
             self.n_grid_segments,
             self.n_graph_points,
             self.n_bots,
             self.n_objects,
-            self.rng_seed if rng is None else rng)
+            self.rng_seed if rng is None else rng,
+            supenv_width,
+            n_supgrid_segments)
 
         self.open_grid_delims = self.constructor.open_grid_delims
 
-        if data_path is None:
-            level_data = None
-
-        else:
-            level_data = MazeData(**np.load(data_path), n_subzone_segments=len(self.constructor.grid_delims)-1)
+        if data_path is not None:
+            level_data = MazeData(self.constructor, **data_dict)
 
         env_data = [self.constructor.generate(level_data) for _ in range(self.n_envs)]
 

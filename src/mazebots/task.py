@@ -115,6 +115,8 @@ class MazeTask:
     bot_rst_mask: Tensor
     bot_pos: Tensor
     bot_vel: Tensor
+    rcvr_clr_classes: Tensor
+    actions: Tensor
     act_trq: Tensor
     act_rgb: Tensor
 
@@ -349,10 +351,12 @@ class MazeTask:
         self.bot_rst_mask = torch.zeros(sim.n_all_bots, dtype=torch.bool, device=device)
 
         # Action feedback
+        self.rcvr_clr_classes = torch.tensor(cfg.RCVR_CLR_CLASSES, device=device)
+
         if self.spawn_with_random_rgb:
             self.actions = torch.hstack((
                 torch.zeros((sim.n_all_bots, cfg.DOF_VEC_SIZE), device=device),
-                torch.rand((sim.n_all_bots, cfg.RGB_VEC_SIZE), device=device)))
+                self.sample_colours()))
         else:
             self.actions = torch.zeros((sim.n_all_bots, cfg.ACT_VEC_SIZE), device=device)
 
@@ -394,7 +398,7 @@ class MazeTask:
                     torch.zeros((len(bot_rst_indices), cfg.DOF_VEC_SIZE), device=self.device)
 
                 self.act_rgb[bot_rst_indices] = act_rgb = \
-                    torch.rand((len(bot_rst_indices), cfg.RGB_VEC_SIZE), device=self.device)
+                    self.sample_colours(len(bot_rst_indices))
 
                 self.actions[bot_rst_indices] = torch.hstack((act_trq, act_rgb))
 
@@ -457,6 +461,14 @@ class MazeTask:
     def reset_all(self):
         self.bot_rst_mask = torch.ones_like(self.bot_rst_mask)
         self.rst_env_indices = list(range(self.sim.n_envs))
+
+    def sample_colours(self, n_to_sample: int = None) -> Tensor:
+        if n_to_sample is None:
+            n_to_sample = self.sim.n_all_bots
+
+        clr_indices = torch.randint(cfg.N_RCVR_CLR_CLASSES, (n_to_sample,), device=self.device)
+
+        return self.rcvr_clr_classes.index_select(0, clr_indices)
 
     def sample_tasks(
         self,

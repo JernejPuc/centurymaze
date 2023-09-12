@@ -1,5 +1,6 @@
 .vscode
 data/**
+!data/env7.npz
 !data/img_depcam_00.png
 !data/img_rgbcam_00.png
 !data/img_viewer_00.png
