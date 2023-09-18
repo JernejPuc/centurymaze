@@ -212,8 +212,16 @@ class Interface(BasicInterface):
         self.gym.render_all_camera_sensors(self.sim_handle)
         self.gym.start_access_image_tensors(self.sim_handle)
 
-        rgb = self.session.img_rgb_list[self.all_bot_idx][..., :3].cpu().numpy()
-        dep = 255. * norm_depth_range(-self.session.img_dep_list[self.all_bot_idx], MAX_IMG_DEPTH).cpu().numpy()
+        rgb = self.session.img_rgb_list[self.all_bot_idx][..., :3]
+        dep = self.session.img_dep_list[self.all_bot_idx]
+        seg = self.session.img_seg_list[self.all_bot_idx]
+
+        if self.sim.is_preset:
+            seg_mask = (seg == cfg.SEG_CLS_NULL).unsqueeze(-1).float()
+            rgb = torch.lerp(rgb.float(), self.session.sky_clr, seg_mask)
+
+        rgb = rgb.cpu().numpy()
+        dep = 255. * norm_depth_range(-dep, MAX_IMG_DEPTH).cpu().numpy()
 
         self.gym.end_access_image_tensors(self.sim_handle)
 
@@ -283,18 +291,17 @@ class Interface(BasicInterface):
 
                 elif cmd_key == 'cycle_view':
                     self.view = (self.view + (-1 if self.key_vec[-1] else 1)) % 3
-                    self.update_top_view()
+                    # self.update_top_view()
 
                 elif cmd_key == 'save_view':
-                    if self.view == self.VIEW_BOT:
+                    if self.view == self.VIEW_BOT and self.session.render_cameras:
                         filename_rgb, filename_dep = self.save_camera_images()
 
                         print(
                             f'Saved camera RGB image to: {filename_rgb}\n'
-                            f'Saved camera DEP image to: {filename_dep}\n')
+                            f'Saved camera DEP image to: {filename_dep}')
 
-                    else:
-                        print(f'Saved viewer image to: {self.save_viewer_image()}')
+                    print(f'Saved viewer image to: {self.save_viewer_image()}')
 
             elif cmd_key in self.ACT_KEYS:
                 if cmd_key == 'alt_move':
@@ -356,7 +363,7 @@ class Session(MazeTask):
 
     ARGS = [
         {'name': '--level', 'type': int, 'default': 4, 'help': 'Maze complexity level.'},
-        {'name': '--level_name', 'type': str, 'default': 'env7', 'help': 'Name of file containing preset level data.'},
+        {'name': '--preset_name', 'type': str, 'default': 'env7', 'help': 'Name of files with preset level data.'},
         {'name': '--regen', 'type': int, 'default': 0, 'help': 'Option to fully regenerate environments on reset.'},
         {'name': '--n_bots', 'type': int, 'default': -1, 'help': 'Number of agents per environment.'},
         {'name': '--n_envs', 'type': int, 'default': -1, 'help': 'Number of parallel environments.'},
@@ -379,7 +386,7 @@ class Session(MazeTask):
         self.end_step: int = args.end_step
         self.ctrl_mode: int = args.ctrl_mode
         self.rec_mode: int = args.rec_mode
-        self.rec_data_queue: 'list[tuple[Tensor, Tensor]]' = []
+        self.rec_data_queue: 'list[Tensor]' = []
 
         # Resume model state
         device = 'cuda' if args.use_gpu_pipeline else 'cpu'
@@ -397,9 +404,9 @@ class Session(MazeTask):
         self.steps_per_second: int = min(args.act_freq, 64)
         frames_per_second = self.steps_per_second if args.headless else 64
 
-        data_path = os.path.join(cfg.DATA_DIR, args.level_name + '.npz') if args.level_name else None
+        preset_path = os.path.join(cfg.DATA_DIR, args.preset_name) if args.preset_name else None
 
-        sim = MazeSim(args.level, args.n_bots, args.n_envs, frames_per_second, args, self.ckpter.rng, data_path)
+        sim = MazeSim(args.level, args.n_bots, args.n_envs, frames_per_second, args, self.ckpter.rng, preset_path)
         interface = Interface(self, sim, device) if not args.headless else None
 
         # Extend or diminish standard episode duration
@@ -412,11 +419,12 @@ class Session(MazeTask):
             self.steps_per_second,
             frames_per_second,
             render_cameras=self.ctrl_mode > self.CTRL_MAN or self.rec_mode > self.REC_NONE,
-            render_segmentation=self.rec_mode > self.REC_NONE,
+            keep_segmentation=self.rec_mode > self.REC_NONE,
+            keep_rgb_over_hsv=self.ctrl_mode == self.CTRL_GEN,
             spawn_with_random_rgb=self.ctrl_mode == self.CTRL_GEN,
             uniform_task_sampling=self.ctrl_mode == self.CTRL_GEN,
             distribute_env_resets=self.ctrl_mode == self.CTRL_RL,
-            full_env_regeneration=data_path is None and args.regen,
+            full_env_regeneration=preset_path is None and args.regen,
             reward_sharing=bool(args.model_share),
             device=device)
 
@@ -460,7 +468,7 @@ class Session(MazeTask):
         vec_data = torch.hstack(vecs).cpu().numpy()
         com_data = com.cpu().numpy()
 
-        self.rec_data_queue.append((img_data, vec_data, com_data))
+        self.rec_data_queue.extend((img_data, vec_data, com_data))
 
     def save_rec_data(self):
         if self.rec_mode == self.REC_NONE or not self.rec_data_queue:
@@ -469,15 +477,14 @@ class Session(MazeTask):
         file_idx = get_available_file_idx(cfg.DATA_DIR, 'rec')
         filename = os.path.join(cfg.DATA_DIR, f'rec_{file_idx:02d}.npz')
 
-        img = np.stack([x[0] for x in self.rec_data_queue])
-        vec = np.stack([x[1] for x in self.rec_data_queue])
-        com = np.stack([x[2] for x in self.rec_data_queue])
+        img = np.stack(self.rec_data_queue[0::3])
+        vec = np.stack(self.rec_data_queue[1::3])
+        com = np.stack(self.rec_data_queue[2::3])
         self.rec_data_queue.clear()
 
         np.savez_compressed(filename, img=img, vec=vec, com=com)
 
         print(f'Saved data to: {filename}')
-        vec = np.stack([x[1] for x in self.rec_data_queue])
 
     def run(self):
         print(f'Data logging is {"ON" if self.rec_mode else "OFF"}.')
@@ -542,6 +549,9 @@ class Session(MazeTask):
         # Half-life of rewards is at 1/8th of an episode
         gamma = 0.5 ** (1. / ((self.sim.ep_duration / 8) * self.steps_per_second))
 
+        n_batches_per_step = self.sim.n_all_bots // MazeSim.NUM_ALL_BOTS - MazeSim.NUM_ALL_BOTS // self.sim.n_all_bots
+        n_rollouts = round(cfg.N_ROLLOUT_STEPS * MazeSim.NUM_ALL_BOTS / self.sim.n_all_bots)
+
         rl_algo = PPG(
             self.step,
             self.ckpter,
@@ -550,9 +560,10 @@ class Session(MazeTask):
             cfg.LOG_EPOCH_INTERVAL,
             cfg.CKPT_EPOCH_INTERVAL,
             cfg.BRANCH_EPOCH_INTERVAL,
-            cfg.N_ROLLOUT_STEPS,
+            n_rollouts,
             cfg.N_TRUNCATED_STEPS,
             self.sim.n_all_bots,
+            n_batches_per_step,
             cfg.N_ROLLOUTS_PER_EPOCH,
             cfg.N_AUX_ITERS_PER_EPOCH,
             gamma,

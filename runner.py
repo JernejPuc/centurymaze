@@ -13,8 +13,9 @@ for i in range(1, 8):
 
     ARG_CFG[f'test{i}'] = base_call
 
-    # NOTE: Gets (N+1)x256 images per level, where N is the end_step
-    ARG_CFG[f'collect{i}'] = f'{base_call} --ctrl_mode 1 --headless 1 --rec_mode 2 --x_duration 0 --end_step 0'
+    # NOTE: Gets 64x256 (16k) images, or about 1.5 GB at dims. 96x48x5 per level
+    # Bots and goals are repositioned and recoloured on every step before collecting
+    ARG_CFG[f'collect{i}'] = f'{base_call} --ctrl_mode 1 --headless 1 --rec_mode 2 --x_duration 0 --end_step 64'
 
     ARG_CFG[f'train{i}'] = f'{base_call} --ctrl_mode 2 --headless 1'
     ARG_CFG[f'eval{i}'] = f'{base_call} --ctrl_mode 3'

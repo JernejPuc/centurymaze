@@ -11,6 +11,7 @@ from utils import (
     any_intersections,
     astar,
     eval_path,
+    get_cached_paths,
     get_numba_dict,
     min_distance,
     prune_path_backward,
@@ -53,7 +54,7 @@ class MazeData:
     subenv_idcs: 'tuple[int, int]'
     subenv_idx_list: 'list[tuple[int, int]]'
 
-    def __init__(self, constructor: 'MazeConstructor', **kwargs):
+    def __init__(self, constructor: 'MazeConstructor', precompute: bool = True, **kwargs):
         self.constructor = constructor
         self.grid_delims = constructor.grid_delims
         self.open_grid_delims = constructor.open_grid_delims
@@ -75,7 +76,22 @@ class MazeData:
             self.init_connection_map()
 
         if 'regcon_graph_paths' not in kwargs and 'obj_points' in kwargs:
-            self.init_path_map()
+            self.init_path_map(precompute=precompute)
+
+    def copy(self) -> 'MazeData':
+        kwargs = {}
+
+        for k, v in self.__dict__.items():
+            if k == 'constructor':
+                continue
+
+            if isinstance(v, ndarray):
+                kwargs[k] = v.copy()
+
+            else:
+                kwargs[k] = v
+
+        return MazeData(self.constructor, **kwargs)
 
     def init_subenv_indices(self):
         """
@@ -231,13 +247,17 @@ class MazeData:
 
         self.regcon_graph_points = np.unique(np.array(regcon_graph_edges).reshape(-1, 2), axis=0)
 
-    def init_path_map(self):
+    def init_path_map(self, reset: bool = True, precompute: bool = True):
         """
         Use A* on the underlying graph to precompute estimated paths
         from all valid entry points to all target objects.
         """
 
-        self.regcon_graph_paths = get_numba_dict(tuple_as_key=True)
+        if reset:
+            self.regcon_graph_paths = get_numba_dict(tuple_as_key=True)
+
+        if not precompute:
+            return
 
         exit_idcs = np.digitize(self.obj_points, self.open_grid_delims)
         flattened_exit_idcs = self.n_grid_segments * exit_idcs[:, 0] + exit_idcs[:, 1]
@@ -261,12 +281,24 @@ class MazeData:
         self,
         start_pts: ndarray,
         end_pts: ndarray,
-        sight_mask: ndarray
+        sight_mask: ndarray,
+        use_cache: bool = False
     ) -> 'tuple[ndarray, ndarray]':
         """
         Estimate path length and starting direction from valid starting points
         to target end points based on precomputed A* reference paths.
         """
+
+        if use_cache:
+            return get_cached_paths(
+                start_pts,
+                end_pts,
+                sight_mask,
+                self.regcon_graph_map,
+                self.regcon_graph_paths,
+                self.open_grid_delims,
+                self.grid_square_centres,
+                self.grid_wall_pairs)
 
         return reconstruct_paths(
             start_pts,
@@ -589,7 +621,7 @@ class MazeConstructor:
         data.obj_clr_idcs = self.rng.permutation(cfg.N_OBJ_COLOURS)[:self.n_objects]
         data.bot_spawn_angles = self.rng.uniform(low=-np.pi, high=np.pi, size=self.n_bots)
 
-        data.init_path_map()
+        data.init_path_map(reset='regcon_graph_paths' not in data.__dict__, precompute=False)
 
         return data
 

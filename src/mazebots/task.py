@@ -140,7 +140,7 @@ class MazeTask:
         steps_per_second: int = cfg.STEPS_PER_SECOND,
         frames_per_second: int = 64,
         render_cameras: bool = False,
-        render_segmentation: bool = False,
+        keep_segmentation: bool = False,
         keep_rgb_over_hsv: bool = False,
         spawn_with_random_rgb: bool = False,
         uniform_task_sampling: bool = False,
@@ -154,7 +154,7 @@ class MazeTask:
         self.interface = interface
         self.headless = interface is None
         self.render_cameras = render_cameras
-        self.render_segmentation = render_segmentation
+        self.keep_segmentation = keep_segmentation
         self.keep_rgb_over_hsv = keep_rgb_over_hsv
         self.spawn_with_random_rgb = spawn_with_random_rgb
         self.uniform_task_sampling = uniform_task_sampling
@@ -275,10 +275,6 @@ class MazeTask:
                 for env in sim.envs
                 for cam in env.cam_handles]
 
-        else:
-            self.img_rgb_list = self.img_dep_list = []
-
-        if self.render_segmentation:
             self.img_seg_list: 'list[Tensor]' = [
                 gymtorch.wrap_tensor(gym.get_camera_image_gpu_tensor(
                     sim.handle, env.handle, cam, gymapi.IMAGE_SEGMENTATION))
@@ -286,7 +282,7 @@ class MazeTask:
                 for cam in env.cam_handles]
 
         else:
-            self.img_seg_list = []
+            self.img_rgb_list = self.img_dep_list = self.img_seg_list = []
 
         # Static tensors
         self.mag_ref = torch.tensor(MAG_REF, dtype=torch.float32, device=device)
@@ -294,6 +290,7 @@ class MazeTask:
         self.quat_inv = torch.tensor([[-1., -1., -1., 1.]], dtype=torch.float32, device=device)
         self.rcvr_rel_phases = torch.tensor(RCVR_REL_PHASES, dtype=torch.float32, device=device)
         self.zero_z = torch.zeros((sim.n_all_bots, 1), dtype=torch.float32, device=device)
+        self.sky_clr = torch.tensor(COLOURS['sky'][0] * 255., dtype=torch.float32, device=device)
 
         # Objectives
         # KxLxL -> NxLxL
@@ -607,11 +604,13 @@ class MazeTask:
     async def async_eval_state(self):
         """Get state data, compute rewards, check terminal conditions."""
 
+        sim = self.sim
+
         # Update tensor data
-        self.gym.fetch_results(self.sim.handle, True)
-        self.gym.refresh_actor_root_state_tensor(self.sim.handle)
-        self.gym.refresh_dof_state_tensor(self.sim.handle)
-        self.gym.refresh_net_contact_force_tensor(self.sim.handle)
+        self.gym.fetch_results(sim.handle, True)
+        self.gym.refresh_actor_root_state_tensor(sim.handle)
+        self.gym.refresh_dof_state_tensor(sim.handle)
+        self.gym.refresh_net_contact_force_tensor(sim.handle)
 
         self.bot_pos.copy_(self.env_bot_pos.reshape(-1, 2))
         self.bot_ori.copy_(self.env_bot_ori.reshape(-1, 4))
@@ -623,17 +622,21 @@ class MazeTask:
             bot_pos_arr,
             self.goal_pos_arr,
             self.goal_wallgrid_idx,
-            self.sim.open_grid_delims,
-            self.sim.all_wallgrid_pairs)
+            sim.open_grid_delims,
+            sim.all_wallgrid_pairs)
 
         self.goal_in_sight_mask.copy_(torch.from_numpy(goal_in_sight_mask))
 
         # Estimate shortest path
-        slices = (slice(i, i+self.sim.n_bots) for i in range(0, self.sim.n_all_bots, self.sim.n_bots))
+        slices = (slice(i, i+sim.n_bots) for i in range(0, sim.n_all_bots, sim.n_bots))
 
         path_res = [
-            env.data.get_path_estimate(bot_pos_arr[idcs], self.goal_pos_arr[idcs], goal_in_sight_mask[idcs])
-            for env, idcs in zip(self.sim.envs, slices)]
+            env.data.get_path_estimate(
+                bot_pos_arr[idcs],
+                self.goal_pos_arr[idcs],
+                goal_in_sight_mask[idcs],
+                sim.is_preset)
+            for env, idcs in zip(sim.envs, slices)]
 
         goal_path_len = np.concatenate([path_res_i[0] for path_res_i in path_res])
         goal_path_dir = np.concatenate([path_res_i[1] for path_res_i in path_res])
@@ -691,7 +694,7 @@ class MazeTask:
         throughput = throughput.repeat_interleave(self.sim.n_bots, output_size=self.sim.n_all_bots)
 
         # Evalute rewards
-        reward = bot_done_mask_f * (1. - self.bot_time_on_task / self.sim.ep_duration)
+        reward = bot_done_mask_f * (1. - self.bot_time_on_task / max(self.sim.ep_duration, self.dt))
 
         if self.reward_sharing:
             env_reward = reward.reshape(self.sim.n_envs, -1).sum(-1)
@@ -839,6 +842,16 @@ class MazeTask:
         rgb = torch.stack(self.img_rgb_list)[..., :3]
         dep = torch.stack(self.img_dep_list)
 
+        # Override black sky colour
+        if self.sim.is_preset:
+            seg = torch.stack(self.img_seg_list)
+            seg_mask = (seg == cfg.SEG_CLS_NULL).unsqueeze(-1).float()
+
+            rgb = torch.lerp(rgb.float(), self.sky_clr, seg_mask)
+
+        else:
+            seg = None
+
         # Normalise
         rgb = rgb / 255.
         dep = norm_depth_range(-dep, MAX_IMG_DEPTH)
@@ -850,8 +863,11 @@ class MazeTask:
             clr = rgb_to_hsv(rgb, stack_dim=1)
 
         # Stack channels
-        if self.render_segmentation:
-            seg = torch.stack(self.img_seg_list).unsqueeze(1).float()
+        if self.keep_segmentation:
+            if seg is None:
+                seg = torch.stack(self.img_seg_list)
+
+            seg = seg.unsqueeze(1).float()
 
             return torch.cat((clr, dep.unsqueeze(1), seg), dim=1)
 

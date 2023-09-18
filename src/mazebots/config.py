@@ -93,6 +93,8 @@ GOAL_RADIUS = 1.
 
 # Colour palette
 COLOURS = {
+    'sky': (
+        (230, 245, 255),),
     'pastel': (
         (185, 255, 175),
         (255, 255, 160),
@@ -115,7 +117,7 @@ COLOURS = {
         (215, 20, 135)),
     'grey': (
         (0, 0, 0),
-        (51, 51, 51),
+        (85, 85, 85),
         (255, 255, 255))}
 
 COLOURS = {clr_group: [[val / 255. for val in clr] for clr in clrs] for clr_group, clrs in COLOURS.items()}
@@ -194,7 +196,7 @@ LOG_DIR = 'runs'    # Tracked scalars
 # GAE length etc.
 STEPS_PER_SECOND = 4
 N_TRUNCATED_STEPS = STEPS_PER_SECOND * 4
-N_ROLLOUT_STEPS = 256
+N_ROLLOUT_STEPS = 240
 N_ROLLOUTS_PER_EPOCH = 4
 N_AUX_ITERS_PER_EPOCH = 8
 SECONDS_PER_EPOCH = N_ROLLOUT_STEPS * N_ROLLOUTS_PER_EPOCH // STEPS_PER_SECOND

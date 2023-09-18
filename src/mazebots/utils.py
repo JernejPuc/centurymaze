@@ -234,8 +234,8 @@ def get_numba_dict(tuple_as_key: bool = False) -> 'dict[int | tuple[int, int], n
 def astar(
     graph: 'dict[int, ndarray]',
     node_pos: ndarray,
-    entry_node: ndarray,
-    exit_node: ndarray
+    entry_node: int,
+    exit_node: int
 ) -> ndarray:
     """A* with air distance heuristic returning a reversed path."""
 
@@ -306,6 +306,83 @@ def astar(
 
     # If no path can be found, use air path estimate
     return np.array([exit_node, entry_node])
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def get_cached_paths(
+    origin_pos: ndarray,
+    target_pos: ndarray,
+    sight_mask: ndarray,
+    graph: 'dict[int, ndarray]',
+    path_map: 'dict[tuple[int, int], ndarray]',
+    open_grid_delims: ndarray,
+    grid_square_centres: ndarray,
+    grid_edge_pairs: ndarray
+) -> 'tuple[ndarray, ndarray]':
+    """
+    Estimate path length and starting direction from valid starting points
+    to target end points based on computed and cached A* reference paths.
+    """
+
+    # Compute air distance to goal
+    diffs = target_pos - origin_pos
+    dists = np.sqrt(np.sum(diffs**2, axis=1))
+    dirs = diffs / np.expand_dims(dists, 1)
+
+    # Check for points without their goal in sight
+    remaining_pt_idcs = np.where(~sight_mask)[0]
+
+    if len(remaining_pt_idcs) == 0:
+        return dists, dirs
+
+    # For remaining points, find entry and exit nodes (bounding squares)
+    origin_pos = origin_pos[remaining_pt_idcs]
+    target_pos = target_pos[remaining_pt_idcs]
+
+    entry_idcs = np.digitize(origin_pos, open_grid_delims)
+    exit_idcs = np.digitize(target_pos, open_grid_delims)
+
+    # Node IDs are flattened grid indices
+    n_squares_per_row = len(open_grid_delims) + 1
+    entry_nodes = n_squares_per_row * entry_idcs[:, 0] + entry_idcs[:, 1]
+    exit_nodes = n_squares_per_row * exit_idcs[:, 0] + exit_idcs[:, 1]
+
+    # Get or compute astar path from a shared dict, then prune and eval wrt. local positions
+    for i, pt_i in enumerate(remaining_pt_idcs):
+        entry_node = entry_nodes[i]
+        exit_node = exit_nodes[i]
+        path_key = entry_node, exit_node
+
+        if path_key in path_map:
+            path = path_map[path_key]
+
+        else:
+            path = astar(graph, grid_square_centres, entry_node, exit_node)
+            path_map[path_key] = path
+
+        path = prune_path_backward(
+            path,
+            exit_idcs[i],
+            target_pos[i],
+            grid_square_centres,
+            grid_edge_pairs,
+            n_squares_per_row)
+
+        path = prune_path_forward(
+            path,
+            entry_idcs[i],
+            origin_pos[i],
+            grid_square_centres,
+            grid_edge_pairs,
+            n_squares_per_row)
+
+        dists[pt_i], dirs[pt_i] = eval_path(
+            path,
+            origin_pos[i],
+            target_pos[i],
+            grid_square_centres)
+
+    return dists, dirs
 
 
 @numba.jit(nopython=True, nogil=True, cache=True)
@@ -406,7 +483,7 @@ def prune_path_forward(
     entry_idcs: ndarray,
     origin_pos: ndarray,
     grid_square_centres: ndarray,
-    grid_edge_squares: ndarray,
+    grid_edge_pairs: ndarray,
     n_squares_per_row: int
 ) -> ndarray:
     """
@@ -425,7 +502,7 @@ def prune_path_forward(
         node_idcs[1] = node_idx % n_squares_per_row
         node_pos = grid_square_centres[node_idx]
 
-        if ray_trace(entry_idcs, node_idcs, origin_pos, node_pos, grid_edge_squares):
+        if ray_trace(entry_idcs, node_idcs, origin_pos, node_pos, grid_edge_pairs):
             entry_ptr = ptr
 
         else:
@@ -440,7 +517,7 @@ def prune_path_backward(
     exit_idcs: ndarray,
     target_pos: ndarray,
     grid_square_centres: ndarray,
-    grid_edge_squares: ndarray,
+    grid_edge_pairs: ndarray,
     n_squares_per_row: int
 ) -> ndarray:
     """
@@ -459,7 +536,7 @@ def prune_path_backward(
         node_idcs[1] = node_idx % n_squares_per_row
         node_pos = grid_square_centres[node_idx]
 
-        if ray_trace(exit_idcs, node_idcs, target_pos, node_pos, grid_edge_squares):
+        if ray_trace(exit_idcs, node_idcs, target_pos, node_pos, grid_edge_pairs):
             exit_ptr = ptr
 
         else:

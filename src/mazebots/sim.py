@@ -1,3 +1,4 @@
+import json
 import os
 from argparse import Namespace
 
@@ -40,6 +41,7 @@ class MazeEnv:
     BASE_BOT_COLOUR = gymapi.Vec3(*cfg.COLOURS['grey'][0])
     BASE_CARGO_COLOUR = gymapi.Vec3(*cfg.COLOURS['grey'][2])
 
+    box_handles: ndarray
     wally_handles: ndarray
     wallx_handles: ndarray
     link_handles: ndarray
@@ -48,6 +50,7 @@ class MazeEnv:
     bot_handles: ndarray
     cam_handles: ndarray
 
+    box_indices: ndarray
     wally_indices: ndarray
     wallx_indices: ndarray
     link_indices: ndarray
@@ -73,10 +76,63 @@ class MazeEnv:
             sim.n_envs_per_row)
 
         # Place entities (actors) into the environment
-        self.init_static()
+        self.init_static() if not sim.is_preset else self.init_preset()
         self.init_agents()
         self.set_colours()
         self.set_rigid_props()
+
+    def init_preset(self):
+        """Place objects and preset boxes."""
+
+        sim = self.sim
+        gym = sim.gym
+        data = self.data
+
+        self.box_handles = []
+        self.box_indices = []
+        self.obj_handles = np.zeros(len(data.obj_clr_idcs), dtype=np.int32)
+        self.obj_indices = np.zeros(len(data.obj_clr_idcs), dtype=np.int32)
+
+        # Presets
+        for name, (pos_x, pos_y, asset_key, clr_idx) in sim.preset_specs.items():
+            asset, pos_z = sim.preset_assets[asset_key]
+
+            if clr_idx < 0:
+                pos_z = -pos_z
+                clr = self.LINK_COLOUR
+                seg_class = cfg.SEG_CLS_PLANE
+
+            else:
+                clr = self.WALL_COLOURS[clr_idx]
+                seg_class = cfg.SEG_CLS_WALL
+
+            self.box_handles.append(handle := gym.create_actor(
+                    self.handle,
+                    asset,
+                    gymapi.Transform(gymapi.Vec3(pos_x, pos_y, pos_z)),
+                    name,
+                    self.group_id,
+                    -1,
+                    seg_class))
+
+            self.box_indices.append(gym.get_actor_index(self.handle, handle, gymapi.DOMAIN_SIM))
+
+            gym.set_rigid_body_color(self.handle, handle, OBJECT_BODY_IDX, gymapi.MESH_VISUAL, clr)
+
+        # Objectives
+        for i, pos in enumerate(data.obj_points):
+            pose = gymapi.Transform(gymapi.Vec3(*pos, cfg.OBJECT_HEIGHT))
+
+            self.obj_handles[i] = handle = gym.create_actor(
+                self.handle,
+                sim.asset_object,
+                pose,
+                f'object-{i:02d}',
+                self.group_id,
+                -1,
+                cfg.SEG_CLS_OBJ)
+
+            self.obj_indices[i] = gym.get_actor_index(self.handle, handle, gymapi.DOMAIN_SIM)
 
     def init_static(self):
         """Place objects and raise or lower walls and links wrt. associated masks."""
@@ -91,14 +147,12 @@ class MazeEnv:
         self.link_handles = np.zeros(cons.link_grid.shape[:2], dtype=np.int32)
         self.roof_handles = np.zeros(cons.roof_grid.shape[:2], dtype=np.int32)
         self.obj_handles = np.zeros(len(data.obj_clr_idcs), dtype=np.int32)
-        self.bot_handles = np.zeros(sim.n_bots, dtype=np.int32)
 
         self.wally_indices = np.zeros(cons.hor_grid.shape[:2], dtype=np.int32)
         self.wallx_indices = np.zeros(cons.ver_grid.shape[:2], dtype=np.int32)
         self.link_indices = np.zeros(cons.link_grid.shape[:2], dtype=np.int32)
         self.roof_indices = np.zeros(cons.roof_grid.shape[:2], dtype=np.int32)
         self.obj_indices = np.zeros(len(data.obj_clr_idcs), dtype=np.int32)
-        self.bot_indices = np.zeros(sim.n_bots, dtype=np.int32)
 
         # Horizontal walls
         n_rows, n_cols = cons.hor_grid.shape[:-1]
@@ -214,6 +268,9 @@ class MazeEnv:
         gym = sim.gym
         data = self.data
 
+        self.bot_handles = np.zeros(sim.n_bots, dtype=np.int32)
+        self.bot_indices = np.zeros(sim.n_bots, dtype=np.int32)
+
         # Bots
         for i, pos, angle in zip(range(sim.n_bots), data.bot_spawn_points, data.bot_spawn_angles):
             pose = gymapi.Transform(
@@ -277,7 +334,7 @@ class MazeEnv:
             gym.set_rigid_body_color(self.handle, handle, BOT_BODY_IDX, gymapi.MESH_VISUAL, self.BASE_BOT_COLOUR)
             gym.set_rigid_body_color(self.handle, handle, BOT_CARGO_IDX, gymapi.MESH_VISUAL, self.BASE_CARGO_COLOUR)
 
-        if not full:
+        if not full or sim.is_preset:
             return
 
         # Walls
@@ -308,20 +365,20 @@ class MazeEnv:
                 gym.set_rigid_body_color(self.handle, handle, OBJECT_BODY_IDX, gymapi.MESH_VISUAL, colour)
 
     def set_rigid_props(self):
-        # TODO: Test when/if friction var becomes relevant
-        return
+        if not self.sim.is_preset:
+            return
 
         gym = self.sim.gym
-        rng = self.sim.constructor.rng
 
         for handle in self.bot_handles:
-            rigid_props = gym.get_actor_rigid_shape_properties(self.handle, handle)
-            (
-                rigid_props.friction,
-                rigid_props.rolling_friction,
-                rigid_props.torsion_friction) = rng.uniform(-0.9, 1.1, 3)
+            shape_prop_list = gym.get_actor_rigid_shape_properties(self.handle, handle)
 
-            gym.set_actor_rigid_shape_properties(self.handle, handle, rigid_props)
+            for shape_props in shape_prop_list:
+                shape_props.friction = 0.
+                # shape_props.rolling_friction
+                # shape_props.torsion_friction
+
+            gym.set_actor_rigid_shape_properties(self.handle, handle, shape_prop_list)
 
     def reset(self, full: bool = True) -> ndarray:
         """Partially or fully reset the environment and relay the new states."""
@@ -333,7 +390,7 @@ class MazeEnv:
         self.set_colours(full)
         self.set_rigid_props()
 
-        if full:
+        if full and not sim.is_preset:
             wally_states = np.concatenate((
                 cons.hor_grid.reshape(-1, 2),
                 np.where(
@@ -389,8 +446,8 @@ class MazeEnv:
 class MazeSim:
     """Gym.Sim wrapper for procedurally generated mazes."""
 
-    # Benchmarks suggest highest total FPS at 256 agents/cameras with 3.5GB VRAM
-    # The main bottleneck is the number/overhead of cameras
+    # Benchmarks suggest highest total FPS at 256 agents/cameras with ~3 GB VRAM usage
+    # The main bottleneck is the number/overhead of cameras and objects for them to render
     # Camera resolution and physics simulation have less effect
     NUM_ALL_BOTS = 256
 
@@ -417,8 +474,10 @@ class MazeSim:
         fps: int = 60,
         args: Namespace = DEFAULT_SIM_ARGS,
         rng: 'None | np.random.Generator' = None,
-        data_path: str = None
+        preset_path: str = None
     ):
+        self.is_preset = preset_path is not None
+
         # Init IsaacGym
         self.gym = gym = gymapi.acquire_gym()
 
@@ -448,11 +507,18 @@ class MazeSim:
 
         # Add ground plane
         # NOTE: Slipping on CPU
-        plane_params = gymapi.PlaneParams()
-        plane_params.normal = gymapi.Vec3(0, 0, 1)
-        plane_params.dynamic_friction = 0.                      # 1. by default
-        plane_params.segmentation_id = cfg.SEG_CLS_PLANE
-        gym.add_ground(self.handle, plane_params)
+        # NOTE: Height field has uniform colour
+        if not self.is_preset:
+            plane_params = gymapi.HeightFieldParams()
+            plane_params.dynamic_friction = 0.                      # 1. by default
+            plane_params.segmentation_id = cfg.SEG_CLS_PLANE
+            plane_params.column_scale = 500
+            plane_params.row_scale = 500
+            plane_params.nbColumns = 2
+            plane_params.nbRows = 2
+            plane_params.transform = gymapi.Transform(gymapi.Vec3(-65., -50., 0.))
+            height_samples = np.array((0, 0, 0, 0), dtype=np.int16)
+            gym.add_heightfield(self.handle, height_samples, plane_params)
 
         # Override lighting to normalise viewing conditions
         # 0, (1., 1., 1.), (0.1, 0.1, 0.1), (1., 1., 4.)
@@ -480,16 +546,24 @@ class MazeSim:
         self.n_all_bots: int = self.n_envs * self.n_bots
 
         # Parallel environments are created with the same base parameters
-        if data_path is None:
+        if not self.is_preset:
+            preset_data_dict = None
             supenv_width = None
             n_supgrid_segments = None
-            level_data = None
+            preset_assets = None
+            self.preset_specs = None
 
         else:
-            data_dict = np.load(data_path)
-            supgrid_delims = data_dict['grid_delims']
+            preset_data_dict = np.load(preset_path + '.npz')
+            supgrid_delims = preset_data_dict['grid_delims']
             supenv_width = supgrid_delims[-1] - supgrid_delims[0]
             n_supgrid_segments = len(supgrid_delims) - 1
+
+            with open(preset_path + '.json', 'r') as spec_file:
+                preset_cfg_dict = json.load(spec_file)
+
+            preset_assets = preset_cfg_dict['assets']
+            self.preset_specs = preset_cfg_dict['specs']
 
         self.constructor = MazeConstructor(
             self.env_width,
@@ -503,10 +577,13 @@ class MazeSim:
 
         self.open_grid_delims = self.constructor.open_grid_delims
 
-        if data_path is not None:
-            level_data = MazeData(self.constructor, **data_dict)
+        if preset_data_dict is None:
+            env_data = [self.constructor.generate() for _ in range(self.n_envs)]
 
-        env_data = [self.constructor.generate(level_data) for _ in range(self.n_envs)]
+        else:
+            preset_data = MazeData(self.constructor, precompute=False, **preset_data_dict)
+
+            env_data = [self.constructor.generate(preset_data.copy()) for _ in range(self.n_envs)]
 
         # Load bot asset
         bot_asset_options = gymapi.AssetOptions()
@@ -533,6 +610,20 @@ class MazeSim:
 
         self.asset_object = gym.create_sphere(
             self.handle, cfg.OBJECT_RADIUS, static_asset_options)
+
+        # Create preset assets
+        if preset_assets is None:
+            self.preset_assets = None
+
+        else:
+            self.preset_assets = {}
+
+            for key, vals in preset_assets.items():
+                width, length, height = vals
+
+                self.preset_assets[key] = (
+                    gym.create_box(self.handle, width, length, height, static_asset_options),
+                    height / 2.)
 
         # Build envs from generated and loaded data
         self.envs = [MazeEnv(self, maze_data, group_id) for group_id, maze_data in enumerate(env_data)]
@@ -578,7 +669,7 @@ class MazeSim:
     def reset(self, rst_env_indices: 'list[int]', full: bool = True) -> 'tuple[ndarray, ndarray]':
         actor_states = [self.envs[i].reset(full) for i in rst_env_indices]
 
-        if full:
+        if full and not self.is_preset:
             for i in rst_env_indices:
                 self.all_wallgrid_pairs[i] = self.envs[i].data.grid_wall_pairs
 
