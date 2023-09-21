@@ -22,8 +22,8 @@
   <xacro:property name="BRD_Y" value="${BDY_Y - WHL_W}"/>
   <xacro:property name="BRD_Z" value="${0.007 * DIM_SCALE}"/>
   <xacro:property name="CAM_X" value="${MOT_RAD/2}"/>
-  <xacro:property name="CAM_Y" value="${0.006 * DIM_SCALE}"/>
-  <xacro:property name="CAM_Z" value="${CAM_Y}"/>
+  <xacro:property name="CAM_Y" value="${0.009 * DIM_SCALE}"/>
+  <xacro:property name="CAM_Z" value="${0.006 * DIM_SCALE}"/>
 
   <!-- PROPERTIES -->
   <xacro:property name="M_SCALE" value="150"/>
@@ -56,7 +56,7 @@
     <color rgba="0.1 0.1 0.1 1.0"/>
   </material>
   <material name="grey">
-    <color rgba="0.3 0.3 0.3 1.0"/>
+    <color rgba="0.4 0.4 0.4 1.0"/>
   </material>
   <material name="midgrey">
     <color rgba="0.5 0.5 0.5 1.0"/>
@@ -97,7 +97,7 @@
       <geometry>
         <box size="${BDY_X} ${BDY_Y} ${BDY_Z}"/>
       </geometry>
-    <material name="orange"/>
+    <material name="grey"/>
     </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 ${BDY_Z/2 + MOT_RAI + WHL_RAD}"/>
@@ -123,7 +123,7 @@
       <geometry>
         <box size="${BRD_X} ${BRD_Y} ${BRD_Z}"/>
       </geometry>
-    <material name="lightgrey"/>
+    <material name="grey"/>
     </visual>
   </link>
 
@@ -133,7 +133,7 @@
       <geometry>
         <box size="${CAM_X} ${CAM_Y} ${CAM_Z}"/>
       </geometry>
-    <material name="midgrey"/>
+    <material name="grey"/>
     </visual>
   </link>
 
@@ -148,7 +148,7 @@
     <geometry>
       <cylinder radius="${WHL_RAD}" length="${WHL_W}"/>
     </geometry>
-    <material name="lightgrey"/>
+    <material name="grey"/>
   </visual>
   <collision>
     <origin rpy="${PI/2} 0 0" xyz="0 ${WHL_W/2} 0.0"/>
@@ -169,7 +169,7 @@
     <geometry>
       <cylinder radius="${WHL_RAD}" length="${WHL_W}"/>
     </geometry>
-    <material name="lightgrey"/>
+    <material name="grey"/>
   </visual>
   <collision>
     <origin rpy="${PI/2} 0 0" xyz="0 ${-WHL_W/2} 0.0"/>
@@ -190,7 +190,7 @@
     <geometry>
       <cylinder radius="${WHL_RAD}" length="${WHL_W}"/>
     </geometry>
-    <material name="lightgrey"/>
+    <material name="grey"/>
   </visual>
   <collision>
     <origin rpy="${PI/2} 0 0" xyz="0 ${WHL_W/2} 0.0"/>
@@ -211,7 +211,7 @@
     <geometry>
       <cylinder radius="${WHL_RAD}" length="${WHL_W}"/>
     </geometry>
-    <material name="lightgrey"/>
+    <material name="grey"/>
   </visual>
   <collision>
     <origin rpy="${PI/2} 0 0" xyz="0 ${-WHL_W/2} 0.0"/>
@@ -228,7 +228,7 @@
     <geometry>
       <box size="${DOT_LEN} ${DOT_LEN} ${DOT_OUT}"/>
     </geometry>
-    <material name="midgrey"/>
+    <material name="grey"/>
   </visual>
   </link>
 
@@ -238,7 +238,7 @@
     <geometry>
       <box size="${DOT_LEN} ${DOT_LEN} ${DOT_OUT}"/>
     </geometry>
-    <material name="midgrey"/>
+    <material name="grey"/>
   </visual>
   </link>
 
@@ -248,7 +248,7 @@
     <geometry>
       <box size="${DOT_LEN} ${DOT_LEN} ${DOT_OUT}"/>
     </geometry>
-    <material name="midgrey"/>
+    <material name="grey"/>
   </visual>
   </link>
 
@@ -258,7 +258,7 @@
     <geometry>
       <box size="${DOT_LEN} ${DOT_LEN} ${DOT_OUT}"/>
     </geometry>
-    <material name="midgrey"/>
+    <material name="grey"/>
   </visual>
   </link>
 

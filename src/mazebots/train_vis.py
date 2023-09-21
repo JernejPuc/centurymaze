@@ -5,6 +5,7 @@ from argparse import ArgumentParser, Namespace
 from datetime import timedelta
 from time import perf_counter
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch.nn.functional import log_softmax, one_hot
@@ -49,12 +50,13 @@ class Trainer:
         self.ckpter = CheckpointTracker(model_name, cfg.DATA_DIR, device, rng_seed)
 
         self.model = VisNet()
-        self.optimiser = NAdamW(self.model.parameters(), lr=2e-5, weight_decay=0.)
+        self.optimiser = NAdamW(self.model.parameters(), lr=1e-4, weight_decay=1e-3)
         self.ckpter.load_model(self.model, self.optimiser)
 
         self.scheduler = PlateauScheduler(
             self.optimiser,
             step_milestones=[lr_main_start_epoch, lr_main_end_epoch, self.n_epochs],
+            lr_milestones=[1e-4, 5e-3, 2e-6],
             starting_step=self.ckpter.meta['update_step'])
 
         # Logging
@@ -63,9 +65,9 @@ class Trainer:
 
         self.stats = {
             'loss': new_zero_tensor(),
-            'rgb_wmae': new_zero_tensor(),
-            'dep_wmse': new_zero_tensor(),
-            'seg_fce': new_zero_tensor()}
+            'dep_mse': new_zero_tensor(),
+            'clr_fce': new_zero_tensor(),
+            'typ_fce': new_zero_tensor()}
 
         self.writer = SummaryWriter(log_dir=os.path.join(cfg.LOG_DIR, model_name))
         self.write = self.writer.add_scalar
@@ -75,7 +77,9 @@ class Trainer:
             SideLoadingDataset
             if device.startswith('cuda') and sideload
             else LoadedDataset)(
-                os.path.join(cfg.DATA_DIR, file_name), batch_size, device)
+                np.load(os.path.join(cfg.DATA_DIR, file_name))['train'],
+                batch_size,
+                device)
 
         self.n_steps_per_epoch = max(1, len(self.dataset) // batch_size)
 
@@ -173,42 +177,44 @@ class Trainer:
     def update(self, batch: Tensor):
 
         # Unpack inputs and targets
-        ipt, clr_target, seg_target, px_weights = batch.split(cfg.DEC_IMG_CHANNEL_SPLIT, dim=1)
+        ipt, targets, weights = batch.split(cfg.ENC_IMG_CHANNEL_SPLIT, dim=1)
 
-        dep_target = ipt[:, -1]
-        clr_target = clr_target.long()
-        seg_target = seg_target.long()
+        dep_target = ipt[:, -1:]
+        clr_target = targets[:, 1].long()
+        typ_target = targets[:, 0].long()
+        weight_sum = weights.sum()
 
         # Unpack model outputs
         out = self.model(ipt)
 
-        clr_logits, seg_logits, dep = out.split(cfg.DEC_IMG_CHANNEL_SPLIT[1:], dim=1)
+        clr_logits, typ_logits, dep = out.split(cfg.DEC_IMG_CHANNEL_SPLIT, dim=1)
 
         # Logits to probs.
         clr_log_probs = log_softmax(clr_logits, dim=1)
         clr_probs = clr_logits.softmax(dim=1)
 
-        seg_log_probs = log_softmax(seg_logits, dim=1)
-        seg_probs = seg_logits.softmax(dim=1)
+        typ_log_probs = log_softmax(typ_logits, dim=1)
+        typ_probs = typ_logits.softmax(dim=1)
 
         # Expand indices to probs. (one-hot)
-        clr_probs_target = one_hot(clr_target, cfg.N_ALL_CLR_CLASSES).neg_()
+        clr_probs_target = one_hot(clr_target, cfg.N_ALL_CLR_CLASSES)
         clr_probs_target = torch.movedim(clr_probs_target, -1, 1)
 
-        seg_probs_target = one_hot(seg_target, cfg.N_SEG_CLASSES).neg_()
-        seg_probs_target = torch.movedim(seg_probs_target, -1, 1)
+        typ_probs_target = one_hot(typ_target, cfg.N_SEG_CLASSES)
+        typ_probs_target = torch.movedim(typ_probs_target, -1, 1)
 
-        # Weighted mean squared error (external weights)
-        dep_wmse = ((dep - dep_target).square() * px_weights).mean()
+        # NOTE: Using weighted sum / weight_sum instead of mean, weighting across the whole batch
+        # Mean squared error
+        dep_mse = ((dep - dep_target).square() * weights).sum() / weight_sum
 
-        # Focal cross entropy (gamma 1)
-        clr_fce = ((1. - clr_probs) * (clr_log_probs * clr_probs_target)).mean()
+        # Focal cross entropy (gamma 2)
+        clr_fce = ((1. - clr_probs).square() * (clr_log_probs * clr_probs_target.neg_()) * weights).sum() / weight_sum
 
-        # Focal cross entropy (gamma 1)
-        seg_fce = ((1. - seg_probs) * (seg_log_probs * seg_probs_target)).mean()
+        # Focal cross entropy (gamma 2)
+        typ_fce = ((1. - typ_probs).square() * (typ_log_probs * typ_probs_target.neg_()) * weights).sum() / weight_sum
 
         # Update params.
-        loss = dep_wmse + clr_fce + seg_fce
+        loss = dep_mse + clr_fce + typ_fce
         loss.backward()
 
         self.optimiser.step()
@@ -219,10 +225,10 @@ class Trainer:
             # NOTE: Loss is later divided by iter_step, hence noisy at the start of each epoch
             self.loss += loss
 
-            self.stats['loss'] += loss
-            self.stats['dep_wmse'] += dep_wmse
-            self.stats['clr_fce'] += clr_fce
-            self.stats['seg_fce'] += seg_fce
+            self.stats['loss'] += loss.detach()
+            self.stats['dep_mse'] += dep_mse.detach()
+            self.stats['clr_fce'] += clr_fce.detach()
+            self.stats['typ_fce'] += typ_fce.detach()
 
 
 if __name__ == '__main__':
@@ -243,30 +249,30 @@ if __name__ == '__main__':
         '--n_epochs', type=int, default=2000,
         help='Number of repeated iterations through the dataset.')
     parser.add_argument(
-        '--log_epoch_interval', type=int, default=10,
+        '--log_epoch_interval', type=int, default=1,
         help='Interval for logging current loss components.')
     parser.add_argument(
-        '--ckpt_epoch_interval', type=int, default=250,
+        '--ckpt_epoch_interval', type=int, default=10,
         help='Interval for saving current model parameters.')
     parser.add_argument(
-        '--branch_epoch_interval', type=int, default=500,
+        '--branch_epoch_interval', type=int, default=200,
         help='Interval for starting a new branch, i.e. path to save current model parameters.')
 
     parser.add_argument(
-        '--lr_main_start_epoch', type=float, default=1000,
+        '--lr_main_start_epoch', type=float, default=10,
         help='Epoch on which the learning rate assumes its peak value.')
     parser.add_argument(
-        '--lr_main_end_epoch', type=float, default=1500,
+        '--lr_main_end_epoch', type=float, default=1000,
         help='Epoch on which the learning rate proceeds to cool down.')
 
     parser.add_argument(
-        '--file_name', type=str, default='dataset.pt',
+        '--file_name', type=str, default='rec_00-06_set.npz',
         help='Name of the file with pre-processed image data.')
     parser.add_argument(
         '--sideload', type=int, default=0,
         help='Option to stream batches from RAM instead of moving the whole dataset to target device.')
     parser.add_argument(
-        '--batch_size', type=int, default=64,
+        '--batch_size', type=int, default=128,
         help='Number of images processed simultaneously per update.')
     parser.add_argument(
         '--mirror_prob', type=float, default=0.,

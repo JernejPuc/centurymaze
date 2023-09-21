@@ -37,9 +37,9 @@ class MazeEnv:
 
     WALL_COLOURS = np.array([gymapi.Vec3(*clr) for clr in cfg.COLOURS['pastel']], dtype=object)
     OBJECT_COLOURS = np.array([gymapi.Vec3(*clr) for clr in cfg.COLOURS['basic']], dtype=object)
-    LINK_COLOUR = gymapi.Vec3(*cfg.COLOURS['grey'][1])
-    BASE_BOT_COLOUR = gymapi.Vec3(*cfg.COLOURS['grey'][0])
-    BASE_CARGO_COLOUR = gymapi.Vec3(*cfg.COLOURS['grey'][2])
+    LINK_COLOUR = gymapi.Vec3(*cfg.COLOURS['grey'][2])
+    BASE_BOT_COLOUR = gymapi.Vec3(*cfg.COLOURS['grey'][1])
+    BASE_CARGO_COLOUR = gymapi.Vec3(*cfg.COLOURS['grey'][1])
 
     box_handles: ndarray
     wally_handles: ndarray

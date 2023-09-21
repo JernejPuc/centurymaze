@@ -763,6 +763,7 @@ if __name__ == '__main__':
 
         cons = MazeConstructor(**kwargs, supenv_width=supenv_width, n_supgrid_segments=n_supgrid_segments)
         data = cons.generate(MazeData(cons, **data_dict))
+        data.init_path_map(reset=False)
 
     # Setup
     subenv_slice = (slice(data.subenv_idcs[0], None), slice(data.subenv_idcs[1], None))

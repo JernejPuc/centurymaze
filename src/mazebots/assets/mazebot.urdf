@@ -10,7 +10,7 @@
 <color rgba="0.1 0.1 0.1 1.0"/>
 </material>
 <material name="grey">
-<color rgba="0.3 0.3 0.3 1.0"/>
+<color rgba="0.4 0.4 0.4 1.0"/>
 </material>
 <material name="midgrey">
 <color rgba="0.5 0.5 0.5 1.0"/>
@@ -47,7 +47,7 @@
 <geometry>
 <box size="0.3 0.3 0.1"/>
 </geometry>
-<material name="orange"/>
+<material name="grey"/>
 </visual>
 <collision>
 <origin rpy="0 0 0" xyz="0 0 0.164"/>
@@ -71,16 +71,16 @@
 <geometry>
 <box size="0.12 0.26 0.07"/>
 </geometry>
-<material name="lightgrey"/>
+<material name="grey"/>
 </visual>
 </link>
 <link name="sensor">
 <visual>
 <origin rpy="0 0 0" xyz="0.01 0 0"/>
 <geometry>
-<box size="0.02 0.06 0.06"/>
+<box size="0.02 0.09 0.06"/>
 </geometry>
-<material name="midgrey"/>
+<material name="grey"/>
 </visual>
 </link>
 <link name="wheel_1_left">
@@ -94,7 +94,7 @@
 <geometry>
 <cylinder radius="0.055" length="0.04"/>
 </geometry>
-<material name="lightgrey"/>
+<material name="grey"/>
 </visual>
 <collision>
 <origin rpy="1.57079632675 0 0" xyz="0 0.02 0.0"/>
@@ -114,7 +114,7 @@
 <geometry>
 <cylinder radius="0.055" length="0.04"/>
 </geometry>
-<material name="lightgrey"/>
+<material name="grey"/>
 </visual>
 <collision>
 <origin rpy="1.57079632675 0 0" xyz="0 -0.02 0.0"/>
@@ -134,7 +134,7 @@
 <geometry>
 <cylinder radius="0.055" length="0.04"/>
 </geometry>
-<material name="lightgrey"/>
+<material name="grey"/>
 </visual>
 <collision>
 <origin rpy="1.57079632675 0 0" xyz="0 0.02 0.0"/>
@@ -154,7 +154,7 @@
 <geometry>
 <cylinder radius="0.055" length="0.04"/>
 </geometry>
-<material name="lightgrey"/>
+<material name="grey"/>
 </visual>
 <collision>
 <origin rpy="1.57079632675 0 0" xyz="0 -0.02 0.0"/>
@@ -169,7 +169,7 @@
 <geometry>
 <box size="0.011 0.011 0.004"/>
 </geometry>
-<material name="midgrey"/>
+<material name="grey"/>
 </visual>
 </link>
 <link name="rotdot_2_right">
@@ -178,7 +178,7 @@
 <geometry>
 <box size="0.011 0.011 0.004"/>
 </geometry>
-<material name="midgrey"/>
+<material name="grey"/>
 </visual>
 </link>
 <link name="rotdot_3_left">
@@ -187,7 +187,7 @@
 <geometry>
 <box size="0.011 0.011 0.004"/>
 </geometry>
-<material name="midgrey"/>
+<material name="grey"/>
 </visual>
 </link>
 <link name="rotdot_4_right">
@@ -196,7 +196,7 @@
 <geometry>
 <box size="0.011 0.011 0.004"/>
 </geometry>
-<material name="midgrey"/>
+<material name="grey"/>
 </visual>
 </link>
 <joint name="body_motors_glue" type="fixed">

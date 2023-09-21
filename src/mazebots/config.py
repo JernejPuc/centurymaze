@@ -117,16 +117,17 @@ COLOURS = {
         (215, 20, 135)),
     'grey': (
         (0, 0, 0),
-        (85, 85, 85),
+        (102, 102, 102),
+        (127, 127, 127),
         (255, 255, 255))}
 
 COLOURS = {clr_group: [[val / 255. for val in clr] for clr in clrs] for clr_group, clrs in COLOURS.items()}
 
 # 9 + 2 colours: basic (objectives) + black & white (quiet or ungrounded)
-RCVR_CLR_CLASSES = COLOURS['basic'] + COLOURS['grey'][::2]
+RCVR_CLR_CLASSES = COLOURS['grey'][::3] + COLOURS['basic']
 
-# 9 + 11 colours: pastel (walls) + above
-ALL_CLR_CLASSES = COLOURS['pastel'] + RCVR_CLR_CLASSES
+# 11 + 9 + 3 colours: above (com.) + pastel (walls) + other (bot, floor, sky)
+ALL_CLR_CLASSES = RCVR_CLR_CLASSES + COLOURS['pastel'] + COLOURS['grey'][1:3] + COLOURS['sky']
 
 N_RCVR_CLR_CLASSES = len(RCVR_CLR_CLASSES)
 N_ALL_CLR_CLASSES = len(ALL_CLR_CLASSES)
@@ -163,8 +164,9 @@ OBS_RGB_SLICE = slice(OBS_VEC_SIZE-RGB_VEC_SIZE, OBS_VEC_SIZE)
 # Resolution mostly important for effective viewing distance
 OBS_IMG_RES_WIDTH = 96
 OBS_IMG_RES_HEIGHT = 48
-OBS_IMG_CHANNELS = RGB_VEC_SIZE + 1  # RGB, depth
-DEC_IMG_CHANNEL_SPLIT = (OBS_IMG_CHANNELS, N_ALL_CLR_CLASSES, N_SEG_CLASSES, 1)  # HSVD, clrs., seg., weights (32)
+OBS_IMG_CHANNELS = RGB_VEC_SIZE + 1                             # RGB or HSV, depth (4)
+ENC_IMG_CHANNEL_SPLIT = (OBS_IMG_CHANNELS, 2, 1)                # HSVD, clr. seg. + func. (type) seg., px. weights (7)
+DEC_IMG_CHANNEL_SPLIT = (N_ALL_CLR_CLASSES, N_SEG_CLASSES, 1)   # Clr. softmax, func. softmax, depth value (31)
 
 # Torque cmd., rgb radial emitter
 ACT_VEC_SIZE = DOF_VEC_SIZE + RGB_VEC_SIZE
