@@ -1,5 +1,4 @@
 import json
-import os
 from argparse import Namespace
 
 import numpy as np
@@ -12,7 +11,6 @@ from maze import MazeData, MazeConstructor
 
 
 # Assets
-BOT_FILE_DIR = os.path.abspath(os.path.join(__file__, '..', 'assets'))
 BOT_FILE_NAME = 'mazebot.urdf'
 
 OBJECT_BODY_IDX = 0
@@ -500,6 +498,12 @@ class MazeSim:
         # All substeps by default, but that produces noisy and nondeterministic results
         sim_params.physx.contact_collection = gymapi.CC_LAST_SUBSTEP
 
+        if args.use_gpu_pipeline:
+            if args.graphics_device_id != args.compute_device_id:
+                print(f'Warning: Overriding graphics device {args.graphics_device_id} to {args.compute_device_id}.')
+
+                args.graphics_device_id = args.compute_device_id
+
         self.handle = gym.create_sim(args.compute_device_id, args.graphics_device_id, gymapi.SIM_PHYSX, sim_params)
 
         if self.handle is None:
@@ -589,7 +593,7 @@ class MazeSim:
         bot_asset_options = gymapi.AssetOptions()
         bot_asset_options.thickness = 0.005  # 0.02 default; change not visible, but this relates better to bot size
 
-        self.asset_bot = gym.load_urdf(self.handle, BOT_FILE_DIR, BOT_FILE_NAME, bot_asset_options)
+        self.asset_bot = gym.load_urdf(self.handle, cfg.ASSET_DIR, BOT_FILE_NAME, bot_asset_options)
 
         # Create static assets
         static_asset_options = gymapi.AssetOptions()

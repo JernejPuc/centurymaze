@@ -1,5 +1,8 @@
 """Project-wide configuration"""
 
+import os
+
+
 # Base parameters for procedural environment generation
 # At higher levels, mazes become larger and more complex,
 # with more agents and objectives and longer episodes
@@ -63,6 +66,8 @@ LEVEL_PARAMS = {
 
 
 # Assets
+ASSET_DIR = os.path.abspath(os.path.join(__file__, '..', 'assets'))
+
 BOT_WIDTH = 0.3
 BOT_RADIUS = BOT_WIDTH/2 * 2**0.5
 BOT_HEIGHT = 0.264
@@ -167,6 +172,7 @@ OBS_IMG_RES_HEIGHT = 48
 OBS_IMG_CHANNELS = RGB_VEC_SIZE + 1                             # RGB or HSV, depth (4)
 ENC_IMG_CHANNEL_SPLIT = (OBS_IMG_CHANNELS, 2, 1)                # HSVD, clr. seg. + func. (type) seg., px. weights (7)
 DEC_IMG_CHANNEL_SPLIT = (N_ALL_CLR_CLASSES, N_SEG_CLASSES, 1)   # Clr. softmax, func. softmax, depth value (31)
+ALL_IMG_CHANNEL_SPLIT = ENC_IMG_CHANNEL_SPLIT + DEC_IMG_CHANNEL_SPLIT
 
 # Torque cmd., rgb radial emitter
 ACT_VEC_SIZE = DOF_VEC_SIZE + RGB_VEC_SIZE
@@ -208,17 +214,17 @@ N_UPDATES_PER_EPOCH = (
     N_ROLLOUT_STEPS // N_TRUNCATED_STEPS * N_ROLLOUTS_PER_EPOCH
     + N_ROLLOUT_STEPS * N_ROLLOUTS_PER_EPOCH // N_TRUNCATED_STEPS * N_AUX_ITERS_PER_EPOCH)
 
-# Approx. 1 plot point and checkpoint per 4 virtual minutes, 14 per hour, 337 per day, 2362 per week
+# 1 plot point and checkpoint per 4 virtual minutes, 15 per hour, 360 per day, 2520 per week
 LOG_EPOCH_INTERVAL = max(1, 4 * 60 // SECONDS_PER_EPOCH)
 CKPT_EPOCH_INTERVAL = LOG_EPOCH_INTERVAL
 
-# Approx. 1 branch per half virtual hour, 48 per day, 336 per week
+# 1 branch per half virtual hour, 48 per day, 360 per week
 BRANCH_EPOCH_INTERVAL = 30 * 60 // SECONDS_PER_EPOCH
 
 # TODO: Adjust wrt. trials
 TIME_MILESTONE_MAP = {
-    # Approx. 4 virtual minutes to warm up, 6 hours to train, half hour to cool down, 6.5 hours total
-    i: (256, 6 * 3600, 6 * 3600 + 1800) for i in range(1, 8)}
+    # 4 virtual minutes to warm up, 4 hours to train, half hour to cool down, 4.5 hours total
+    i: (240, 4 * 3600, 4 * 3600 + 1800) for i in range(1, 8)}
 
 N_EPOCHS_MAP = {k: tv[-1] // SECONDS_PER_EPOCH for k, tv in TIME_MILESTONE_MAP.items()}
 

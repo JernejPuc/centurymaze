@@ -1,5 +1,6 @@
 """Simulation control flow and runtime"""
 
+import tkinter as tk
 import os
 from argparse import Namespace
 from typing import Any, Callable
@@ -18,7 +19,7 @@ from discit.track import CheckpointTracker
 import config as cfg
 from sim import MazeSim, CAM_OFFSET, MOT_MAX_TORQUE
 from task import BasicInterface, MazeTask, MAX_IMG_DEPTH, SCALE_TIME
-from model import ActorCritic, Policy
+from model import ActorCritic, Policy, VisNet
 from utils import get_arg_defaults, get_available_file_idx
 from utils_torch import norm_depth_range, apply_quat_rot, get_eulz_from_quat
 
@@ -42,6 +43,12 @@ class Interface(BasicInterface):
 
     OFFSET_3RD_AHEAD = [[-cfg.BOT_WIDTH*2, 0., 0.]]
     OFFSET_3RD_ABOVE = [[0., 0., cfg.WALL_HALFHEIGHT]]
+
+    PREV_ZOOM = 9
+    PREV_DIM = (cfg.OBS_IMG_RES_WIDTH, 3 * cfg.OBS_IMG_RES_HEIGHT)
+
+    RGB_CLASSES = np.round(np.array(cfg.ALL_CLR_CLASSES, dtype=np.float32) * 255.)
+    RGB_CLASSES[-2] = 168.  # Override 127, as the ground appears brighter in renders
 
     OBS_EVENTS = [
         (gymapi.KEY_ESCAPE, 'end_session'), (gymapi.KEY_L, 'lvl_reset'),
@@ -93,6 +100,24 @@ class Interface(BasicInterface):
             for key, val in self.TORQUE_STATES.items()}
 
         self.key_vec = np.zeros(5)
+
+        # Side panel
+        self.prev_reconstruct = False
+
+        if session.preview:
+            self.tk_root = tk.Tk()
+            self.tk_canvas = tk.Canvas(
+                self.tk_root,
+                width=self.PREV_DIM[0] * self.PREV_ZOOM,
+                height=self.PREV_DIM[1] * self.PREV_ZOOM)
+
+            self.tk_canvas.pack()
+
+            self.visnet = VisNet().to(session.ckpter.device)
+            self.visnet.load_state_dict(torch.load(os.path.join(cfg.ASSET_DIR, 'visnet.pt')))
+
+        else:
+            self.tk_root = self.tk_canvas = self.visnet = None
 
     def update_target_indices(self, env_inc: int = 0, bot_inc: int = 0):
         self.env_idx = (self.env_idx + env_inc) % self.sim.n_envs
@@ -208,22 +233,47 @@ class Interface(BasicInterface):
             f'RGB rcvr. Back  | R: {obs_com[6]: .2f} | G: {obs_com[7]: .2f} | B: {obs_com[8]: .2f}\n'
             f'RGB rcvr. Left  | R: {obs_com[9]: .2f} | G: {obs_com[10]: .2f} | B: {obs_com[11]: .2f}\n')
 
-    def save_camera_images(self) -> 'tuple[str, str]':
+    def get_rendered_images(self) -> 'tuple[np.ndarray, np.ndarray, np.ndarray]':
         self.gym.render_all_camera_sensors(self.sim_handle)
         self.gym.start_access_image_tensors(self.sim_handle)
 
         rgb = self.session.img_rgb_list[self.all_bot_idx][..., :3]
         dep = self.session.img_dep_list[self.all_bot_idx]
-        seg = self.session.img_seg_list[self.all_bot_idx]
+        typ = self.session.img_seg_list[self.all_bot_idx]
 
         if self.sim.is_preset:
-            seg_mask = (seg == cfg.SEG_CLS_NULL).unsqueeze(-1).float()
-            rgb = torch.lerp(rgb.float(), self.session.sky_clr, seg_mask)
+            typ_mask = (typ == cfg.SEG_CLS_NULL).unsqueeze(-1).float()
+            rgb = torch.lerp(rgb.float(), self.session.sky_clr, typ_mask)
 
         rgb = rgb.cpu().numpy()
         dep = 255. * norm_depth_range(-dep, MAX_IMG_DEPTH).cpu().numpy()
+        typ = (255. / 6.) * typ.cpu().numpy()
 
         self.gym.end_access_image_tensors(self.sim_handle)
+
+        return rgb, dep, typ
+
+    def get_visnet_images(self) -> 'tuple[np.ndarray, np.ndarray, np.ndarray]':
+        obs_img, _, _ = self.session.async_temp_result
+
+        hsvd = obs_img[self.all_bot_idx:self.all_bot_idx+1]
+
+        out = self.visnet(hsvd)
+
+        clr_logits, typ_logits, dep = out.split(cfg.DEC_IMG_CHANNEL_SPLIT, dim=1)
+        clr_logits = clr_logits[0].cpu().numpy()
+        typ_logits = typ_logits[0].cpu().numpy()
+        dep = dep[0, 0].cpu().numpy()
+
+        dep = np.clip(dep * 255., 0., 255.)
+        typ_seg = np.argmax(typ_logits, axis=0) * (255. / 6.)
+        clr_seg = np.argmax(clr_logits, axis=0)
+        rgb_cls = self.RGB_CLASSES[clr_seg]
+
+        return rgb_cls, dep, typ_seg
+
+    def save_camera_images(self, reconstruct: bool = False) -> 'tuple[str, str, str]':
+        rgb, dep, typ = (self.get_visnet_images if reconstruct else self.get_rendered_images)()
 
         # RGB
         file_idx = get_available_file_idx(cfg.DATA_DIR, 'img_rgbcam')
@@ -237,7 +287,13 @@ class Interface(BasicInterface):
 
         Image.fromarray(dep.astype(np.uint8), mode='L').save(filename_dep)
 
-        return filename_rgb, filename_dep
+        # Type seg.
+        file_idx = get_available_file_idx(cfg.DATA_DIR, 'img_typcam')
+        filename_typ = os.path.join(cfg.DATA_DIR, f'img_typcam_{file_idx:02d}.png')
+
+        Image.fromarray(typ.astype(np.uint8), mode='L').save(filename_typ)
+
+        return filename_rgb, filename_dep, filename_typ
 
     def save_viewer_image(self) -> str:
         file_idx = get_available_file_idx(cfg.DATA_DIR, 'img_viewer')
@@ -252,6 +308,8 @@ class Interface(BasicInterface):
 
         if self.gym.query_viewer_has_closed(self.viewer):
             raise KeyboardInterrupt
+
+        self.update_preview()
 
         for event in self.gym.query_viewer_action_events(self.viewer):
             cmd_key, cmd_press = event.action, event.value > 0
@@ -294,18 +352,25 @@ class Interface(BasicInterface):
                     # self.update_top_view()
 
                 elif cmd_key == 'save_view':
-                    if self.view == self.VIEW_BOT and self.session.render_cameras:
-                        filename_rgb, filename_dep = self.save_camera_images()
+                    if self.view != self.VIEW_TOP and self.session.render_cameras:
+                        for reconstruct in (False, True):
+                            filename_rgb, filename_dep, filename_typ = self.save_camera_images(reconstruct)
 
-                        print(
-                            f'Saved camera RGB image to: {filename_rgb}\n'
-                            f'Saved camera DEP image to: {filename_dep}')
+                            print(
+                                f'Saved camera RGB image to: {filename_rgb}\n'
+                                f'Saved camera DEP image to: {filename_dep}\n'
+                                f'Saved camera TYP image to: {filename_typ}')
 
                     print(f'Saved viewer image to: {self.save_viewer_image()}')
 
             elif cmd_key in self.ACT_KEYS:
                 if cmd_key == 'alt_move':
                     self.key_vec[-1] = event.value
+
+                    if not event.value:
+                        self.prev_reconstruct = not self.prev_reconstruct
+
+                        print(f'Side preview reconstruction is {"ON" if self.prev_reconstruct else "OFF"}.')
 
                 elif self.session.ctrl_mode != Session.CTRL_MAN:
                     if cmd_press:
@@ -332,6 +397,27 @@ class Interface(BasicInterface):
                     self.key_vec[3] = -event.value
 
                 self.session.actions[self.all_bot_idx, :cfg.DOF_VEC_SIZE] = self.get_torque_from_key_vec()
+
+    def update_preview(self):
+        step_out = self.session.async_temp_result
+
+        if step_out is None or len(step_out) != 3 or len(step_out[0].shape) != 4:
+            return
+
+        rgb, dep, typ = (self.get_visnet_images if self.prev_reconstruct else self.get_rendered_images)()
+        stacked = np.concatenate((rgb, np.stack((dep,)*3, axis=-1), np.stack((typ,)*3, axis=-1)), axis=0)
+
+        data = f'P6 {self.PREV_DIM[0]} {self.PREV_DIM[1]} 255 '.encode() + stacked.astype(np.uint8).tobytes()
+
+        photoimage = tk.PhotoImage(
+            width=self.PREV_DIM[0],
+            height=self.PREV_DIM[1],
+            data=data,
+            format='PPM'
+        ).zoom(self.PREV_ZOOM, self.PREV_ZOOM)
+
+        self.tk_canvas.create_image(0, 0, anchor='nw', image=photoimage)
+        self.tk_root.update()
 
     def sync_redraw(self):
         """Draw the scene in the viewer, syncing sim with real-time."""
@@ -371,6 +457,7 @@ class Session(MazeTask):
         {'name': '--end_step', 'type': int, 'default': -1, 'help': 'Max steps until auto-termination.'},
         {'name': '--ctrl_mode', 'type': int, 'default': CTRL_MAN, 'help': 'Sim/agent control mode.'},
         {'name': '--rec_mode', 'type': int, 'default': REC_NONE, 'help': 'Data category to record.'},
+        {'name': '--preview', 'type': int, 'default': 0, 'help': 'Option to view input or recons. images in side GUI.'},
         {'name': '--headless', 'type': int, 'default': 0, 'help': 'Option to run without a viewer.'},
         {'name': '--act_freq', 'type': int, 'default': cfg.STEPS_PER_SECOND, 'help': 'Inference steps per second.'},
         {'name': '--transfer_name', 'type': str, 'default': '', 'help': 'Starting model name/ID string.'},
@@ -378,6 +465,7 @@ class Session(MazeTask):
         {'name': '--model_name', 'type': str, 'default': 'mazeai', 'help': 'Model name/ID string.'},
         {'name': '--model_com', 'type': int, 'default': 1, 'help': 'Option to use communication I/O.'},
         {'name': '--model_guide', 'type': int, 'default': 0, 'help': 'Option to use hidden state inputs.'},
+        {'name': '--model_align', 'type': int, 'default': 1, 'help': 'Option to aux. train for objective alignment.'},
         {'name': '--model_prob', 'type': int, 'default': 1, 'help': 'Option to keep probabilistic inference.'},
         {'name': '--model_share', 'type': int, 'default': 0, 'help': 'Option to enable reward sharing.'},
         {'name': '--rng_seed', 'type': int, 'default': 42, 'help': 'Seed for numpy and torch RNGs.'}]
@@ -387,27 +475,29 @@ class Session(MazeTask):
         self.ctrl_mode: int = args.ctrl_mode
         self.rec_mode: int = args.rec_mode
         self.rec_data_queue: 'list[Tensor]' = []
+        self.preview = bool(args.preview)
 
         # Resume model state
-        device = 'cuda' if args.use_gpu_pipeline else 'cpu'
-
         self.model_options = {
             'communicating': args.model_com,
             'guided': args.model_guide,
+            'aligned': args.model_align,
             'prob_actor': args.model_prob}
 
         self.ckpter = CheckpointTracker(
-            args.model_name, cfg.DATA_DIR, device, args.rng_seed, args.transfer_name, args.transfer_ver,
+            args.model_name, cfg.DATA_DIR, args.sim_device, args.rng_seed,
+            transfer_name=args.transfer_name,
+            ver_to_transfer=args.transfer_ver if args.transfer_ver >= 0 else None,
             reset_step_on_transfer=True)
 
         # Init IsaacGym and generate initial envs
         self.steps_per_second: int = min(args.act_freq, 64)
         frames_per_second = self.steps_per_second if args.headless else 64
 
-        preset_path = os.path.join(cfg.DATA_DIR, args.preset_name) if args.preset_name else None
+        preset_path = os.path.join(cfg.ASSET_DIR, args.preset_name) if args.preset_name else None
 
         sim = MazeSim(args.level, args.n_bots, args.n_envs, frames_per_second, args, self.ckpter.rng, preset_path)
-        interface = Interface(self, sim, device) if not args.headless else None
+        interface = Interface(self, sim, args.sim_device) if not args.headless else None
 
         # Extend or diminish standard episode duration
         sim.ep_duration: int = round(sim.ep_duration * args.x_duration)
@@ -418,7 +508,7 @@ class Session(MazeTask):
             interface,
             self.steps_per_second,
             frames_per_second,
-            render_cameras=self.ctrl_mode > self.CTRL_MAN or self.rec_mode > self.REC_NONE,
+            render_cameras=self.ctrl_mode > self.CTRL_MAN or self.rec_mode > self.REC_NONE or self.preview,
             keep_segmentation=self.rec_mode > self.REC_NONE,
             keep_rgb_over_hsv=self.ctrl_mode == self.CTRL_GEN,
             spawn_with_random_rgb=self.ctrl_mode == self.CTRL_GEN,
@@ -426,7 +516,7 @@ class Session(MazeTask):
             distribute_env_resets=self.ctrl_mode == self.CTRL_RL,
             full_env_regeneration=preset_path is None and args.regen,
             reward_sharing=bool(args.model_share),
-            device=device)
+            device=args.sim_device)
 
         self.accelerate()
 
@@ -510,20 +600,19 @@ class Session(MazeTask):
         if self.interface is not None:
             self.gym.destroy_viewer(self.interface.viewer)
 
+            if self.interface.tk_root is not None:
+                self.interface.tk_root.destroy()
+
         self.sim.cleanup()
         self.async_event_loop.close()
 
         print('Done.')
 
     def train(self):
-        # Assert that encoder exists
-        encoder_path = os.path.join(cfg.DATA_DIR, 'visnet', 'encoder_000.pt')
-
-        if not os.path.exists(encoder_path):
-            raise FileNotFoundError(f'Visual encoder is missing from presumed path: {encoder_path}')
+        encoder_path = os.path.join(cfg.ASSET_DIR, 'visenc.pt')
 
         # Load model
-        model = ActorCritic(self.sim.n_bots, **self.model_options)
+        model = ActorCritic(self.sim.n_bots, self.sim.n_envs, **self.model_options)
 
         optimiser = NAdamW(
             (param for param in model.parameters() if param.requires_grad),
@@ -582,7 +671,7 @@ class Session(MazeTask):
         if not self.headless:
             self.interface.update_top_view()
 
-        model = ActorCritic(self.sim.n_bots, **self.model_options)
+        model = ActorCritic(self.sim.n_bots, self.sim.n_envs, **self.model_options)
 
         model.to(self.ckpter.device)
         self.ckpter.load_model(model)
@@ -640,7 +729,7 @@ class Session(MazeTask):
             inputs = (
                 torch.rand_like(self.graphs['act_partial']['out'][2]),
                 torch.rand_like(self.graphs['act_partial']['out'][3]),
-                self.graphs['eval_state']['out'][2].detach().clone(),
+                self.graphs['eval_state']['out'][1].detach().clone(),
                 *[aux.detach().clone() for aux in aux_tensors])
 
             act_fn, self.graphs['act_partial_encoded'] = capture_graph(act_fn, inputs)

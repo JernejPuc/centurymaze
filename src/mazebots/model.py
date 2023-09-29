@@ -205,7 +205,9 @@ class Policy(Module):
 
         self.comp_initial = nn.Parameter(comp_initial, requires_grad=False)
         self.coml_initial = nn.Parameter(coml_initial, requires_grad=False)
+        self.com_in_idx = sum(self.act_in_sizes[:-1])
         self.com_out_idx = self.act_out_sizes[0]
+        self.com_out_size = self.act_out_sizes[1]
 
         self.activ = nn.Tanh()
 
@@ -265,8 +267,9 @@ class Policy(Module):
         wrt. 4 oriented receivers, each covering an angle of 90 degrees.
         """
 
-        # Nx3 -> Ex1xBx3 -> ExBxBx3 -> NxBx3 (repeat_interleave cannot be used directly)
-        sig = sig.reshape(self.n_envs, 1, -1, 3).expand(-1, self.n_bots, -1, -1).reshape(self.n_all_bots, -1, 3)
+        # NxS -> Ex1xBxS -> ExBxBxS -> NxBxS (repeat_interleave cannot be used directly)
+        sig = sig.reshape(self.n_envs, 1, -1, self.com_out_size).expand(-1, self.n_bots, -1, -1)
+        sig = sig.reshape(self.n_all_bots, -1, self.com_out_size)
 
         # NxBx4, NxBxS -> Nx4xS -> Nx(4xS)
         sig_agg = torch.einsum('ijk,ijl->ikl', weights, sig).flatten(1)
@@ -278,7 +281,7 @@ class Policy(Module):
 
     def forward(self, x: Tensor, com_weights: Tensor, com_probs: Tensor, memp: Tensor) -> 'tuple[Tensor, Tensor]':
         if self.communicating:
-            x, com_mask = x[:, :self.com_out_idx], x[:, self.com_out_idx:]
+            x, com_mask = x[:, :self.com_in_idx], x[:, self.com_in_idx:]
 
             com_sig = WeightedGradDiscretise.apply(com_probs, com_mask)
             com_agg = self.weigh_signals(com_sig, com_weights)
@@ -414,12 +417,14 @@ class ActorCritic(ActorCriticTemplate):
         n_envs: int = 1,
         communicating: bool = True,
         guided: bool = False,
+        aligned: bool = True,
         prob_actor: bool = True
     ):
         super().__init__()
 
         self.prob_actor = prob_actor
         self.ignore_com = not communicating
+        self.detach_alignment = not aligned
 
         self.visencoder = VisEncoder()
         self.policy = Policy(n_agents_per_env, n_envs, communicating, guided)
@@ -580,7 +585,7 @@ class ActorCritic(ActorCriticTemplate):
     ) -> 'tuple[MultiCategorical, FixedVarNormal, MultiNormal, tuple[Tensor, ...]]':
 
         x, v, memp, memv = self.fwd_partial(*obs, *mem, detach=detach)
-        aux = self.aligner(memp)
+        aux = self.aligner(memp.detach() if self.detach_alignment else memp)
 
         act = self.get_distr(x, from_raw=True)
         val = FixedVarNormal(symexp(v))
