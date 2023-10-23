@@ -163,7 +163,7 @@ RCVR_VEC_SIZE = 4
 # 4 torque cmd., 4 ang. vel., 3x3 IMU,
 # 3 RGB cmd., 3 RGB task, 11x4 clr. receivers
 OBS_VEC_SIZE = 1 + 2*DOF_VEC_SIZE + IMU_VEC_SIZE + 2*RGB_VEC_SIZE
-OBS_COM_SIZE = len(RCVR_CLR_CLASSES) * RCVR_VEC_SIZE
+OBS_COM_SIZE = N_RCVR_CLR_CLASSES * RCVR_VEC_SIZE
 OBS_RGB_SLICE = slice(OBS_VEC_SIZE-RGB_VEC_SIZE, OBS_VEC_SIZE)
 
 # Resolution mostly important for effective viewing distance
@@ -185,16 +185,34 @@ ACT_DOF_MODES_BASE = [
     [-1., 1., -1., 1.],
     [1., -1., 1., -1.]]
 
-# 20 total:
-# 2 goal pos., 2 bot pos.,
-# 2 air xy direction, 2 a* xy direction, 1 air proximity, 1 a* path proximity,
-# 4 proximity channels, 1 colliding flag,
-# 1 time at goal, 1 time spent on task, 1 time until end of episode, 1 num. of completed tasks, 1 throughput
-STATE_VEC_SIZE = 2*XY_VEC_SIZE + 2*DIRMAG_VEC_SIZE + RCVR_VEC_SIZE + 6
+# 1 nearest obj. in fov., 1 nearest obj. in reach
+HEUR_VEC_SIZE = 2
 
-# 4 total:
-# 2 goal pos xy, 2 bot pos xy
-AUX_VEC_SPLIT = (2, 2)
+# 24 total:
+# 9 prox. of obj. in fov., 1 goal in fov. mask,
+# 2 goal xy pos., 2 bot xy pos., 2 air xy dir., 1 air prox., 2 a* path xy dir., 1 a* path prox.,
+# 4 bot proximity
+AUX_VEC_SPLIT = (N_OBJ_COLOURS, 1, XY_VEC_SIZE, XY_VEC_SIZE, DIRMAG_VEC_SIZE, DIRMAG_VEC_SIZE, RCVR_VEC_SIZE)
+AUX_VEC_SIZE = sum(AUX_VEC_SPLIT)
+
+# 24 total:
+# 15 aux without prox. of obj. in fov.,
+# 1 colliding flag, 3 RGB task,
+# 1 time at goal, 1 time spent on task, 1 time until end of episode, 1 num. of completed tasks, 1 throughput
+STATE_REM_SIZE = 1 + RGB_VEC_SIZE + 5
+STATE_VEC_SIZE = AUX_VEC_SIZE - N_OBJ_COLOURS + STATE_REM_SIZE
+
+# 59 total:
+# 24 obs., 2 heuristic, 24 aux., 9 state
+ALL_VEC_SPLIT = (OBS_VEC_SIZE, HEUR_VEC_SIZE, AUX_VEC_SIZE, STATE_REM_SIZE)
+
+IPT_VEC_SPLIT = ALL_VEC_SPLIT[:3]
+IPT_VEC_SIZE = sum(IPT_VEC_SPLIT)
+
+AUX_VEC_SLICE = slice(OBS_VEC_SIZE + HEUR_VEC_SIZE, OBS_VEC_SIZE + HEUR_VEC_SIZE + AUX_VEC_SIZE)
+STATE_VEC_SLICE = slice(
+    OBS_VEC_SIZE + HEUR_VEC_SIZE + N_OBJ_COLOURS,
+    OBS_VEC_SIZE + HEUR_VEC_SIZE + N_OBJ_COLOURS + STATE_VEC_SIZE)
 
 
 # Training setup
@@ -232,5 +250,6 @@ UPDATE_MILESTONE_MAP = {
     k: tuple([v * N_UPDATES_PER_EPOCH // SECONDS_PER_EPOCH for v in tv])
     for k, tv in TIME_MILESTONE_MAP.items()}
 
-WEIGHT_DECAY_MAP = {i: 1e-2 for i in range(1, 8)}
-WEIGHT_DECAY_MAP[1] = WEIGHT_DECAY_MAP[7] = 0.
+WEIGHT_DECAY = 1e-2
+AUX_WEIGHT = 1e-2
+ENT_WEIGHT = 4e-3

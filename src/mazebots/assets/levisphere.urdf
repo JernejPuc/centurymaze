@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot name="tsphere" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<material name="grey">
+<color rgba="0.4 0.4 0.4 1.0"/>
+</material>
+<link name="body">
+<visual>
+<origin rpy="0 0 0" xyz="0 0 0"/>
+<geometry>
+<sphere radius="0.225"/>
+</geometry>
+<material name="grey"/>
+</visual>
+</link>
+<link name="collider">
+<inertial>
+<mass value="10000."/>
+<origin rpy="0 0 0" xyz="0 0 0"/>
+<inertia ixx="189.583334" ixy="0.0" ixz="0.0" iyy="189.583334" iyz="0.0" izz="253.125"/>
+</inertial>
+<collision>
+<origin rpy="0 0 0" xyz="0 0 0"/>
+<geometry>
+<cylinder radius="0.225" length="0.275"/>
+</geometry>
+</collision>
+</link>
+<joint name="collider_body_relation" type="fixed">
+<parent link="body"/>
+<child link="collider"/>
+<origin xyz="0.0 0.0 -0.1375"/>
+</joint>
+</robot>

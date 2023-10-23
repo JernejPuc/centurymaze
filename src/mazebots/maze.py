@@ -461,11 +461,11 @@ class MazeConstructor:
 
         return wall_centres, grid_wall_pairs, sqr_roof_mask, sqr_link_mask, hor_wall_mask, ver_wall_mask
 
-    def generate(self, data: 'None | MazeData' = None) -> MazeData:
+    def generate(self, data: 'None | MazeData' = None, precompute_paths: bool = False) -> MazeData:
         """Randomly generate mazes until the underlying graph is feasible."""
 
         if data is not None:
-            return self.reposition(data)
+            return self.reposition(data, precompute_paths)
 
         while True:
             rng_state = self.reset_rng()
@@ -584,7 +584,7 @@ class MazeConstructor:
             bot_spawn_points=bot_spawn_points,
             bot_spawn_angles=bot_spawn_angles)
 
-    def reposition(self, data: MazeData) -> MazeData:
+    def reposition(self, data: MazeData, precompute_paths: bool = False) -> MazeData:
         """Move spawns and objects around, but keep the overall maze structure."""
 
         while True:
@@ -621,7 +621,7 @@ class MazeConstructor:
         data.obj_clr_idcs = self.rng.permutation(cfg.N_OBJ_COLOURS)[:self.n_objects]
         data.bot_spawn_angles = self.rng.uniform(low=-np.pi, high=np.pi, size=self.n_bots)
 
-        data.init_path_map(reset='regcon_graph_paths' not in data.__dict__, precompute=False)
+        data.init_path_map(reset='regcon_graph_paths' not in data.__dict__, precompute=precompute_paths)
 
         return data
 

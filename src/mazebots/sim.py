@@ -12,6 +12,7 @@ from maze import MazeData, MazeConstructor
 
 # Assets
 BOT_FILE_NAME = 'mazebot.urdf'
+OBJ_FILE_NAME = 'levisphere.urdf'
 
 OBJECT_BODY_IDX = 0
 BOT_BODY_IDX = 0
@@ -384,7 +385,7 @@ class MazeEnv:
         sim = self.sim
         cons = sim.constructor
 
-        self.data = data = cons.generate(None if full else self.data)
+        self.data = data = cons.generate(None if full else self.data, not sim.is_preset)
         self.set_colours(full)
         self.set_rigid_props()
 
@@ -589,11 +590,12 @@ class MazeSim:
 
             env_data = [self.constructor.generate(preset_data.copy()) for _ in range(self.n_envs)]
 
-        # Load bot asset
+        # Load bot and objective assets
         bot_asset_options = gymapi.AssetOptions()
         bot_asset_options.thickness = 0.005  # 0.02 default; change not visible, but this relates better to bot size
 
         self.asset_bot = gym.load_urdf(self.handle, cfg.ASSET_DIR, BOT_FILE_NAME, bot_asset_options)
+        self.asset_object = gym.load_urdf(self.handle, cfg.ASSET_DIR, OBJ_FILE_NAME, bot_asset_options)
 
         # Create static assets
         static_asset_options = gymapi.AssetOptions()
@@ -611,9 +613,6 @@ class MazeSim:
 
         self.asset_roof = gym.create_box(
             self.handle, wall_length-cfg.WALL_WIDTH, wall_length-cfg.WALL_WIDTH, cfg.WALL_WIDTH, static_asset_options)
-
-        self.asset_object = gym.create_sphere(
-            self.handle, cfg.OBJECT_RADIUS, static_asset_options)
 
         # Create preset assets
         if preset_assets is None:

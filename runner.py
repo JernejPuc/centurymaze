@@ -9,6 +9,7 @@ ARG_CFG = {
     'maze': 'python src/mazebots/maze.py'}
 
 for i in range(1, 8):
+    # NOTE: May need to add `DISPLAY=:0.0` to get rid of seg. faults on a headless server
     base_call = f'DRI_PRIME=1 python src/mazebots/session.py --level {i}'
 
     ARG_CFG[f'test{i}'] = base_call

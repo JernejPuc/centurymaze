@@ -47,7 +47,8 @@ class Interface(BasicInterface):
     PREV_ZOOM = 9
     PREV_DIM = (cfg.OBS_IMG_RES_WIDTH, 3 * cfg.OBS_IMG_RES_HEIGHT)
 
-    RGB_CLASSES = np.round(np.array(cfg.ALL_CLR_CLASSES, dtype=np.float32) * 255.)
+    TYP_CLASSES = np.linspace(0, 255, 7, dtype=np.float32)[:, None, None]
+    RGB_CLASSES = np.round(np.array(cfg.ALL_CLR_CLASSES, dtype=np.float32)[:, None, None] * 255.)
     RGB_CLASSES[-2] = 168.  # Override 127, as the ground appears brighter in renders
 
     OBS_EVENTS = [
@@ -186,6 +187,10 @@ class Interface(BasicInterface):
         obs_vec = obs_vec[self.all_bot_idx].cpu().numpy()
         obs_com = obs_com[self.all_bot_idx].cpu().flatten().numpy()
 
+        # TODO: Reindex and handle omitted
+        goal_in_sight = obs_vec[35]
+        obs_vec = np.concatenate((obs_vec[2:26], obs_vec[36:51], obs_vec[54:]))
+
         time_left = (self.sim.ep_duration - self.session.env_run_times[self.env_idx]).item()
         tput = self.session.get_throughput()
         bot_ori = self.session.env_bot_ori[None, self.env_idx, self.bot_idx].cpu()
@@ -201,10 +206,10 @@ class Interface(BasicInterface):
             f'Goal position   | Front: {obs_vec[24]: .2f} | Left: {obs_vec[25]: .2f}\n'
             f'Bot position    | Front: {obs_vec[26]: .2f} | Left: {obs_vec[27]: .2f}\n'
             f'Air direction   | Front: {obs_vec[28]: .2f} | Left: {obs_vec[29]: .2f}\n'
-            f'A*  direction   | Front: {obs_vec[30]: .2f} | Left: {obs_vec[31]: .2f}\n'
-            f'Air proximity   |        {obs_vec[32]: .2f}\n'
+            f'A*  direction   | Front: {obs_vec[31]: .2f} | Left: {obs_vec[32]: .2f}\n'
+            f'Air proximity   |        {obs_vec[30]: .2f}\n'
             f'A*  proximity   |        {obs_vec[33]: .2f}\n'
-            f'Goal in sight   | {"TRUE" if obs_vec[32] == obs_vec[33] else "FALSE"}\n\n'
+            f'Goal in sight   | {"TRUE" if goal_in_sight else "FALSE"}\n\n'
 
             'OBSTRUCTION\n'
             f'Prox. channels  | Front: {obs_vec[34]: .2f} | Right: {obs_vec[35]: .2f}\n'
@@ -261,14 +266,13 @@ class Interface(BasicInterface):
         out = self.visnet(hsvd)
 
         clr_logits, typ_logits, dep = out.split(cfg.DEC_IMG_CHANNEL_SPLIT, dim=1)
-        clr_logits = clr_logits[0].cpu().numpy()
-        typ_logits = typ_logits[0].cpu().numpy()
+        clr_probs = clr_logits[0].softmax(dim=0).cpu().numpy()
+        typ_probs = typ_logits[0].softmax(dim=0).cpu().numpy()
         dep = dep[0, 0].cpu().numpy()
 
         dep = np.clip(dep * 255., 0., 255.)
-        typ_seg = np.argmax(typ_logits, axis=0) * (255. / 6.)
-        clr_seg = np.argmax(clr_logits, axis=0)
-        rgb_cls = self.RGB_CLASSES[clr_seg]
+        typ_seg = (typ_probs * self.TYP_CLASSES).sum(axis=0)
+        rgb_cls = (clr_probs[..., None] * self.RGB_CLASSES).sum(axis=0)
 
         return rgb_cls, dep, typ_seg
 
@@ -399,9 +403,12 @@ class Interface(BasicInterface):
                 self.session.actions[self.all_bot_idx, :cfg.DOF_VEC_SIZE] = self.get_torque_from_key_vec()
 
     def update_preview(self):
+        if not self.session.preview:
+            return
+
         step_out = self.session.async_temp_result
 
-        if step_out is None or len(step_out) != 3 or len(step_out[0].shape) != 4:
+        if step_out is None or len(step_out) != 4 or len(step_out[0].shape) != 4:
             return
 
         rgb, dep, typ = (self.get_visnet_images if self.prev_reconstruct else self.get_rendered_images)()
@@ -463,11 +470,11 @@ class Session(MazeTask):
         {'name': '--transfer_name', 'type': str, 'default': '', 'help': 'Starting model name/ID string.'},
         {'name': '--transfer_ver', 'type': int, 'default': 0, 'help': 'Starting model ckpt. version.'},
         {'name': '--model_name', 'type': str, 'default': 'mazeai', 'help': 'Model name/ID string.'},
-        {'name': '--model_com', 'type': int, 'default': 1, 'help': 'Option to use communication I/O.'},
-        {'name': '--model_guide', 'type': int, 'default': 0, 'help': 'Option to use hidden state inputs.'},
-        {'name': '--model_align', 'type': int, 'default': 1, 'help': 'Option to aux. train for objective alignment.'},
-        {'name': '--model_prob', 'type': int, 'default': 1, 'help': 'Option to keep probabilistic inference.'},
-        {'name': '--model_share', 'type': int, 'default': 0, 'help': 'Option to enable reward sharing.'},
+        {'name': '--com_level', 'type': int, 'default': Policy.COM_FREE, 'help': 'Level of communication.'},
+        {'name': '--guide_level', 'type': int, 'default': Policy.GUIDE_FREE, 'help': 'Level of objective guidance.'},
+        {'name': '--aux_level', 'type': int, 'default': Policy.AUX_FREE, 'help': 'Level of aux. objective alignment.'},
+        {'name': '--prob_actor', 'type': int, 'default': 1, 'help': 'Option to keep probabilistic inference.'},
+        {'name': '--rew_sharing', 'type': int, 'default': 0, 'help': 'Option to enable reward sharing.'},
         {'name': '--rng_seed', 'type': int, 'default': 42, 'help': 'Seed for numpy and torch RNGs.'}]
 
     def __init__(self, args: Namespace):
@@ -479,10 +486,10 @@ class Session(MazeTask):
 
         # Resume model state
         self.model_options = {
-            'communicating': args.model_com,
-            'guided': args.model_guide,
-            'aligned': args.model_align,
-            'prob_actor': args.model_prob}
+            'com_level': args.com_level,
+            'guide_level': args.guide_level,
+            'aux_level': args.aux_level,
+            'prob_actor': args.prob_actor}
 
         self.ckpter = CheckpointTracker(
             args.model_name, cfg.DATA_DIR, args.sim_device, args.rng_seed,
@@ -515,7 +522,7 @@ class Session(MazeTask):
             uniform_task_sampling=self.ctrl_mode == self.CTRL_GEN,
             distribute_env_resets=self.ctrl_mode == self.CTRL_RL,
             full_env_regeneration=preset_path is None and args.regen,
-            reward_sharing=bool(args.model_share),
+            reward_sharing=bool(args.rew_sharing),
             device=args.sim_device)
 
         self.accelerate()
@@ -525,8 +532,8 @@ class Session(MazeTask):
         obs: 'tuple[Tensor, ...]',
         reward: Tensor,
         rst_mask_f: Tensor,
-        _vals: 'tuple[Tensor, ...]',
-        _info: 'dict[str, Any]'
+        _vals: 'tuple[Tensor, ...]' = None,
+        _info: 'dict[str, Any]' = None
     ) -> 'tuple[Tensor, ...]':
 
         # Keep data for debugging via interface
@@ -617,7 +624,7 @@ class Session(MazeTask):
         optimiser = NAdamW(
             (param for param in model.parameters() if param.requires_grad),
             lr=get_arg_defaults(AdaptivePlateauScheduler.__init__)['lr_milestones'][0],
-            weight_decay=cfg.WEIGHT_DECAY_MAP[self.sim.level])
+            weight_decay=cfg.WEIGHT_DECAY)
 
         model.to(self.ckpter.device)
         model.visencoder.load_state_dict(torch.load(encoder_path))
@@ -656,8 +663,8 @@ class Session(MazeTask):
             cfg.N_ROLLOUTS_PER_EPOCH,
             cfg.N_AUX_ITERS_PER_EPOCH,
             gamma,
-            aux_weight=1e-2,
-            entropy_weight=4e-3,
+            aux_weight=cfg.AUX_WEIGHT,
+            entropy_weight=cfg.ENT_WEIGHT,
             log_dir=cfg.LOG_DIR)
 
         try:
@@ -688,7 +695,7 @@ class Session(MazeTask):
                 actions, mem = model.act(obs, mem)
 
                 obs, reward, rst_mask_f, _, _ = self.step(actions, get_info=False)
-                obs = self.post_step(obs, reward, rst_mask_f, None)
+                obs = self.post_step(obs, reward, rst_mask_f)
 
                 if rst_mask_f.any().item():
                     mem = model.reset_mem(mem, rst_mask_f)

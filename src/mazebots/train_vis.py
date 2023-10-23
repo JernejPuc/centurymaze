@@ -51,13 +51,13 @@ class Trainer:
         self.ckpter = CheckpointTracker(model_name, cfg.DATA_DIR, device, rng_seed)
 
         self.model = VisNet()
-        self.optimiser = NAdamW(self.model.parameters(), lr=3e-5, weight_decay=1e-2, device=device)
+        self.optimiser = NAdamW(self.model.parameters(), lr=args.lr_init, weight_decay=1e-2, device=device)
         self.ckpter.load_model(self.model, self.optimiser)
 
         self.scheduler = PlateauScheduler(
             self.optimiser,
             step_milestones=[lr_main_start_epoch, lr_main_end_epoch, self.n_epochs],
-            lr_milestones=[3e-5, 6e-4, 1e-7],
+            lr_milestones=[args.lr_init, args.lr_max, args.lr_final],
             starting_step=self.ckpter.meta['update_step'])
 
         # Logging
@@ -713,17 +713,17 @@ class Student:
         self.ckpter = CheckpointTracker(model_name, cfg.DATA_DIR, device, rng_seed)
 
         self.model = VisNet()
-        self.optimiser = NAdamW(self.model.parameters(), lr=3e-5, weight_decay=1e-2, device=device)
+        self.optimiser = NAdamW(self.model.parameters(), lr=args.lr_init, weight_decay=1e-2, device=device)
 
         self.model.load_state_dict(
-            torch.load(os.path.join(cfg.DATA_DIR, file_name[:-9] + '_stud.pt'), map_location=device))
+            torch.load(os.path.join(cfg.DATA_DIR, file_name[:-13] + '_stud.pt'), map_location=device))
 
         self.ckpter.load_model(self.model, self.optimiser)
 
         self.scheduler = PlateauScheduler(
             self.optimiser,
             step_milestones=[lr_main_start_epoch, lr_main_end_epoch, self.n_epochs],
-            lr_milestones=[3e-5, 6e-4, 3e-5],
+            lr_milestones=[args.lr_init, args.lr_max, args.lr_final],
             starting_step=self.ckpter.meta['update_step'])
 
         # Logging
@@ -941,6 +941,15 @@ if __name__ == '__main__':
     parser.add_argument(
         '--lr_main_end_epoch', type=float, default=650,
         help='Epoch on which the learning rate proceeds to cool down.')
+    parser.add_argument(
+        '--lr_init', type=float, default=5e-3,
+        help='Initial learning rate in the warmup phase.')
+    parser.add_argument(
+        '--lr_max', type=float, default=6e-4,
+        help='Maximum learning rate in the main phase.')
+    parser.add_argument(
+        '--lr_final', type=float, default=1e-7,
+        help='Final learning rate in the cooldown phase.')
 
     parser.add_argument(
         '--file_name', type=str, default='rec_00-06_set.npz',

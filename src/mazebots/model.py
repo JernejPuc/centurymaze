@@ -6,7 +6,7 @@ from torch.nn import Module
 from torch.nn.functional import one_hot, scaled_dot_product_attention
 
 from discit.distr import FixedVarNormal, MultiCategorical, MultiNormal
-from discit.func import WeightedGradDiscretise, symexp
+from discit.func import GradDiscretise, symexp
 from discit.rl import ActorCritic as ActorCriticTemplate
 
 import config as cfg
@@ -176,36 +176,56 @@ class VisNet(Module):
 
 
 class Policy(Module):
-    def __init__(self, n_agents_per_env: int, n_envs: int, communicating: bool, guided: bool):
+    COM_FREE = 2
+    COM_HEURISTIC = 1
+    COM_NONE = 0
+
+    GUIDE_FREE = 2
+    GUIDE_EXTERNAL = 1
+    GUIDE_NONE = 0
+
+    AUX_FREE = 2
+    AUX_ALIGNED = 1
+    AUX_DETACHED = 0
+
+    def __init__(self, n_agents_per_env: int, n_envs: int, com_level: int, guide_level: int, aux_level: int):
         super().__init__()
 
         self.n_bots = n_agents_per_env
         self.n_envs = n_envs
         self.n_all_bots = n_agents_per_env * n_envs
-        self.communicating = communicating
-        self.unguided = not guided
+        self.com_level = com_level
+        self.guide_level = guide_level
+        self.aux_level = aux_level
 
-        self.act_in_sizes = (
-            VISENC_SIZE,
-            cfg.OBS_VEC_SIZE + (cfg.STATE_VEC_SIZE if guided else 0),
-            cfg.OBS_COM_SIZE if communicating else 0)
+        self.communicating = com_level > self.COM_NONE
+        self.guided = guide_level > self.GUIDE_NONE
+        self.auxpropped = aux_level > self.AUX_DETACHED
+
+        self.act_in_sizes = ((cfg.OBS_COM_SIZE,) if self.communicating else ()) + (VISENC_SIZE, cfg.IPT_VEC_SPLIT[0])
+        self.act_in_split = (
+            (cfg.N_RCVR_CLR_CLASSES if self.communicating else 0) + sum(self.act_in_sizes[-2:]),
+            *cfg.IPT_VEC_SPLIT[1:])
 
         trq_values = torch.tensor(cfg.ACT_DOF_MODES_BASE)
         clr_values = torch.tensor(cfg.RCVR_CLR_CLASSES)
 
         comp_initial = torch.zeros(1, len(clr_values))
-        comp_initial[:, -1] = 1.
+        comp_initial[:, 0] = 1.
         coml_initial = torch.full((1, len(clr_values)), -20.)
-        coml_initial[:, -1] = 0.
+        coml_initial[:, 0] = 0.
+        coml_uniform = torch.full((1, len(clr_values)), -20.)
 
         self.trq_values = nn.Parameter(trq_values, requires_grad=False)
         self.clr_values = nn.Parameter(clr_values, requires_grad=False)
         self.act_value_tpl = (self.trq_values, self.clr_values)
         self.act_out_sizes = (len(trq_values), len(clr_values))
+        self.aux_out_sizes = (cfg.AUX_VEC_SIZE,)*2
 
         self.comp_initial = nn.Parameter(comp_initial, requires_grad=False)
         self.coml_initial = nn.Parameter(coml_initial, requires_grad=False)
-        self.com_in_idx = sum(self.act_in_sizes[:-1])
+        self.coml_uniform = nn.Parameter(coml_uniform, requires_grad=False)
+        self.com_in_size = cfg.N_RCVR_CLR_CLASSES
         self.com_out_idx = self.act_out_sizes[0]
         self.com_out_size = self.act_out_sizes[1]
 
@@ -217,8 +237,13 @@ class Policy(Module):
         # 256 -> M
         self.rnn = nn.GRUCell(256, RNNMEM_SIZE)
 
-        # M -> 5 + 11
-        self.fcout = nn.Linear(RNNMEM_SIZE, sum(self.act_out_sizes))
+        # M -> A
+        self.fcaux = nn.Linear(RNNMEM_SIZE, sum(self.aux_out_sizes))
+
+        # M + A -> 5 + 11
+        self.fcout = nn.Linear(
+            RNNMEM_SIZE + (self.aux_out_sizes[0] if self.guided else 0),
+            sum(self.act_out_sizes))
 
         # https://r2rt.com/non-zero-initial-states-for-recurrent-neural-networks.html
         self.mem_initial = nn.Parameter(torch.zeros(1, RNNMEM_SIZE).uniform_(-1., 1.))
@@ -227,6 +252,8 @@ class Policy(Module):
         nn.init.zeros_(self.fcin.bias)
         nn.init.orthogonal_(self.fcout.weight, gain=0.001)
         nn.init.zeros_(self.fcout.bias)
+        nn.init.orthogonal_(self.fcaux.weight, gain=0.001)
+        nn.init.zeros_(self.fcaux.bias)
 
         nn.init.orthogonal_(self.rnn.weight_ih)
         nn.init.orthogonal_(self.rnn.weight_hh)
@@ -240,8 +267,7 @@ class Policy(Module):
     def get_input(self, img_enc: Tensor, vec_etc: Tensor) -> Tensor:
         """Get a single vector input from multiple sources (img, vec, state, com)."""
 
-        if self.unguided:
-            vec_etc = vec_etc[:, :-cfg.STATE_VEC_SIZE]
+        vec_etc = vec_etc[:, :-cfg.STATE_REM_SIZE]
 
         if not self.communicating:
             return torch.cat((img_enc, vec_etc), dim=-1)
@@ -259,7 +285,7 @@ class Policy(Module):
         # N -> Nx11
         com_mask = one_hot(clr_idcs, len(self.clr_values)).float()
 
-        return torch.cat((img_enc, vec_etc, com_mask), dim=-1)
+        return torch.cat((com_mask, img_enc, vec_etc), dim=-1)
 
     def weigh_signals(self, sig: Tensor, weights: Tensor, scale_agg: float = 10.) -> Tensor:
         """
@@ -280,21 +306,66 @@ class Policy(Module):
         return sig_agg
 
     def forward(self, x: Tensor, com_weights: Tensor, com_probs: Tensor, memp: Tensor) -> 'tuple[Tensor, Tensor]':
-        if self.communicating:
-            x, com_mask = x[:, :self.com_in_idx], x[:, self.com_in_idx:]
+        x, heur, aux = x.split(self.act_in_split, dim=-1)
 
-            com_sig = WeightedGradDiscretise.apply(com_probs, com_mask)
+        # Aggregate incoming messages
+        if self.communicating:
+            com_mask, x = x[:, :self.com_in_size], x[:, self.com_in_size:]
+
+            com_sig = GradDiscretise.apply(com_probs, com_mask)
             com_agg = self.weigh_signals(com_sig, com_weights)
 
             x = torch.cat((x, com_agg), dim=-1)
 
+        # Process observations
         x = self.activ(self.fcin(x))
 
+        # Update memory/state
         memp = self.rnn(x, memp)
 
-        x = self.fcout(memp)
+        # Auxiliary path
+        # NOTE: Only a linear combination by design
+        a = self.fcaux(memp if self.auxpropped else memp.detach())
 
-        return x, memp
+        if self.guide_level == self.GUIDE_NONE:
+            x = memp
+
+        elif self.guide_level == self.GUIDE_EXTERNAL:
+            x = torch.cat((memp, aux), dim=-1)
+
+        else:
+            x = torch.cat((memp, a[:, :cfg.AUX_VEC_SIZE]), dim=-1)
+
+        # Output
+        x = self.fcout(x)
+
+        if self.aux_level == self.AUX_FREE:
+            a = a.detach()
+
+        # Override - silent
+        if self.com_level == self.COM_NONE:
+            trq_logits, clr_logits = x.split(self.act_out_sizes, dim=-1)
+            clr_logits = self.coml_initial.expand(len(clr_logits), -1)
+
+            x = torch.cat((trq_logits, clr_logits), dim=-1)
+
+        # Override - heuristic
+        else:
+            trq_logits, clr_logits = x.split(self.act_out_sizes, dim=-1)
+            clr_logits = self.coml_uniform.expand(len(clr_logits), -1)
+
+            near_idx, near_in_reach_mask = heur[:, 0].long(), heur[:, 1:]
+
+            clr_logits = clr_logits * torch.logical_not(
+                one_hot(near_idx, len(self.clr_values)),
+                out=torch.empty_like(clr_logits))
+
+            # Switch between null output for no obj. in reach and output in favour of one objective
+            clr_logits = torch.lerp(self.coml_initial, clr_logits, near_in_reach_mask)
+
+            x = torch.cat((trq_logits, clr_logits), dim=-1)
+
+        return x, a, memp
 
 
 class AttentionBlock(Module):
@@ -352,7 +423,7 @@ class Valuator(Module):
 
         self.activ = nn.Tanh()
 
-        # 20 + 2*M -> 256
+        # 24 + 2*M -> 256
         self.fcin = nn.Linear(cfg.STATE_VEC_SIZE + RNNMEM_SIZE*2, 256)
 
         # 256 -> 768 -> 3x 256 -> 256
@@ -391,45 +462,25 @@ class Valuator(Module):
         return x, memv
 
 
-class Aligner(Module):
-    def __init__(self):
-        super().__init__()
-
-        self.aux_out_sizes = (sum(cfg.AUX_VEC_SPLIT),)*2
-        self.fc = nn.Linear(RNNMEM_SIZE, sum(self.aux_out_sizes))
-
-        nn.init.orthogonal_(self.fc.weight, gain=0.001)
-        nn.init.zeros_(self.fc.bias)
-
-    def forward(self, memp: Tensor) -> MultiNormal:
-        x = self.fc(memp)
-        mean, pseudo_log_dev = x.split(self.aux_out_sizes, dim=-1)
-
-        return MultiNormal.from_raw(mean, pseudo_log_dev)
-
-
 class ActorCritic(ActorCriticTemplate):
-    """Wrapper around the visual encoder, policy, valuator, and aligner networks."""
+    """Wrapper around the visual encoder, policy, and valuator networks."""
 
     def __init__(
         self,
         n_agents_per_env: int = 1,
         n_envs: int = 1,
-        communicating: bool = True,
-        guided: bool = False,
-        aligned: bool = True,
+        com_level: int = Policy.COM_FREE,
+        guide_level: int = Policy.GUIDE_FREE,
+        aux_level: int = Policy.AUX_FREE,
         prob_actor: bool = True
     ):
         super().__init__()
 
         self.prob_actor = prob_actor
-        self.ignore_com = not communicating
-        self.detach_alignment = not aligned
 
         self.visencoder = VisEncoder()
-        self.policy = Policy(n_agents_per_env, n_envs, communicating, guided)
+        self.policy = Policy(n_agents_per_env, n_envs, com_level, guide_level, aux_level)
         self.valuator = Valuator(n_agents_per_env)
-        self.aligner = Aligner()
 
         for param in self.visencoder.parameters():
             param.requires_grad = False
@@ -462,9 +513,6 @@ class ActorCritic(ActorCriticTemplate):
 
         trq_logits, clr_logits = args.split(self.policy.act_out_sizes, dim=-1)
 
-        if self.ignore_com:
-            clr_logits = self.policy.coml_initial.expand(len(clr_logits), -1).clone()
-
         return MultiCategorical.from_raw(self.policy.act_value_tpl, (trq_logits, clr_logits))
 
     def act_partial(
@@ -482,7 +530,7 @@ class ActorCritic(ActorCriticTemplate):
 
             x = self.policy.get_input(img_enc, vec_etc)
 
-            x, memp = self.policy(x, com_weights, comp, memp)
+            x, _, memp = self.policy(x, com_weights, comp, memp)
 
         return x, memp
 
@@ -495,7 +543,7 @@ class ActorCritic(ActorCriticTemplate):
 
         comp, memp, memv = mem
 
-        x, memp = self.act_partial(*obs, comp, memp)
+        x, memp = self.act_partial(*obs, comp, memp, memv)
 
         act = self.get_distr(x, from_raw=True)
         comp = act.distrs[1].probs
@@ -515,10 +563,10 @@ class ActorCritic(ActorCriticTemplate):
         detach: bool
     ) -> 'tuple[Tensor, ...]':
 
-        x, memp = self.policy(ipt, com_weights, comp, memp)
+        x, a, memp = self.policy(ipt, com_weights, comp, memp)
         v, memv = self.valuator(state, memp.detach() if detach else memp, memv)
 
-        return x, v, memp, memv
+        return x, v, a, memp, memv
 
     def collect_static(
         self,
@@ -534,9 +582,9 @@ class ActorCritic(ActorCriticTemplate):
             img_enc = self.visencoder(img).flatten(1)
 
             ipt = self.policy.get_input(img_enc, vec_etc)
-            state = vec_etc[:, -cfg.STATE_VEC_SIZE:]
+            state = vec_etc[:, cfg.STATE_VEC_SLICE]
 
-            x, v, memp, memv = self.fwd_partial(ipt, state, com_weights, comp, memp, memv, detach=False)
+            x, v, _, memp, memv = self.fwd_partial(ipt, state, com_weights, comp, memp, memv, detach=False)
 
             val_mean = FixedVarNormal(symexp(v)).mean.flatten()
             comp = x[:, self.policy.com_out_idx:].softmax(dim=-1)
@@ -554,7 +602,7 @@ class ActorCritic(ActorCriticTemplate):
     ) -> 'tuple[Tensor, ...]':
 
         with torch.no_grad():
-            x, v, memp, memv = self.fwd_partial(ipt, state, com_weights, comp, memp, memv, detach=False)
+            x, v, _, memp, memv = self.fwd_partial(ipt, state, com_weights, comp, memp, memv, detach=False)
 
             val_mean = FixedVarNormal(symexp(v)).mean.flatten()
             comp = x[:, self.policy.com_out_idx:].softmax(dim=-1)
@@ -584,11 +632,12 @@ class ActorCritic(ActorCriticTemplate):
         detach: bool = False
     ) -> 'tuple[MultiCategorical, FixedVarNormal, MultiNormal, tuple[Tensor, ...]]':
 
-        x, v, memp, memv = self.fwd_partial(*obs, *mem, detach=detach)
-        aux = self.aligner(memp.detach() if self.detach_alignment else memp)
+        x, v, a, memp, memv = self.fwd_partial(*obs, *mem, detach=detach)
 
         act = self.get_distr(x, from_raw=True)
         val = FixedVarNormal(symexp(v))
+        aux = MultiNormal.from_raw(*a.split(self.policy.aux_out_sizes, dim=-1))
+
         comp = act.distrs[1].probs
 
         return act, val, aux, (comp, memp, memv)
