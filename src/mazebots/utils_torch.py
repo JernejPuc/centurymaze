@@ -4,26 +4,38 @@ import torch
 from torch import Tensor
 
 
-def norm_depth_range(dep: Tensor, max_dep: float = 128., slope: float = 0.5) -> Tensor:
+def norm_distance(dist: Tensor, max_dist: float = 24., dist_bias: float = 2., exp: float = None) -> Tensor:
     """
-    Truncated 1/x characteristic (1 at 0, 0 at max distance).
-    Lower K corresponds to steeper slope, i.e. higher sensitivity in close range.
+    Truncated 1/(d+b) characteristic (1 at 0, 0 at max distance).
+    Lower bias corresponds to steeper slope, i.e. higher sensitivity in close range,
+    while exponentiation can be used to adjust values in distant range.
     """
 
-    add_term = 1. / slope
-    sub_term = add_term / max_dep
-    mul_term = (max_dep + add_term) * sub_term
+    sub_term = dist_bias / max_dist
+    mul_term = (max_dist + dist_bias) * sub_term
 
-    dep = torch.clamp(dep, 0., max_dep)
-    dep = mul_term / (dep + add_term) - sub_term
+    dist = torch.clamp(dist, 0., max_dist)
+    res = mul_term / (dist + dist_bias) - sub_term
 
-    return dep
+    if exp is not None:
+        res = res ** exp
+
+    return res
 
 
 def clip_angle_range(ang: Tensor):
     """Bound angles between -pi and pi."""
 
     return ang + ((ang < -torch.pi).float() - (ang > torch.pi).float()) * (2. * torch.pi)
+
+
+def check_fov(diff_to_pt: Tensor, half_angle: float = torch.pi / 4.) -> Tensor:
+    """
+    Check whether the given difference (in the local frame) corresponds to
+    a point within the given angle range (field of view).
+    """
+
+    return torch.atan(diff_to_pt[:, 1] / diff_to_pt[:, 0].clip(1e-6)).abs() < half_angle
 
 
 def apply_quat_rot(q: Tensor, v: Tensor) -> Tensor:
@@ -79,11 +91,11 @@ def rgb_to_hsv(img: Tensor, unstack_dim: int = -1, stack_dim: int = -1) -> Tenso
     max_channel_val = torch.max(img, dim=-1).values
     min_channel_val = torch.min(img, dim=-1).values
 
-    eq_channel_mask_f = (max_channel_val == min_channel_val).float()
+    eq_channel_mask = (max_channel_val == min_channel_val)
     channel_diff = max_channel_val - min_channel_val
 
-    masked_diff = torch.lerp(channel_diff, max_val, eq_channel_mask_f)
-    sat = channel_diff / torch.lerp(max_channel_val, max_val, eq_channel_mask_f)
+    masked_diff = torch.where(eq_channel_mask, max_val, channel_diff)
+    sat = channel_diff / torch.where(eq_channel_mask, max_val, max_channel_val)
 
     r_diff = (max_channel_val - r) / masked_diff
     g_diff = (max_channel_val - g) / masked_diff

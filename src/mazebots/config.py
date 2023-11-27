@@ -13,7 +13,7 @@ LEVEL_PARAMS = {
         'n_graph_points': 5,
         'n_bots': 2,
         'n_objects': 2,
-        'ep_duration': 10,
+        'ep_duration': 15,
         'rng_seed': 12},
     2: {
         'env_width': 5.4,
@@ -93,7 +93,8 @@ BOT_TO_BOT_BUFFER = BOT_RADIUS*2 + MIN_BUFFER
 BOT_TO_OBJECT_BUFFER = OBJECT_RADIUS + BOT_RADIUS + MIN_BUFFER
 BOT_TO_WALL_BUFFER = BOT_RADIUS + WALL_HALFWIDTH + MIN_BUFFER
 
-GOAL_RADIUS = 1.
+MIN_GOAL_DIST = OBJECT_RADIUS + BOT_WIDTH/2
+GOAL_RADIUS = 2*BOT_WIDTH + MIN_GOAL_DIST
 
 
 # Colour palette
@@ -152,19 +153,20 @@ N_SEG_CLASSES = 7
 
 # Model IO components
 DOF_VEC_SIZE = 4
-IMU_VEC_SIZE = 3*3
+XYZ_VEC_SIZE = 3
+IMU_VEC_SIZE = 3 * XYZ_VEC_SIZE
 RGB_VEC_SIZE = 3
-XY_VEC_SIZE = 2
-DIRMAG_VEC_SIZE = XY_VEC_SIZE + 1
 RCVR_VEC_SIZE = 4
 
-# 24+44 (68) total:
+# 27 total:
 # 1 confirmation status (time) at goal,
-# 4 torque cmd., 4 ang. vel., 3x3 IMU,
-# 3 RGB cmd., 3 RGB task, 11x4 clr. receivers
-OBS_VEC_SIZE = 1 + 2*DOF_VEC_SIZE + IMU_VEC_SIZE + 2*RGB_VEC_SIZE
-OBS_COM_SIZE = N_RCVR_CLR_CLASSES * RCVR_VEC_SIZE
+# 4 torque cmd., 4 whl. ang. vel., 3 vel., 3x3 IMU, 3 RGB cmd., 3 RGB task
+OBS_VEC_SIZE = 1 + 2*DOF_VEC_SIZE + XYZ_VEC_SIZE + IMU_VEC_SIZE + 2*RGB_VEC_SIZE
 OBS_RGB_SLICE = slice(OBS_VEC_SIZE-RGB_VEC_SIZE, OBS_VEC_SIZE)
+
+# 50 total:
+# 10x4 clr. channels, 10 clr. channel norm
+OBS_COM_SIZE = (N_RCVR_CLR_CLASSES - 1) * (RCVR_VEC_SIZE + 1)
 
 # Resolution mostly important for effective viewing distance
 OBS_IMG_RES_WIDTH = 96
@@ -175,8 +177,8 @@ DEC_IMG_CHANNEL_SPLIT = (N_ALL_CLR_CLASSES, N_SEG_CLASSES, 1)   # Clr. softmax, 
 ALL_IMG_CHANNEL_SPLIT = ENC_IMG_CHANNEL_SPLIT + DEC_IMG_CHANNEL_SPLIT
 
 # Torque cmd., rgb radial emitter
-ACT_VEC_SIZE = DOF_VEC_SIZE + RGB_VEC_SIZE
 ACT_VEC_SPLIT = (DOF_VEC_SIZE, RGB_VEC_SIZE)
+ACT_VEC_SIZE = sum(ACT_VEC_SPLIT)
 
 ACT_DOF_MODES_BASE = [
     [0., 0., 0., 0.],
@@ -185,34 +187,30 @@ ACT_DOF_MODES_BASE = [
     [-1., 1., -1., 1.],
     [1., -1., 1., -1.]]
 
-# 1 nearest obj. in fov., 1 nearest obj. in reach
-HEUR_VEC_SIZE = 2
-
-# 24 total:
-# 9 prox. of obj. in fov., 1 goal in fov. mask,
-# 2 goal xy pos., 2 bot xy pos., 2 air xy dir., 1 air prox., 2 a* path xy dir., 1 a* path prox.,
-# 4 bot proximity
-AUX_VEC_SPLIT = (N_OBJ_COLOURS, 1, XY_VEC_SIZE, XY_VEC_SIZE, DIRMAG_VEC_SIZE, DIRMAG_VEC_SIZE, RCVR_VEC_SIZE)
+# 13 total:
+# 9 prox. of obj. in fov., 1 goal in fov. mask, 2 air xy dir., 1 air prox.
+AUX_VEC_SPLIT = (N_OBJ_COLOURS+1, XYZ_VEC_SIZE)
 AUX_VEC_SIZE = sum(AUX_VEC_SPLIT)
 
-# 24 total:
-# 15 aux without prox. of obj. in fov.,
-# 1 colliding flag, 3 RGB task,
-# 1 time at goal, 1 time spent on task, 1 time until end of episode, 1 num. of completed tasks, 1 throughput
-STATE_REM_SIZE = 1 + RGB_VEC_SIZE + 5
-STATE_VEC_SIZE = AUX_VEC_SIZE - N_OBJ_COLOURS + STATE_REM_SIZE
+GUIDE_VEC_SLICE = slice(OBS_VEC_SIZE + AUX_VEC_SPLIT[0], OBS_VEC_SIZE + AUX_VEC_SIZE)
+OBS_EXT_SLICE = slice(None, OBS_VEC_SIZE + AUX_VEC_SIZE)
 
-# 59 total:
-# 24 obs., 2 heuristic, 24 aux., 9 state
-ALL_VEC_SPLIT = (OBS_VEC_SIZE, HEUR_VEC_SIZE, AUX_VEC_SIZE, STATE_REM_SIZE)
+# 3 total:
+# 1 nearest obj. proximity, 1 nearest obj. index, 1 last selected clr. index
+META_VEC_SIZE = 3
+META_VEC_SLICE = slice(-META_VEC_SIZE, None)
 
-IPT_VEC_SPLIT = ALL_VEC_SPLIT[:3]
-IPT_VEC_SIZE = sum(IPT_VEC_SPLIT)
+# 58 total:
+# 27 obs., 13 aux.,
+# 2 a* path xy dir., 1 a* path prox., 2 goal xy pos., 2 bot xy pos.,
+# 4 bot proximity, 1 colliding flag, 1 speaker ratio,
+# 1 time spent on task, 1 time until end of episode, 1 num. of completed tasks, 1 throughput, 1 dist. diff.
+STATE_VEC_SIZE = OBS_VEC_SIZE + AUX_VEC_SIZE + XYZ_VEC_SIZE + 2*(XYZ_VEC_SIZE-1) + RCVR_VEC_SIZE + 7
+STATE_VEC_SLICE = slice(None, -META_VEC_SIZE)
 
-AUX_VEC_SLICE = slice(OBS_VEC_SIZE + HEUR_VEC_SIZE, OBS_VEC_SIZE + HEUR_VEC_SIZE + AUX_VEC_SIZE)
-STATE_VEC_SLICE = slice(
-    OBS_VEC_SIZE + HEUR_VEC_SIZE + N_OBJ_COLOURS,
-    OBS_VEC_SIZE + HEUR_VEC_SIZE + N_OBJ_COLOURS + STATE_VEC_SIZE)
+# 43 total:
+# 27 obs., 10 obj. ext., 3 guide ext., 3 meta
+IPT_VEC_SPLIT = (OBS_VEC_SIZE, *AUX_VEC_SPLIT, META_VEC_SIZE)
 
 
 # Training setup
@@ -239,10 +237,15 @@ CKPT_EPOCH_INTERVAL = LOG_EPOCH_INTERVAL
 # 1 branch per half virtual hour, 48 per day, 360 per week
 BRANCH_EPOCH_INTERVAL = 30 * 60 // SECONDS_PER_EPOCH
 
-# TODO: Adjust wrt. trials
+# 4-30 virtual minutes to warm up, 14+5 hours to train, 5 hours to cool down, 24 hours total
 TIME_MILESTONE_MAP = {
-    # 4 virtual minutes to warm up, 4 hours to train, half hour to cool down, 4.5 hours total
-    i: (240, 4 * 3600, 4 * 3600 + 1800) for i in range(1, 8)}
+    1: (4 * 60, 40 * 60, 40 * 60),
+    2: (4 * 60, 80 * 60, 80 * 60),
+    3: (4 * 60, 120 * 60, 120 * 60),
+    4: (8 * 60, 160 * 60, 160 * 60),
+    5: (12 * 60, 200 * 60, 200 * 60),
+    6: (16 * 60, 240 * 60, 240 * 60),
+    7: (28 * 60, 280 * 60, 320 * 60)}
 
 N_EPOCHS_MAP = {k: tv[-1] // SECONDS_PER_EPOCH for k, tv in TIME_MILESTONE_MAP.items()}
 
