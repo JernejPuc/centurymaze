@@ -200,12 +200,13 @@ OBS_EXT_SLICE = slice(None, OBS_VEC_SIZE + AUX_VEC_SIZE)
 META_VEC_SIZE = 3
 META_VEC_SLICE = slice(-META_VEC_SIZE, None)
 
-# 58 total:
+# 60 total:
 # 27 obs., 13 aux.,
 # 2 a* path xy dir., 1 a* path prox., 2 goal xy pos., 2 bot xy pos.,
-# 4 bot proximity, 1 colliding flag, 1 speaker ratio,
-# 1 time spent on task, 1 time until end of episode, 1 num. of completed tasks, 1 throughput, 1 dist. diff.
-STATE_VEC_SIZE = OBS_VEC_SIZE + AUX_VEC_SIZE + XYZ_VEC_SIZE + 2*(XYZ_VEC_SIZE-1) + RCVR_VEC_SIZE + 7
+# 4 bot proximity, 1 colliding flag,
+# 1 time spent on task, 1 time until end of episode, 1 num. of completed tasks, 1 throughput, 1 dist. diff.,
+# 1 nrg. in use, 1 nrg. used, 1 heat
+STATE_VEC_SIZE = OBS_VEC_SIZE + AUX_VEC_SIZE + XYZ_VEC_SIZE + 2*(XYZ_VEC_SIZE-1) + RCVR_VEC_SIZE + 9
 STATE_VEC_SLICE = slice(None, -META_VEC_SIZE)
 
 # 43 total:
@@ -217,11 +218,15 @@ IPT_VEC_SPLIT = (OBS_VEC_SIZE, *AUX_VEC_SPLIT, META_VEC_SIZE)
 DATA_DIR = 'data'   # Training meta data and model checkpoints
 LOG_DIR = 'runs'    # Tracked scalars
 
+# Should be a divisor of num. of all bots in the sim.
+MINIBATCH_SIZE = 256
+N_AUX_MINIBATCHES = 1
+
 # GAE length etc.
 STEPS_PER_SECOND = 4
 N_TRUNCATED_STEPS = STEPS_PER_SECOND * 4
-N_ROLLOUT_STEPS = 240
-N_ROLLOUTS_PER_EPOCH = 4
+N_ROLLOUT_STEPS = 16#240
+N_ROLLOUTS_PER_EPOCH = 6
 N_AUX_ITERS_PER_EPOCH = 8
 SECONDS_PER_EPOCH = N_ROLLOUT_STEPS * N_ROLLOUTS_PER_EPOCH // STEPS_PER_SECOND
 
@@ -254,5 +259,6 @@ UPDATE_MILESTONE_MAP = {
     for k, tv in TIME_MILESTONE_MAP.items()}
 
 WEIGHT_DECAY = 1e-2
+VALUE_WEIGHT = 1.
 AUX_WEIGHT = 1e-2
-ENT_WEIGHT = 4e-3
+ENT_WEIGHT_MILESTONES = (1e-2, 1e-3)

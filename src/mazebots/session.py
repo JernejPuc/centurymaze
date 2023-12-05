@@ -12,7 +12,7 @@ import torch
 from torch import Tensor
 
 from discit.accel import capture_graph
-from discit.optim import NAdamW, AdaptivePlateauScheduler
+from discit.optim import NAdamW, AdaptivePlateauScheduler, CoeffScheduler
 from discit.rl import PPG
 from discit.track import CheckpointTracker
 
@@ -43,6 +43,17 @@ class Interface(BasicInterface):
 
     OFFSET_3RD_AHEAD = [[-cfg.BOT_WIDTH*2, 0., 0.]]
     OFFSET_3RD_ABOVE = [[0., 0., cfg.WALL_HALFHEIGHT]]
+
+    OBJ_LINE_NUM = 16
+    OBJ_LINE_OFFSET = cfg.BOT_HEIGHT / 2.
+    OBJ_LINE_CLR = (1., 0., 0.)
+
+    DIR_LINE_OFFSET = cfg.BOT_HEIGHT + 0.1
+    DIR_LINE_MAX_LENGTH = cfg.BOT_WIDTH * 5.
+    DIR_LINE_MULTIPLIER = DIR_LINE_MAX_LENGTH - cfg.BOT_WIDTH
+    DIR_LINE_CLR_DEFAULT = (1., 0., 0.)
+    DIR_LINE_CLR_GOAL_SEEN = (0., 1., 0.)
+    DIR_LINE_CLR_OBJ_SEEN = (0., 0., 1.)
 
     PREV_ZOOM = 9
     PREV_DIM = (cfg.OBS_IMG_RES_WIDTH, 3 * cfg.OBS_IMG_RES_HEIGHT)
@@ -79,7 +90,8 @@ class Interface(BasicInterface):
         self.sim = sim
 
         # Init viewer
-        self.viewer_top_pos = gymapi.Vec3(0., sim.env_width * 0.75, sim.env_width * 0.75)
+        viewer_top_offset = sim.constructor.supenv_halfwidth * 1.5
+        self.viewer_top_pos = gymapi.Vec3(0., viewer_top_offset, viewer_top_offset)
         self.viewer_top_target = gymapi.Vec3(0., 0., 0.)
 
         # Setup input events for user interaction
@@ -95,6 +107,19 @@ class Interface(BasicInterface):
         self.offset_bot_above = torch.tensor(self.OFFSET_BOT_ABOVE, dtype=torch.float32)
         self.offset_3rd_ahead = torch.tensor(self.OFFSET_3RD_AHEAD, dtype=torch.float32)
         self.offset_3rd_above = torch.tensor(self.OFFSET_3RD_ABOVE, dtype=torch.float32)
+
+        self.obj_line_num = sim.n_objects * self.OBJ_LINE_NUM
+        obj_line_angles = np.array([i*2.*np.pi/self.OBJ_LINE_NUM for i in range(self.OBJ_LINE_NUM)], dtype=np.float32)
+        obj_line_pts = np.stack((np.cos(obj_line_angles), np.sin(obj_line_angles)), axis=-1) * cfg.GOAL_RADIUS
+        self.obj_line_start_pts = np.tile(obj_line_pts, (sim.n_objects, 1))
+        self.obj_line_end_pts = np.concatenate((self.obj_line_start_pts[1:], self.obj_line_start_pts[:1]))
+        self.obj_line_offset = np.array((self.OBJ_LINE_OFFSET,)*self.obj_line_num, dtype=np.float32)[:, None]
+        self.obj_line_clr = np.array((self.OBJ_LINE_CLR,)*self.obj_line_num, dtype=np.float32)
+
+        self.dir_line_offset = np.array((self.DIR_LINE_OFFSET,)*sim.n_bots, dtype=np.float32)[:, None]
+        self.dir_line_clr_dft = torch.tensor((self.DIR_LINE_CLR_DEFAULT,)*sim.n_bots, dtype=torch.float32)
+        self.dir_line_clr_goal = torch.tensor((self.DIR_LINE_CLR_GOAL_SEEN,)*sim.n_bots, dtype=torch.float32)
+        self.dir_line_clr_obj = torch.tensor((self.DIR_LINE_CLR_OBJ_SEEN,)*sim.n_bots, dtype=torch.float32)
 
         self.torque_states = {
             key: torch.tensor(val, dtype=torch.float32, device=device)
@@ -120,12 +145,12 @@ class Interface(BasicInterface):
         else:
             self.tk_root = self.tk_canvas = self.visnet = None
 
-    def update_target_indices(self, env_inc: int = 0, bot_inc: int = 0):
+    def cycle_target_indices(self, env_inc: int = 0, bot_inc: int = 0):
         self.env_idx = (self.env_idx + env_inc) % self.sim.n_envs
         self.bot_idx = (self.bot_idx + bot_inc) % self.sim.n_bots
         self.all_bot_idx = self.env_idx * self.sim.n_bots + self.bot_idx
 
-    def update_top_view(self):
+    def set_top_view(self):
         if self.view != self.VIEW_TOP:
             return
 
@@ -135,8 +160,61 @@ class Interface(BasicInterface):
             self.viewer_top_pos,
             self.viewer_top_target)
 
-    def update_bot_view(self):
+    def update_obj_lines(self):
+        obj_pos = np.repeat(self.session.obj_pos_arr[:, self.all_bot_idx], self.OBJ_LINE_NUM, axis=0)
+
+        self.gym.add_lines(
+            self.viewer,
+            self.sim.envs[self.env_idx].handle,
+            self.obj_line_num,
+            np.concatenate((
+                obj_pos + self.obj_line_start_pts, self.obj_line_offset,
+                obj_pos + self.obj_line_end_pts, self.obj_line_offset), axis=-1),
+            self.obj_line_clr)
+
+    def update_dir_lines(self):
+        tmp = self.session.async_temp_result
+
+        if tmp is None:
+            return
+
+        obs_vec = tmp[0 if len(tmp[0].shape) == 2 else 1]
+        obs_vec = obs_vec[self.env_idx*self.sim.n_bots:(self.env_idx+1)*self.sim.n_bots, 27:40].cpu()
+
+        obj_in_sight = obs_vec[:, :9].any(-1, keepdim=True)
+        goal_in_sight = obs_vec[:, 9:10]
+
+        dir_line_clr = torch.where(
+            obj_in_sight,
+            torch.lerp(self.dir_line_clr_obj, self.dir_line_clr_goal, goal_in_sight),
+            self.dir_line_clr_dft).numpy()
+
+        if self.prev_reconstruct:
+            dir_vec = np.array(((1., 0., 0.5),)*self.sim.n_bots, dtype=np.float32)
+
+        else:
+            dir_vec = obs_vec[:, -3:]
+
+        bot_ori = self.session.env_bot_ori[self.env_idx].cpu()
+        dir_vec = apply_quat_rot(bot_ori, dir_vec).numpy()
+        dir_vec = dir_vec[:, :2] * (self.DIR_LINE_MAX_LENGTH - self.DIR_LINE_MULTIPLIER * dir_vec[:, 2:])
+
+        self.gym.add_lines(
+            self.viewer,
+            self.sim.envs[self.env_idx].handle,
+            self.sim.n_bots,
+            np.concatenate((
+                self.session.bot_pos_arr, self.dir_line_offset,
+                self.session.bot_pos_arr + dir_vec, self.dir_line_offset), axis=-1),
+            dir_line_clr)
+
+    def update_view(self, update_lines: bool = True):
         if self.view == self.VIEW_TOP:
+            if update_lines:
+                self.gym.clear_lines(self.viewer)
+                self.update_obj_lines()
+                self.update_dir_lines()
+
             return
 
         elif self.view == self.VIEW_BOT:
@@ -202,12 +280,15 @@ class Interface(BasicInterface):
         tput = self.session.get_throughput()
         bot_ori = self.session.env_bot_ori[None, self.env_idx, self.bot_idx].cpu()
         z_angle = get_eulz_from_quat(bot_ori).item() * 180. / np.pi
+        idx, idy = torch.bucketize(self.session.bot_pos[self.all_bot_idx], self.session.heatmap_bounds)
+        heat = self.session.heatmap[self.all_bot_idx, idx, idy].item()
 
         return (
             '\nSESSION\n'
             f'Time to ep. end | {max(0., time_left): .2f}s\n'
             f'Avg. throughput | {tput: .2f} (per bot per min)\n'
-            f'Ori. angle (z)  | {z_angle: .0f}\n\n'
+            f'Ori. angle (z)  | {z_angle: .0f}\n'
+            f'Heat            | {heat: .3f}\n\n'
 
             'GUIDE\n'
             f'Goal com. chn.  |                Front: {goal_com[0]: .2f}\n'
@@ -357,19 +438,22 @@ class Interface(BasicInterface):
 
                 # NOTE: Same as below
                 elif cmd_key == 'cycle_env':
-                    self.update_target_indices(env_inc=-1 if self.key_vec[-1] else 1)
+                    self.cycle_target_indices(env_inc=-1 if self.key_vec[-1] else 1)
 
                     print(f'Env/agent index switched to {self.env_idx}/{self.all_bot_idx}.')
 
                 # NOTE: Previous bot torques are not automatically reset to zero
                 elif cmd_key == 'cycle_bot':
-                    self.update_target_indices(bot_inc=-1 if self.key_vec[-1] else 1)
+                    self.cycle_target_indices(bot_inc=-1 if self.key_vec[-1] else 1)
 
                     print(f'Bot/agent index switched to {self.bot_idx}/{self.all_bot_idx}.')
 
                 elif cmd_key == 'cycle_view':
                     self.view = (self.view + (-1 if self.key_vec[-1] else 1)) % 3
-                    # self.update_top_view()
+                    # self.set_top_view()
+
+                    if self.view == self.VIEW_BOT:
+                        self.gym.clear_lines(self.viewer)
 
                 elif cmd_key == 'save_view':
                     if self.view != self.VIEW_TOP and self.session.render_cameras:
@@ -438,16 +522,16 @@ class Interface(BasicInterface):
         self.tk_canvas.create_image(0, 0, anchor='nw', image=photoimage)
         self.tk_root.update()
 
-    def sync_redraw(self):
+    def sync_redraw(self, after_eval: bool = True):
         """Draw the scene in the viewer, syncing sim with real-time."""
 
-        self.update_bot_view()
+        self.update_view(update_lines=after_eval)
         self.gym.draw_viewer(self.viewer, self.sim_handle, False)
         self.gym.sync_frame_time(self.sim_handle)
 
     def reset(self):
         self.key_vec.fill(0)
-        self.update_bot_view()
+        self.update_view()
 
 
 class Session(MazeTask):
@@ -488,7 +572,9 @@ class Session(MazeTask):
         {'name': '--prob_actor', 'type': int, 'default': 1, 'help': 'Option to keep probabilistic inference.'},
         {'name': '--rew_result', 'type': int, 'default': 0, 'help': 'Final reward averaged across the group.'},
         {'name': '--rew_shared', 'type': int, 'default': 0, 'help': 'Per-step reward averaged across the group.'},
-        {'name': '--rew_aux', 'type': int, 'default': 0, 'help': 'Aux. penalty for crowding and collisions.'},
+        {'name': '--pen_contact', 'type': int, 'default': 0, 'help': 'Aux. penalty for crowding and collisions.'},
+        {'name': '--pen_energy', 'type': int, 'default': 0, 'help': 'Aux. penalty for excessive communication.'},
+        {'name': '--pen_idling', 'type': int, 'default': 0, 'help': 'Aux. penalty for not covering new ground.'},
         {'name': '--rng_seed', 'type': int, 'default': 42, 'help': 'Seed for numpy and torch RNGs.'}]
 
     def __init__(self, args: Namespace):
@@ -538,7 +624,9 @@ class Session(MazeTask):
             full_env_regeneration=preset_path is None and args.regen,
             result_reward=bool(args.rew_result),
             shared_reward=bool(args.rew_shared),
-            aux_reward=bool(args.rew_aux),
+            contact_penalty=bool(args.pen_contact),
+            energy_penalty=bool(args.pen_energy),
+            idling_penalty=bool(args.pen_idling),
             device=args.sim_device)
 
         self.accelerate()
@@ -631,6 +719,10 @@ class Session(MazeTask):
         print('Done.')
 
     def train(self):
+        if self.sim.n_all_bots % cfg.MINIBATCH_SIZE:
+            raise ValueError(
+                f'Num. of all bots ({self.sim.n_all_bots}) incompatible with minibatch size ({cfg.MINIBATCH_SIZE}).')
+
         encoder_path = os.path.join(cfg.ASSET_DIR, 'visenc.pt')
 
         # Load model
@@ -650,18 +742,18 @@ class Session(MazeTask):
             step_milestones=cfg.UPDATE_MILESTONE_MAP[self.sim.level],
             starting_step=self.ckpter.meta['update_step'])
 
-        # Accelerate collector, recollector, and critic
+        # Accelerate collector & recollector
         mem = model.init_mem(self.sim.n_all_bots)
         model.collect_static = self.accel_action(model.collect_static, mem)
-
-        mem = model.init_mem(self.sim.n_all_bots)
         model.collect_copied = self.accel_action(model.collect_copied, mem, encode=False)
 
         # Half-life of rewards is at 1/8th of an episode
         gamma = 0.5 ** (1. / ((self.sim.ep_duration / 8) * self.steps_per_second))
 
-        n_batches_per_step = self.sim.n_all_bots // MazeSim.NUM_ALL_BOTS - MazeSim.NUM_ALL_BOTS // self.sim.n_all_bots
-        n_rollouts = round(cfg.N_ROLLOUT_STEPS * MazeSim.NUM_ALL_BOTS / self.sim.n_all_bots)
+        entropy_scheduler = CoeffScheduler(
+            cfg.UPDATE_MILESTONE_MAP[self.sim.level][-1],
+            cfg.ENT_WEIGHT_MILESTONES,
+            starting_step=self.ckpter.meta['update_step'])
 
         rl_algo = PPG(
             self.step,
@@ -671,15 +763,17 @@ class Session(MazeTask):
             cfg.LOG_EPOCH_INTERVAL,
             cfg.CKPT_EPOCH_INTERVAL,
             cfg.BRANCH_EPOCH_INTERVAL,
-            n_rollouts,
+            cfg.N_ROLLOUT_STEPS,
             cfg.N_TRUNCATED_STEPS,
             self.sim.n_all_bots,
-            n_batches_per_step,
+            self.sim.n_all_bots // cfg.MINIBATCH_SIZE,
+            cfg.N_AUX_MINIBATCHES,
             cfg.N_ROLLOUTS_PER_EPOCH,
             cfg.N_AUX_ITERS_PER_EPOCH,
             gamma,
+            value_weight=cfg.VALUE_WEIGHT,
             aux_weight=cfg.AUX_WEIGHT,
-            entropy_weight=cfg.ENT_WEIGHT,
+            entropy_weight=entropy_scheduler,
             log_dir=cfg.LOG_DIR)
 
         try:
@@ -691,7 +785,7 @@ class Session(MazeTask):
 
     def eval(self):
         if not self.headless:
-            self.interface.update_top_view()
+            self.interface.set_top_view()
 
         model = ActorCritic(self.sim.n_bots, self.sim.n_envs, **self.model_options)
 
@@ -717,7 +811,7 @@ class Session(MazeTask):
 
     def play(self):
         if not self.headless:
-            self.interface.update_top_view()
+            self.interface.set_top_view()
 
         with torch.inference_mode():
             self.step(get_info=False)

@@ -443,12 +443,12 @@ class MazeEnv:
 
 
 class MazeSim:
-    """Gym.Sim wrapper for procedurally generated mazes."""
+    """
+    Gym.Sim wrapper for procedurally generated mazes.
 
-    # Benchmarks suggest highest total FPS at 256 agents/cameras with ~3 GB VRAM usage
-    # The main bottleneck is the number/overhead of cameras and objects for them to render
-    # Camera resolution and physics simulation have less effect
-    NUM_ALL_BOTS = 256
+    NOTE: The main bottleneck is the number/overhead of cameras and objects for
+    them to render. Camera resolution and physics simulation have less effect.
+    """
 
     DEFAULT_SIM_ARGS = Namespace(
         use_gpu_pipeline=True,
@@ -546,7 +546,7 @@ class MazeSim:
             setattr(self, key, val)
 
         self.n_bots = n_bots if n_bots > 0 else self.n_bots
-        self.n_envs = n_envs if n_envs > 0 else (self.NUM_ALL_BOTS // self.n_bots)
+        self.n_envs = n_envs if n_envs > 0 else (cfg.MINIBATCH_SIZE // self.n_bots)
         self.n_envs_per_row: int = round(self.n_envs**0.5)
         self.n_all_bots: int = self.n_envs * self.n_bots
 

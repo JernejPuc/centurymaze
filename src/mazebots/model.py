@@ -174,6 +174,7 @@ class VisNet(Module):
 
 class Policy(Module):
     MEM_SIZE = 256
+    MEM_HORIZON = 10 * cfg.STEPS_PER_SECOND
 
     FEAT_TRAINED = 2
     FEAT_EXTERNAL = 1
@@ -252,7 +253,7 @@ class Policy(Module):
 
         # Chrono init. wrt. 1 second (starting from level 1)
         with torch.no_grad():
-            self.rnn.bias_hh[self.MEM_SIZE:-self.MEM_SIZE].uniform_(1, max(1, cfg.STEPS_PER_SECOND-1)).log_()
+            self.rnn.bias_hh[self.MEM_SIZE:-self.MEM_SIZE].uniform_(1, self.MEM_HORIZON-1).log_()
 
     def weigh_signals(self, sig: Tensor, weights: Tensor, scale_agg: float = 10., norm: bool = True) -> Tensor:
         """
@@ -305,7 +306,7 @@ class Policy(Module):
         memp = self.rnn(x, memp)
 
         # Auxiliary path
-        a = self.fcaux(memp if self.guide_state == self.FEAT_TRAINED else memp.detach())
+        a = self.fcaux(GradScaler.apply(memp, 0.05) if self.guide_state == self.FEAT_TRAINED else memp.detach())
 
         a_dir, a_prox = a[:, :2], a[:, 2:]
         a_dir = a_dir / torch.linalg.norm(a_dir, dim=-1, keepdim=True)
@@ -401,37 +402,54 @@ class Valuator(Module):
     to the agents, are critical to reliably anticipate future rewards.
     """
 
+    MEM_SIZE = 256
+    MEM_HORIZON = 20 * cfg.STEPS_PER_SECOND
+
     def __init__(self, n_agents_per_env: int):
         super().__init__()
 
-        input_size = cfg.STATE_VEC_SIZE + Policy.MEM_SIZE
-
         self.activ = nn.Tanh()
 
-        # 58 + M -> 256
-        self.fcin = nn.Linear(input_size, 256)
+        # 60 + M -> 256
+        self.fcin = nn.Linear(cfg.STATE_VEC_SIZE + Policy.MEM_SIZE, 256)
 
-        # 58 + M -> 768 -> 3x 256 -> 256
-        self.atten = AttentionBlock(input_size, 64, 4, n_agents_per_env)
+        # 256 + M -> 768 -> 3x 256 -> 256
+        self.atten = AttentionBlock(256 + self.MEM_SIZE, 64, 4, n_agents_per_env)
 
-        # 512 -> V
-        self.fcout = nn.Linear(256*2, 1)
+        # 256 + 256 -> M
+        self.rnn = nn.GRUCell(256 + 256, self.MEM_SIZE)
+
+        # M -> V
+        self.fcout = nn.Linear(self.MEM_SIZE, 1)
+
+        self.mem_initial = nn.Parameter(torch.zeros(1, self.MEM_SIZE).uniform_(-1., 1.))
 
         nn.init.orthogonal_(self.fcin.weight)
         nn.init.zeros_(self.fcin.bias)
         nn.init.orthogonal_(self.fcout.weight, gain=0.001)
         nn.init.zeros_(self.fcout.bias)
 
-    def forward(self, state: Tensor, memp: Tensor) -> Tensor:
+        nn.init.orthogonal_(self.rnn.weight_ih)
+        nn.init.orthogonal_(self.rnn.weight_hh)
+        nn.init.zeros_(self.rnn.bias_ih)
+        nn.init.zeros_(self.rnn.bias_hh)
+
+        with torch.no_grad():
+            self.rnn.bias_hh[self.MEM_SIZE:-self.MEM_SIZE].uniform_(1, self.MEM_HORIZON-1).log_()
+
+    def forward(self, state: Tensor, memp: Tensor, memv: Tensor) -> 'tuple[Tensor, Tensor]':
         x = torch.cat((state, memp), dim=-1)
+        x = self.activ(self.fcin(x))
 
-        x_fc = self.activ(self.fcin(x))
-        x_atn = self.atten(x)
+        x_atn = torch.cat((x, memv), dim=-1)
+        x_atn = self.atten(x_atn)
 
-        x = torch.cat((x_fc, x_atn), dim=-1)
-        x = self.fcout(x)
+        x = torch.cat((x, x_atn), dim=-1)
+        memv = self.rnn(x, memv)
 
-        return x
+        x = self.fcout(memv)
+
+        return x, memv
 
 
 class ActorCritic(ActorCriticTemplate):
@@ -457,25 +475,27 @@ class ActorCritic(ActorCriticTemplate):
         for param in self.visencoder.parameters():
             param.requires_grad = False
 
-    def init_mem(self, batch_size: int = 1) -> 'tuple[Tensor, Tensor]':
+    def init_mem(self, batch_size: int = 1) -> 'tuple[Tensor, Tensor, Tensor]':
         comp = self.policy.comp_initial.expand(batch_size, -1).clone()
         memp = self.policy.mem_initial.detach().expand(batch_size, -1).clone()
+        memv = self.valuator.mem_initial.detach().expand(batch_size, -1).clone()
 
-        return comp, memp
+        return comp, memp, memv
 
     def reset_mem(
         self,
-        mem: 'tuple[Tensor, Tensor]',
+        mem: 'tuple[Tensor, Tensor, Tensor]',
         reset_mask: Tensor
-    ) -> 'tuple[Tensor, Tensor]':
+    ) -> 'tuple[Tensor, Tensor, Tensor]':
 
         reset_mask = reset_mask.unsqueeze(-1)
-        comp, memp = mem
+        comp, memp, memv = mem
 
         comp = torch.lerp(comp, self.policy.comp_initial, reset_mask)
         memp = torch.lerp(memp, self.policy.mem_initial, reset_mask)
+        memv = torch.lerp(memv, self.valuator.mem_initial, reset_mask)
 
-        return comp, memp
+        return comp, memp, memv
 
     def get_distr(self, args: 'Tensor | tuple[Tensor, ...]', from_raw: bool) -> MultiCategorical:
         if from_raw:
@@ -492,7 +512,8 @@ class ActorCritic(ActorCriticTemplate):
         vec_etc: Tensor,
         com_weights: Tensor,
         comp: Tensor,
-        memp: Tensor
+        memp: Tensor,
+        _memv: Tensor
     ) -> 'tuple[Tensor, Tensor]':
 
         with torch.no_grad():
@@ -523,7 +544,7 @@ class ActorCritic(ActorCriticTemplate):
             x = act.mode
             com_idx = comp.argmax(dim=-1)
 
-        return x, com_idx, (comp, memp)
+        return x, com_idx, (comp, memp, mem[-1])
 
     def fwd_partial(
         self,
@@ -532,15 +553,14 @@ class ActorCritic(ActorCriticTemplate):
         com_weights: Tensor,
         comp: Tensor,
         memp: Tensor,
+        memv: Tensor,
         detach: bool
     ) -> 'tuple[Tensor, ...]':
 
         x, a, memp = self.policy(ipt, com_weights, comp, memp)
-        v = self.valuator(state, memp.detach() if detach else GradScaler.apply(memp, 0.05))
+        v, memv = self.valuator(state, memp.detach() if detach else GradScaler.apply(memp, 0.05), memv)
 
-        comp = x[:, self.policy.output_sizes[0]:].softmax(dim=-1)
-
-        return x, v, a, comp, memp
+        return x, v, a, memp, memv
 
     def collect_static(
         self,
@@ -548,7 +568,8 @@ class ActorCritic(ActorCriticTemplate):
         vec_etc: Tensor,
         com_weights: Tensor,
         comp: Tensor,
-        memp: Tensor
+        memp: Tensor,
+        memv: Tensor
     ) -> 'tuple[Tensor, ...]':
 
         with torch.no_grad():
@@ -557,11 +578,12 @@ class ActorCritic(ActorCriticTemplate):
             ipt = torch.cat((img_enc, vec_etc[:, cfg.OBS_EXT_SLICE], vec_etc[:, cfg.META_VEC_SLICE]), dim=-1)
             state = vec_etc[:, cfg.STATE_VEC_SLICE]
 
-            x, v, _, comp, memp = self.fwd_partial(ipt, state, com_weights, comp, memp, detach=False)
+            x, v, _, memp, memv = self.fwd_partial(ipt, state, com_weights, comp, memp, memv, detach=False)
 
             val_mean = FixedVarNormal(v).mean.flatten()
+            comp = x[:, self.policy.output_sizes[0]:].softmax(dim=-1)
 
-        return x, val_mean, ipt, state, comp, memp
+        return x, val_mean, ipt, state, comp, memp, memv
 
     def collect_copied(
         self,
@@ -569,15 +591,17 @@ class ActorCritic(ActorCriticTemplate):
         state: Tensor,
         com_weights: Tensor,
         comp: Tensor,
-        memp: Tensor
+        memp: Tensor,
+        memv: Tensor
     ) -> 'tuple[Tensor, ...]':
 
         with torch.no_grad():
-            x, v, _, comp, memp = self.fwd_partial(ipt, state, com_weights, comp, memp, detach=False)
+            x, v, _, memp, memv = self.fwd_partial(ipt, state, com_weights, comp, memp, memv, detach=False)
 
             val_mean = FixedVarNormal(v).mean.flatten()
+            comp = x[:, self.policy.output_sizes[0]:].softmax(dim=-1)
 
-        return x, val_mean, comp, memp
+        return x, val_mean, comp, memp, memv
 
     def collect(
         self,
@@ -587,13 +611,13 @@ class ActorCritic(ActorCriticTemplate):
     ) -> 'tuple[Tensor, Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
 
         if encode:
-            x, val_mean, ipt, state, comp, memp = self.collect_static(*obs, *mem)
+            x, val_mean, ipt, state, comp, memp, memv = self.collect_static(*obs, *mem)
             obs = ipt, state, obs[-1].clone()
 
         else:
-            x, val_mean, comp, memp = self.collect_copied(*obs, *mem)
+            x, val_mean, comp, memp, memv = self.collect_copied(*obs, *mem)
 
-        return x, val_mean, obs, (comp, memp)
+        return x, val_mean, obs, (comp, memp, memv)
 
     def forward(
         self,
@@ -602,10 +626,12 @@ class ActorCritic(ActorCriticTemplate):
         detach: bool = False
     ) -> 'tuple[MultiCategorical, FixedVarNormal, FixedVarNormal, tuple[Tensor, ...]]':
 
-        x, v, a, comp, memp = self.fwd_partial(*obs, *mem, detach=detach)
+        x, v, a, memp, memv = self.fwd_partial(*obs, *mem, detach=detach)
 
         act = self.get_distr(x, from_raw=True)
+        comp = act.distrs[1].probs
+
         val = FixedVarNormal(v, skip_log_shift=True)
         aux = FixedVarNormal(a, skip_log_shift=True)
 
-        return act, val, aux, (comp, memp)
+        return act, val, aux, (comp, memp, memv)
