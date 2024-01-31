@@ -4,21 +4,21 @@ import torch
 from torch import Tensor
 
 
-def norm_distance(dist: Tensor, max_dist: float = 24., dist_bias: float = 2., exp: float = None) -> Tensor:
+def norm_distance(dist: Tensor, max_dist: float = 24., dist_bias: float = 2., dist_scale: float = 1.) -> Tensor:
     """
-    Truncated 1/(d+b) characteristic (1 at 0, 0 at max distance).
+    Truncated inverse characteristic: 1 at 0 (dist. bias), 0 at noise threshold (max dist.).
     Lower bias corresponds to steeper slope, i.e. higher sensitivity in close range,
-    while exponentiation can be used to adjust values in distant range.
+    while scaling can be used to adjust values in distant range.
     """
 
     sub_term = dist_bias / max_dist
     mul_term = (max_dist + dist_bias) * sub_term
 
+    if dist_scale != 1.:
+        dist = dist * dist_scale
+
     dist = torch.clamp(dist, 0., max_dist)
     res = mul_term / (dist + dist_bias) - sub_term
-
-    if exp is not None:
-        res = res ** exp
 
     return res
 
@@ -26,7 +26,7 @@ def norm_distance(dist: Tensor, max_dist: float = 24., dist_bias: float = 2., ex
 def clip_angle_range(ang: Tensor):
     """Bound angles between -pi and pi."""
 
-    return ang + ((ang < -torch.pi).float() - (ang > torch.pi).float()) * (2. * torch.pi)
+    return ang + (ang < -torch.pi) * (2.*torch.pi) + (ang > torch.pi) * (-2.*torch.pi)
 
 
 def check_fov(diff_to_pt: Tensor, half_angle: float = torch.pi / 4.) -> Tensor:
@@ -109,3 +109,19 @@ def rgb_to_hsv(img: Tensor, unstack_dim: int = -1, stack_dim: int = -1) -> Tenso
     hue = torch.fmod((hue / 6. + 1.), 1.)
 
     return torch.stack((hue, sat, max_channel_val), dim=stack_dim)
+
+
+def weighted_sum(values: Tensor, weights: Tensor, n_groups: int = 1) -> Tensor:
+    """Accumulate values with a group-wise weighted sum."""
+
+    n_all_sources = len(values)
+    n_sources_per_group = n_all_sources // n_groups
+
+    # NxV -> GxSxV -> NxSxV
+    values = values.reshape(n_groups, n_sources_per_group, -1)
+    values = values.repeat_interleave(n_sources_per_group, dim=0, output_size=n_all_sources)
+
+    # NxSxV, NxSxW -> NxVxW
+    value_sums = torch.einsum('nsv,nsw->nvw', values, weights)
+
+    return value_sums

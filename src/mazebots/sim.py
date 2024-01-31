@@ -546,7 +546,7 @@ class MazeSim:
             setattr(self, key, val)
 
         self.n_bots = n_bots if n_bots > 0 else self.n_bots
-        self.n_envs = n_envs if n_envs > 0 else (cfg.MINIBATCH_SIZE // self.n_bots)
+        self.n_envs = n_envs if n_envs > 0 else 1
         self.n_envs_per_row: int = round(self.n_envs**0.5)
         self.n_all_bots: int = self.n_envs * self.n_bots
 

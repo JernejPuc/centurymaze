@@ -7,17 +7,20 @@ import numpy as np
 from isaacgym import gymapi, gymtorch
 import torch
 from torch import Tensor
+from torch.nn.functional import one_hot
 
 from discit.accel import capture_graph
+from discit.func import symlog
 
 import config as cfg
 from sim import MazeSim, BOT_BODY_IDX, BOT_CARGO_IDX, MOT_MAX_TORQUE
 from utils import eval_line_of_sight
-from utils_torch import apply_quat_rot, check_fov, clip_angle_range, get_eulz_from_quat, norm_distance, rgb_to_hsv
+from utils_torch import (
+    apply_quat_rot, check_fov, clip_angle_range, get_eulz_from_quat, norm_distance, rgb_to_hsv, weighted_sum)
 
 
 # Mag. units are nT / 100
-# Data for 46-3-5N (46.0513889) 14-30-22E 295M on 2023-03-22
+# Data for 46-3-5N | 14-30-22E | 295M | 2023-03-22
 # https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml#igrfwmm
 # https://www.sensorsone.com/local-gravity-calculator/
 MAG_REF = [[0.220967, 0.017385, 0.428883]]
@@ -27,27 +30,17 @@ ACC_REF = [[0., 0., -0.980624]]
 _RAD_90 = 90./180. * torch.pi
 RCVR_REL_PHASES = [[0., -_RAD_90, torch.pi, _RAD_90]]
 
-# Limited to 10 in the worst case, but usually it should be much lower
-# Implemented with tanh(x/10)*10 to keep sensitivity in the average case
-SCALE_RCVR = 10.
-SCALE_ACC = 10.
-
-# https://forums.developer.nvidia.com/t/inaccuracy-of-dof-state-readings/197373
-SCALE_DOF = 1./20.
-
-# Expecting at most half of a turn per second
-SCALE_ANG_VEL = 1./torch.pi
-
-# Expecting 1 avg. completion per 3 to 60 seconds, i.e. 3 to 0.17 per 10 seconds
-SCALE_THROUGHPUT = 10.
-
-# Episodes last from 8 to 600 seconds, i.e. 0.133 to 10 minutes, dt is 0.0042 min
-SCALE_TIME = 1./60.
+# Expecting 1 completion per 3 seconds (edge L1 case) to 1 per 60 (optimistic L7 case) or 10 to 0.5 per 30 seconds
+THROUGHPUT_WINDOW = 30.
+MIN_TASK_DURATION = 3.
 
 # Task completion confirmed after 1 second at goal
-T_TASK_CONFIRM = 1.
+MIN_TIME_AT_GOAL = 1.
 
-# Max norm. ranges
+# Episodes last up to 6 min, dt is 0.0042 min
+TIME_SCALE = 1. / 60.
+
+# Max. env. distances
 MAX_ENV_WIDTH = cfg.LEVEL_PARAMS[7]['env_width']
 MAX_ENV_HALFWIDTH = MAX_ENV_WIDTH / 2.
 MAX_IMG_DEPTH = MAX_ENV_WIDTH * 2 / 3.
@@ -57,19 +50,11 @@ ENV_DIAG_SPAN = np.floor(MAX_ENV_WIDTH * 2**0.5)
 COLOURS = {clr_group: np.array(clrs) for clr_group, clrs in cfg.COLOURS.items()}
 
 # Reward params.
-MAX_DIST_PER_STEP = 0.3
-CONFIRMATION_WEIGHT = MAX_DIST_PER_STEP * cfg.STEPS_PER_SECOND * T_TASK_CONFIRM
+COMPLETION_WEIGHT = 2.
+EXPLORATION_WEIGHT = 0.05  # COMPLETION_WEIGHT / (cfg.LEVEL_PARAMS[7]['n_grid_segments']**2 / 10)
 
-COLLISION_WEIGHT = MAX_DIST_PER_STEP
+COLLISION_WEIGHT = 2. * EXPLORATION_WEIGHT
 PROXIMITY_WEIGHT = 2. * COLLISION_WEIGHT
-
-RGB_ON_WEIGHT = MAX_DIST_PER_STEP / 30.
-RGB_INIT_WEIGHT = 2. * RGB_ON_WEIGHT
-RGB_NRG_THRESHOLD = 30. * cfg.STEPS_PER_SECOND
-
-HEAT_KERN_SIZE = 5
-HEAT_KERN_STD = 0.05
-HEAT_KERN_PEAK = MAX_DIST_PER_STEP / 10.
 
 
 class BasicInterface:
@@ -77,6 +62,7 @@ class BasicInterface:
         self.gym = gym
         self.sim_handle = sim_handle
         self.viewer = gym.create_viewer(sim_handle, gymapi.CameraProperties())
+        self.paused = False
 
         if self.viewer is None:
             raise Exception('Failed to create viewer.')
@@ -116,18 +102,21 @@ class MazeTask:
     obj_rgb: Tensor
     obj_pos: Tensor
     obj_idx_map: Tensor
+    goal_pos_idx: Tensor
     goal_idx: Tensor
     goal_rgb: Tensor
     goal_pos: Tensor
     last_path_len: Tensor
     goal_path_len: Tensor
     goal_path_dir: Tensor
-    goal_in_sight_mask: Tensor
-    obj_in_sight_mask: Tensor
+    goal_in_sight: Tensor
+    obj_in_sight: Tensor
+    obj_found: Tensor
     env_run_times: Tensor
     bot_time_on_task: Tensor
     bot_time_at_goal: Tensor
-    throughput: Tensor
+    obj_done_ctr: Tensor
+    avg_done_ctr: Tensor
     bot_done_ctr: Tensor
     bot_done_mask: Tensor
     bot_rst_mask: Tensor
@@ -137,12 +126,11 @@ class MazeTask:
     actions: Tensor
     act_trq: Tensor
     act_rgb: Tensor
+    act_clr_idx: Tensor
 
-    rgb_in_use: Tensor
-    rgb_nrg_used: Tensor
-    heatmap: Tensor
-    heatmap_bounds: Tensor
-    heat_kernel: np.ndarray
+    cell_exploration: Tensor
+    cell_state: Tensor
+    cell_delims: Tensor
 
     bot_pos_arr: np.ndarray
     obj_pos_arr: np.ndarray
@@ -161,6 +149,8 @@ class MazeTask:
     zero_column: Tensor
     sky_clr: Tensor
     row_idcs: Tensor
+    speaker_mask: Tensor
+    speaker_mask_f: Tensor
 
     def __init__(
         self,
@@ -175,11 +165,9 @@ class MazeTask:
         uniform_task_sampling: bool = False,
         distribute_env_resets: bool = False,
         full_env_regeneration: bool = False,
-        result_reward: bool = False,
-        shared_reward: bool = False,
-        contact_penalty: bool = False,
-        energy_penalty: bool = False,
-        idling_penalty: bool = False,
+        long_range_obj_signal: bool = False,
+        use_team_reward: bool = True,
+        num_speakers_per_env: int = None,
         device: str = 'cuda'
     ):
         self.sim = sim
@@ -193,11 +181,9 @@ class MazeTask:
         self.uniform_task_sampling = uniform_task_sampling
         self.distribute_env_resets = distribute_env_resets
         self.full_env_regeneration = full_env_regeneration
-        self.result_reward = result_reward
-        self.shared_reward = shared_reward
-        self.contact_penalty = contact_penalty
-        self.energy_penalty = energy_penalty
-        self.idling_penalty = idling_penalty
+        self.long_range_obj_signal = long_range_obj_signal
+        self.use_team_reward = use_team_reward
+        self.n_speakers = sim.n_bots if num_speakers_per_env is None else min(sim.n_bots, num_speakers_per_env)
 
         self.rst_env_indices: 'list[int]' = []
 
@@ -231,7 +217,7 @@ class MazeTask:
         # Graph 1
         self.eval_state, self.graphs['eval_state'] = capture_graph(
             self.eval_state,
-            (self.act_trq, self.act_rgb),
+            (self.act_trq, self.act_clr_idx),
             copy_idcs_out=(2,))  # Copy reward; obs. copied later in exp. collection
 
         # Reset tensors modified in-place during warm-up
@@ -242,9 +228,10 @@ class MazeTask:
         self.bot_done_mask.zero_()
         self.bot_rst_mask.zero_()
         self.last_path_len.zero_()
-        self.throughput.zero_()
+        self.obj_found.zero_()
+        self.obj_done_ctr.zero_()
+        self.avg_done_ctr.zero_()
         self.bot_old_vel.zero_()
-        self.rst_env_indices = []
 
         # Graph 2
         if not self.render_cameras:
@@ -336,36 +323,39 @@ class MazeTask:
         self.sky_clr = torch.tensor(COLOURS['sky'][0], dtype=torch.float32, device=device)
         self.row_idcs = torch.arange(self.sim.n_all_bots, device=device)
 
-        # Objectives
-        # KxLxL -> NxLxL
+        self.speaker_mask = torch.zeros(sim.n_bots, dtype=torch.bool, device=device)
+        self.speaker_mask[:self.n_speakers] = True
+        self.speaker_mask = self.speaker_mask.repeat(sim.n_envs)
+        self.speaker_mask_f = self.speaker_mask.unsqueeze(-1).float()
+
+        # Landmarks/objectives
+        # ExLxL -> NxLxL
         self.obj_trans_prob = np.stack([env.data.obj_trans_probs for env in sim.envs])
         self.obj_trans_prob = np.repeat(self.obj_trans_prob, sim.n_bots, axis=0)
         self.obj_trans_prob = torch.from_numpy(self.obj_trans_prob).to(device, dtype=torch.float32)
 
-        # KxCx3 (C=L) -> NxLx3
+        # ExLx3 -> NxLx3
         self.obj_rgb = np.stack([COLOURS['basic'][env.data.obj_clr_idcs] for env in sim.envs])
         self.obj_rgb = np.repeat(self.obj_rgb, sim.n_bots, axis=0)
         self.obj_rgb = torch.from_numpy(self.obj_rgb).to(device, dtype=torch.float32)
 
-        # KxLx2 -> NxLx2
+        # ExLx2 -> NxLx2
         self.obj_pos = np.stack([env.data.obj_points for env in sim.envs])
         self.obj_pos = np.repeat(self.obj_pos, sim.n_bots, axis=0)
         self.obj_pos = torch.from_numpy(self.obj_pos).to(device, dtype=torch.float32)
 
+        # ExL -> NxL
         self.obj_idx_map = np.stack([env.data.obj_clr_idcs for env in sim.envs])
         self.obj_idx_map = np.repeat(self.obj_idx_map, sim.n_bots, axis=0)
         self.obj_idx_map = torch.from_numpy(self.obj_idx_map).to(device, dtype=torch.int64)
 
         # Sample initial tasks
-        ini_bot_pos = np.concatenate([env.data.bot_spawn_points for env in sim.envs])
-        ini_bot_pos = torch.from_numpy(ini_bot_pos).to(device, dtype=torch.float32)
-        goal_indices = self.sample_tasks(ini_bot_pos[:, None], self.obj_pos, self.obj_trans_prob)
+        self.goal_pos_idx = self.sample_tasks(uniform=True)
 
         # Clone not to write over reference tensors
-        bot_range = np.arange(sim.n_all_bots)
-        self.goal_idx = goal_indices
-        self.goal_rgb = self.obj_rgb[bot_range, goal_indices].clone()
-        self.goal_pos = self.obj_pos[bot_range, goal_indices].clone()
+        self.goal_idx = self.obj_idx_map[self.row_idcs, self.goal_pos_idx].clone()
+        self.goal_rgb = self.obj_rgb[self.row_idcs, self.goal_pos_idx].clone()
+        self.goal_pos = self.obj_pos[self.row_idcs, self.goal_pos_idx].clone()
 
         # Must be on cpu for custom line of sight tracer
         self.obj_pos_arr = np.moveaxis(self.obj_pos.cpu().numpy(), 1, 0)
@@ -373,18 +363,20 @@ class MazeTask:
         self.obj_wallgrid_idcs = np.digitize(self.obj_pos_arr, sim.open_grid_delims)
         self.goal_wallgrid_idx = np.digitize(self.goal_pos_arr, sim.open_grid_delims)
 
+        # Task tracking
         self.last_path_len = torch.zeros(sim.n_all_bots, device=device)
         self.goal_path_len = torch.zeros(sim.n_all_bots, device=device)
         self.goal_path_dir = torch.zeros((sim.n_all_bots, 2), device=device)
-        self.goal_in_sight_mask = torch.zeros(sim.n_all_bots, dtype=torch.bool, device=device)
-        self.obj_in_sight_mask = torch.zeros((sim.n_objects, sim.n_all_bots), dtype=torch.bool, device=device)
+        self.goal_in_sight = torch.zeros(sim.n_all_bots, dtype=torch.bool, device=device)
+        self.obj_in_sight = torch.zeros((sim.n_all_bots, sim.n_objects), dtype=torch.bool, device=device)
+        self.obj_found = torch.zeros_like(self.obj_in_sight)
 
-        # Task tracking
         self.env_run_times = torch.zeros(sim.n_envs, device=device)
         self.bot_time_on_task = torch.zeros(sim.n_all_bots, device=device)
         self.bot_time_at_goal = torch.zeros(sim.n_all_bots, device=device)
         self.bot_done_ctr = torch.zeros(sim.n_all_bots, device=device)
-        self.throughput = torch.zeros(sim.n_all_bots, device=device)
+        self.avg_done_ctr = torch.zeros(sim.n_envs, device=device)
+        self.obj_done_ctr = torch.zeros((sim.n_envs, cfg.N_OBJ_COLOURS), device=device)
 
         # Force premature first env. resets by starting their counters mid-episode
         # Having envs. at different stages helps to decorrelate experience in batches
@@ -401,6 +393,7 @@ class MazeTask:
                     envs_done += envs_to_reset
 
             self.env_run_times -= self.env_run_times[0].item()
+            # self.env_run_times = self.env_run_times[torch.randperm(sim.n_envs)]
 
         # Reset flags
         self.bot_done_mask = torch.zeros(sim.n_all_bots, dtype=torch.bool, device=device)
@@ -410,31 +403,59 @@ class MazeTask:
         self.rcvr_clr_classes = torch.tensor(cfg.RCVR_CLR_CLASSES, device=device)
 
         if self.spawn_with_random_rgb:
-            self.actions = torch.hstack((
-                torch.zeros((sim.n_all_bots, cfg.DOF_VEC_SIZE), device=device),
-                self.sample_colours()))
+            self.act_trq = torch.zeros((sim.n_all_bots, cfg.N_DOF_MOT), device=device)
+            self.act_rgb = self.sample_colours()
+
+            self.actions = torch.hstack((self.act_trq, self.act_rgb))
+
         else:
-            self.actions = torch.zeros((sim.n_all_bots, cfg.ACT_VEC_SIZE), device=device)
+            self.actions = torch.zeros((sim.n_all_bots, cfg.ACT_SIZE), device=device)
+            self.act_trq, self.act_rgb = torch.split(self.actions, cfg.ACT_SPLIT, dim=1)
 
-        self.act_trq, self.act_rgb = torch.split(self.actions, cfg.ACT_VEC_SPLIT, dim=1)
+        self.act_clr_idx = self.get_closest_colour_index(self.act_rgb)
 
-        # Aux. reward components
-        self.rgb_in_use = torch.zeros(sim.n_all_bots, dtype=torch.bool, device=device)
-        self.rgb_nrg_used = torch.zeros(sim.n_all_bots, device=device)
+        # Grid cell states
+        self.cell_delims = torch.from_numpy(sim.open_grid_delims).to(device, dtype=torch.float32)
+        n_segments = sim.constructor.n_supgrid_segments
 
-        env_halfwidth = sim.constructor.supenv_halfwidth
-        n_heatmap_segments = round(env_halfwidth * 2. / cfg.BOT_WIDTH * HEAT_KERN_SIZE)
+        cell_idx, cell_idy = torch.bucketize(self.bot_pos, self.cell_delims).unbind(1)
+        self.cell_exploration = torch.ones((sim.n_all_bots, n_segments, n_segments), device=device)
+        self.cell_exploration[self.row_idcs, cell_idx, cell_idy] = 0.
 
-        self.heatmap = torch.zeros((sim.n_all_bots, n_heatmap_segments, n_heatmap_segments), device=device)
-        self.heatmap_bounds = torch.linspace(-env_halfwidth, env_halfwidth, n_heatmap_segments+1)
-        self.heatmap_bounds = self.heatmap_bounds[1:-1].to(device=device, copy=True)
+        self.cell_state = torch.empty((sim.n_envs, cfg.STATE_SPA_CHANNELS-1, n_segments, n_segments), device=device)
+        self.update_cell_state(sim.envs)
 
-        two_squares_from_bot = cfg.BOT_WIDTH / HEAT_KERN_SIZE * 2
-        x, y = np.meshgrid(*(np.linspace(-two_squares_from_bot, two_squares_from_bot, HEAT_KERN_SIZE),)*2)
+    def update_cell_state(self, envs: list, env_indices: 'list[int]' = None):
+        """Update the cell state tensor for given envs."""
 
-        self.heat_kernel = HEAT_KERN_PEAK * np.exp(-(x**2 + y**2) / (2. * HEAT_KERN_STD**2))
-        self.heat_kernel = self.heat_kernel.astype(np.float32)
-        # self.heat_kernel = torch.from_numpy(self.heat_kernel).to(dtype=torch.float32, device=device)
+        n_segments = self.sim.constructor.n_supgrid_segments
+
+        for i, env in enumerate(envs) if env_indices is None else zip(env_indices, envs):
+
+            # NESW connections
+            hor_con_mask_f = torch.from_numpy(~env.data.hor_wall_mask).to(torch.float32)
+            ver_con_mask_f = torch.from_numpy(~env.data.ver_wall_mask).to(torch.float32)
+
+            self.cell_state[i, 0].copy_(hor_con_mask_f[:n_segments])
+            self.cell_state[i, 1].copy_(ver_con_mask_f[:, 1:n_segments+1])
+            self.cell_state[i, 2].copy_(hor_con_mask_f[1:n_segments+1])
+            self.cell_state[i, 3].copy_(ver_con_mask_f[:, :n_segments])
+
+            # Hue & saturation
+            # NOTE: Value omitted, almost all are 1 and therefore not a distinguishing feature
+            cell_clr = torch.from_numpy(COLOURS['pastel'][env.data.sqr_roof_clr_idcs])
+            cell_clr = rgb_to_hsv(cell_clr, stack_dim=0)
+
+            self.cell_state[i, 4:6] = cell_clr[:2]
+
+            # Object mask
+            self.cell_state[:, 6:].zero_()
+
+            obj_idx = self.obj_idx_map[i*self.sim.n_bots]
+            cell_idx = self.obj_wallgrid_idcs[:, i*self.sim.n_bots, 0]
+            cell_idy = self.obj_wallgrid_idcs[:, i*self.sim.n_bots, 1]
+
+            self.cell_state[i, 6 + obj_idx, cell_idx, cell_idy] = 1.
 
     def reset_tensors(self) -> 'tuple[np.ndarray, np.ndarray] | None':
         """Restore tensor states after an env reset or task completion."""
@@ -459,6 +480,8 @@ class MazeTask:
             obj_pos = torch.from_numpy(obj_pos).to(self.device, dtype=torch.float32)
             self.obj_pos[bot_rst_indices] = obj_pos
 
+            self.obj_found[bot_rst_indices] = False
+
             bot_rst_idcs_arr = bot_rst_indices.cpu().numpy()
             self.obj_pos_arr[:, bot_rst_idcs_arr] = obj_pos_arr = np.moveaxis(obj_pos.cpu().numpy(), 1, 0)
             self.obj_wallgrid_idcs[:, bot_rst_idcs_arr] = np.digitize(obj_pos_arr, self.sim.open_grid_delims)
@@ -468,30 +491,31 @@ class MazeTask:
             obj_idx_map = torch.from_numpy(obj_idx_map).to(self.device, dtype=torch.int64)
             self.obj_idx_map[bot_rst_indices] = obj_idx_map
 
+            self.update_cell_state(rst_envs, self.rst_env_indices)
+
             ini_bot_pos = np.concatenate([env.data.bot_spawn_points for env in rst_envs])
             self.bot_pos[bot_rst_indices] = torch.from_numpy(ini_bot_pos).to(self.device, dtype=torch.float32)
 
             self.env_run_times[self.rst_env_indices] = 0.
+            self.obj_done_ctr[self.rst_env_indices] = 0.
             self.bot_done_ctr[bot_rst_indices] = 0.
 
             self.bot_old_vel[bot_rst_indices] = 0.
 
             if self.spawn_with_random_rgb:
                 self.act_trq[bot_rst_indices] = act_trq = \
-                    torch.zeros((len(bot_rst_indices), cfg.DOF_VEC_SIZE), device=self.device)
+                    torch.zeros((len(bot_rst_indices), cfg.N_DOF_MOT), device=self.device)
 
-                self.act_rgb[bot_rst_indices] = act_rgb = \
-                    self.sample_colours(len(bot_rst_indices))
+                self.act_rgb[bot_rst_indices] = act_rgb = self.sample_colours(len(bot_rst_indices))
+                self.act_clr_idx[bot_rst_indices] = self.get_closest_colour_index(act_rgb)
 
                 self.actions[bot_rst_indices] = torch.hstack((act_trq, act_rgb))
 
             else:
                 self.act_trq[bot_rst_indices] = 0.
                 self.act_rgb[bot_rst_indices] = 0.
+                self.act_clr_idx[bot_rst_indices] = 0
                 self.actions[bot_rst_indices] = 0.
-
-            self.rgb_in_use[bot_rst_indices] = False
-            self.rgb_nrg_used[bot_rst_indices] = 0.
 
             bot_rclr_mask = self.bot_done_mask | self.bot_rst_mask
 
@@ -503,14 +527,12 @@ class MazeTask:
             bot_rclr_indices = torch.nonzero(bot_rclr_mask, as_tuple=True)[0]
             bot_rclr_idx_arr = bot_rclr_indices.cpu().numpy()
 
-            new_goal_indices = self.sample_tasks(
-                self.bot_pos[bot_rclr_indices, None],
-                self.obj_pos[bot_rclr_indices],
-                self.obj_trans_prob[bot_rclr_indices])
+            goal_pos_idx = self.sample_tasks(bot_rclr_indices, self.uniform_task_sampling)
 
-            self.goal_idx[bot_rclr_indices] = new_goal_indices
-            self.goal_rgb[bot_rclr_indices] = goal_rgb = self.obj_rgb[bot_rclr_indices, new_goal_indices]
-            self.goal_pos[bot_rclr_indices] = goal_pos = self.obj_pos[bot_rclr_indices, new_goal_indices]
+            self.goal_pos_idx[bot_rclr_indices] = goal_pos_idx
+            self.goal_idx[bot_rclr_indices] = self.obj_idx_map[bot_rclr_indices, goal_pos_idx]
+            self.goal_rgb[bot_rclr_indices] = goal_rgb = self.obj_rgb[bot_rclr_indices, goal_pos_idx]
+            self.goal_pos[bot_rclr_indices] = goal_pos = self.obj_pos[bot_rclr_indices, goal_pos_idx]
             self.goal_path_len[bot_rclr_indices] = 0.
 
             self.goal_pos_arr[bot_rclr_idx_arr] = goal_pos_arr = goal_pos.cpu().numpy()
@@ -519,7 +541,9 @@ class MazeTask:
             self.bot_time_on_task[bot_rclr_indices] = 0.
             self.bot_time_at_goal[bot_rclr_indices] = 0.
 
-            self.heatmap[bot_rclr_indices] = 0.
+            cell_idx, cell_idy = torch.bucketize(self.bot_pos[bot_rclr_indices], self.cell_delims).unbind(1)
+            self.cell_exploration[bot_rclr_indices] = 1.
+            self.cell_exploration[bot_rclr_indices, cell_idx, cell_idy] = 0.
 
             return bot_rclr_idx_arr, goal_rgb.cpu().numpy()
 
@@ -549,7 +573,7 @@ class MazeTask:
             self.interface.reset()
 
     def reset_all(self):
-        self.bot_rst_mask = torch.ones_like(self.bot_rst_mask)
+        self.bot_rst_mask.fill_(True)
         self.rst_env_indices = list(range(self.sim.n_envs))
 
     def sample_colours(self, n_to_sample: int = None) -> Tensor:
@@ -560,29 +584,21 @@ class MazeTask:
 
         return self.rcvr_clr_classes.index_select(0, clr_indices)
 
-    def sample_tasks(
-        self,
-        bot_pos: Tensor,
-        landmark_pos_ref: Tensor,
-        landmark_probs: Tensor
-    ) -> Tensor:
+    def sample_tasks(self, indices: Tensor = None, uniform: bool = False) -> Tensor:
         """Create new assignments for agents."""
 
-        # Uniform
-        if self.uniform_task_sampling:
-            probs = torch.ones(landmark_probs.shape[:2], device=self.device)
+        if uniform:
+            n_to_sample = self.sim.n_all_bots if indices is None else len(indices)
 
-        # Get the transition probs of the closest objective
+            return torch.randint(self.sim.n_objects, (n_to_sample,), device=self.device)
+
+        # Get the transition probs for the current objective
+        # RxLxL -> RxL
+        if indices is None:
+            probs = self.obj_trans_prob[self.row_idcs, self.goal_pos_idx]
+
         else:
-            # Rx1x2 -> RxLx2 -> RxL
-            diff = bot_pos - landmark_pos_ref
-            dist = torch.linalg.norm(diff, dim=-1)
-
-            # RxL -> R
-            origin_idx = torch.argmin(dist, dim=-1)
-
-            # RxLxL -> RxL
-            probs = landmark_probs[self.row_idcs[:len(origin_idx)], origin_idx]
+            probs = self.obj_trans_prob[indices, self.goal_pos_idx[indices]]
 
         # Sample R new assignments
         task_idx = torch.multinomial(probs, 1)
@@ -606,12 +622,16 @@ class MazeTask:
 
         elif self.headless:
             # Pre-physics step
-            self.apply_actions(actions)
+            self.apply_actions(actions, action_indices)
 
         else:
+            while self.interface.paused:
+                self.interface.eval_events()
+                self.interface.sync_redraw(after_eval=False)
+
             # Get events
             self.interface.eval_events()
-            self.apply_actions(actions)
+            self.apply_actions(actions, action_indices)
 
             # Step physics and graphics (the last stride is made later)
             for _ in range(self.inference_stride-1):
@@ -624,49 +644,55 @@ class MazeTask:
                 self.interface.sync_redraw(after_eval=False)
 
         # Reset environments
-        # NOTE: Resets are one step delayed, as all envs must be updated together
+        # NOTE: Resets and final rewards are evaluated one step ahead
+        # to ensure that setter fns., followed by a sim. step, take effect before getting new observations,
+        # at the cost of viewing the final actions taken in flagged environments as arbitrary (which they generally are)
         self.eval_reset()
 
         # Async update tensors and colours, step physics
         self.run_async_ops(self.async_reset_and_recolour, self.async_simulate)
-        rst_mask_f = self.bot_rst_mask.float()
+        rst_mask_f = self.bot_rst_mask.unsqueeze(-1).float()
 
         # Async compute observations and rewards from physical state
         # NOTE: Refreshing cameras is by far the longest part of a step
         self.run_async_ops(self.async_eval_state, self.async_step_graphics)
-        obs_vec, com_weights, reward = self.async_temp_result
+        obs_vec, obs_spa, reward = self.async_temp_result
 
         obs_img = self.get_image_observations()
-        obs = (obs_img, obs_vec, com_weights)
-
-        # Pass explicit indices of discrete actions with current observations
-        if action_indices is not None:
-            obs_vec[:, -1] = action_indices.float()
+        obs = (obs_img, obs_vec, obs_spa)
 
         # Auxiliary value targets
-        vals = obs_vec[:, cfg.GUIDE_VEC_SLICE].clone()
+        vals = obs_vec[:, cfg.AUX_VAL_SLICE].clone()
 
         # Externally handled log
-        info = {'score': self.get_throughput()} if get_info else self.NULL_INFO
+        info = {'score': self.get_score()} if get_info else self.NULL_INFO
 
         return obs, reward, rst_mask_f, vals, info
 
-    def get_throughput(self) -> float:
-        """Get the average number of tasks completed per minute."""
+    def get_score(self) -> float:
+        """Get the average number of tasks completed (per bot)."""
 
-        return self.throughput.mean().item()
+        return self.avg_done_ctr.mean().item()
 
-    def apply_actions(self, actions: Tensor):
+    def apply_actions(self, actions: Tensor, action_indices: Tensor = None):
         """Set torques, relay RGB signals."""
 
         self.actions = actions
-        self.act_trq, self.act_rgb = torch.split(actions, cfg.ACT_VEC_SPLIT, dim=1)
+        self.act_trq, self.act_rgb = torch.split(actions, cfg.ACT_SPLIT, dim=1)
 
+        if action_indices is None:
+            action_indices = self.get_closest_colour_index(self.act_rgb)
+
+        # NOTE: Default is short-range (white) signal, not silence (black)
         self.act_trq = torch.clamp(self.act_trq, -MOT_MAX_TORQUE, MOT_MAX_TORQUE)
-        self.act_rgb = torch.clamp(self.act_rgb, 0., 1.)
+        self.act_rgb = torch.where(self.speaker_mask.unsqueeze(-1), torch.clamp(self.act_rgb, 0., 1.), 1.)
+        self.act_clr_idx = torch.where(self.speaker_mask, action_indices, 1)
 
         act_trq = self.act_trq.reshape(-1)
         self.gym.set_dof_actuation_force_tensor(self.sim.handle, gymtorch.unwrap_tensor(act_trq))
+
+    def get_closest_colour_index(self, rgb: Tensor) -> Tensor:
+        return torch.linalg.norm(rgb.unsqueeze(1) - self.rcvr_clr_classes.unsqueeze(0), dim=-1).argmin(-1)
 
     def set_colours(
         self,
@@ -716,34 +742,34 @@ class MazeTask:
         self.bot_pos_arr = bot_pos_arr = self.bot_pos.cpu().numpy()
 
         # Check line of sight
-        goal_in_sight_mask = eval_line_of_sight(
+        goal_in_sight = eval_line_of_sight(
             bot_pos_arr,
             self.goal_pos_arr,
             self.goal_wallgrid_idx,
             sim.open_grid_delims,
             sim.all_wallgrid_pairs)
 
-        self.goal_in_sight_mask.copy_(torch.from_numpy(goal_in_sight_mask))
+        self.goal_in_sight.copy_(torch.from_numpy(goal_in_sight))
 
-        obj_in_sight_mask = np.stack([
+        obj_in_sight = np.stack([
             eval_line_of_sight(
                 bot_pos_arr,
                 obj_pos_arr,
                 obj_wallgrid_idx,
                 sim.open_grid_delims,
                 sim.all_wallgrid_pairs)
-            for obj_pos_arr, obj_wallgrid_idx in zip(self.obj_pos_arr, self.obj_wallgrid_idcs)])
+            for obj_pos_arr, obj_wallgrid_idx in zip(self.obj_pos_arr, self.obj_wallgrid_idcs)], axis=-1)
 
-        self.obj_in_sight_mask.copy_(torch.from_numpy(obj_in_sight_mask))
+        self.obj_in_sight.copy_(torch.from_numpy(obj_in_sight))
 
         # Estimate shortest path
-        slices = (slice(i, i+sim.n_bots) for i in range(0, sim.n_all_bots, sim.n_bots))
+        slices = [slice(i, i+sim.n_bots) for i in range(0, sim.n_all_bots, sim.n_bots)]
 
         path_res = [
             env.data.get_path_estimate(
                 bot_pos_arr[idcs],
                 self.goal_pos_arr[idcs],
-                goal_in_sight_mask[idcs],
+                goal_in_sight[idcs],
                 sim.is_preset)
             for env, idcs in zip(sim.envs, slices)]
 
@@ -755,35 +781,16 @@ class MazeTask:
         self.goal_path_dir.copy_(torch.from_numpy(goal_path_dir))
 
         # Eval rewards and resets
-        obs_vec, com_weights, reward, self.bot_done_mask, self.bot_rst_mask, rst_env_mask = \
-            self.eval_state(self.act_trq, self.act_rgb)
+        obs_vec, obs_spa, reward, self.bot_done_mask, rst_env_mask = \
+            self.eval_state(self.act_trq, self.act_clr_idx)
 
         self.rst_env_indices = torch.nonzero(rst_env_mask, as_tuple=True)[0].tolist()
 
-        self.async_temp_result = (obs_vec, com_weights, reward)
+        self.async_temp_result = (obs_vec, obs_spa, reward)
 
-    def eval_state(self, act_trq: Tensor, act_rgb: Tensor) -> 'tuple[Tensor, ...]':
-
-        # Get distance and direction to each objective
-        obj_diff = self.obj_pos - self.bot_pos[:, None]
-        obj_dist = torch.linalg.norm(obj_diff, dim=-1)
-
+    def eval_state(self, act_trq: Tensor, act_clr_idx: Tensor) -> 'tuple[Tensor, ...]':
+        n_envs, n_bots, n_all_bots = self.sim.n_envs, self.sim.n_bots, self.sim.n_all_bots
         loc_ori = self.bot_ori * self.quat_inv
-
-        # Mask out values for objectives out of view
-        for i, obj_in_sight_mask in enumerate(self.obj_in_sight_mask):
-            diff_vec = torch.cat((obj_diff[:, i], self.zero_column), dim=-1)
-            loc_diff = apply_quat_rot(loc_ori, diff_vec)
-
-            obj_in_fov_mask = obj_in_sight_mask & check_fov(loc_diff)
-
-            obj_dist[:, i] = torch.where(obj_in_fov_mask, obj_dist[:, i], ENV_DIAG_SPAN)
-
-        obj_prox = 1. - obj_dist / ENV_DIAG_SPAN
-
-        # Get data for the nearest objective
-        nearest_obj_dist, nearest_obj_idx = torch.min(obj_dist, dim=-1)
-        nearest_obj_idx = self.obj_idx_map[self.row_idcs, nearest_obj_idx].float()
 
         # Get distance and direction to goal objective
         goal_diff = self.goal_pos - self.bot_pos
@@ -803,196 +810,307 @@ class MazeTask:
         goal_path_dir = goal_path_dir / torch.linalg.norm(goal_path_dir, dim=1, keepdim=True)
 
         # Check if any goals are in reach and aimed at
-        goal_in_fov_mask = self.goal_in_sight_mask & check_fov(goal_diff)
-        goal_in_reach_mask = (goal_dist < cfg.GOAL_RADIUS) & goal_in_fov_mask
-        goal_in_reach_mask_f = goal_in_reach_mask.float()
+        goal_in_frame = self.goal_in_sight & check_fov(goal_diff)
+        goal_in_reach = (goal_dist < cfg.GOAL_RADIUS) & goal_in_frame
 
         # Step time
         # NOTE: In-place ops avoid needless copying between graph outputs and inputs
         self.env_run_times.add_(self.dt)
         self.bot_time_on_task.add_(self.dt)
-        self.bot_time_at_goal.add_(self.dt).mul_(goal_in_reach_mask_f)
+        self.bot_time_at_goal.add_(self.dt).mul_(goal_in_reach)
 
         # Confirm completed tasks
-        bot_done_mask = self.bot_time_at_goal >= T_TASK_CONFIRM
+        bot_done_mask = self.bot_time_at_goal >= MIN_TIME_AT_GOAL
         bot_done_mask_f = bot_done_mask.float()
         self.bot_done_ctr.add_(bot_done_mask_f)
 
-        env_done_ctr = self.bot_done_ctr.reshape(self.sim.n_envs, -1).mean(-1)
-        throughput = env_done_ctr / self.env_run_times.clip(1.) * SCALE_THROUGHPUT
+        goal_mask_f = one_hot(self.goal_idx, cfg.N_OBJ_COLOURS).float()
+        goal_done_mask_f = goal_mask_f * bot_done_mask_f.unsqueeze(-1)
+        self.obj_done_ctr += goal_done_mask_f.reshape(n_envs, n_bots, -1).sum(1)
 
-        # Check for terminal envs
+        scaled_run_time = self.env_run_times.clip(MIN_TASK_DURATION) / THROUGHPUT_WINDOW
+        obj_throughput = self.obj_done_ctr / scaled_run_time.unsqueeze(-1) * (self.sim.n_objects / n_bots)
+
+        avg_done_ctr = self.bot_done_ctr.reshape(n_envs, -1).mean(-1)
+        avg_throughput = avg_done_ctr / scaled_run_time
+
+        scaled_run_time = scaled_run_time.repeat_interleave(n_bots, output_size=n_all_bots)
+        throughput = self.bot_done_ctr / scaled_run_time
+
+        # Check for terminal envs. ahead of next sim./eval. step
         time_left = self.sim.ep_duration - self.env_run_times
-        rst_env_mask = time_left <= 0.
+        rst_env_mask = time_left <= self.dt
 
-        # Expand env-wise data for each agent
-        time_left = time_left.repeat_interleave(self.sim.n_bots, output_size=self.sim.n_all_bots)
-        bot_rst_mask = rst_env_mask.repeat_interleave(self.sim.n_bots, output_size=self.sim.n_all_bots)
+        bot_rst_mask = rst_env_mask.repeat_interleave(n_bots, output_size=n_all_bots)
 
-        throughput = throughput.repeat_interleave(self.sim.n_bots, output_size=self.sim.n_all_bots)
+        # Get observations
+        obj_in_frame, obj_diff, obj_dist, obj_prox, obj_masked_pos = self.get_obj_data(loc_ori)
+        near_src_ahead, src_dist, obs_sound = self.get_sound_data(obj_diff, obj_dist, act_clr_idx)
+        min_src_dist = src_dist.min(dim=-1)[0]
 
-        # Evalute rewards
-        dist_diff = torch.where(self.last_path_len == 0., 0., self.last_path_len - self.goal_path_len)
+        bot_vel = self.bot_vel.reshape(-1, 3).contiguous()
+        bot_vel_norm = torch.linalg.norm(bot_vel[:, :2], dim=-1)
+        obs_imu = self.get_imu_data(bot_vel, loc_ori)
 
-        reward = torch.lerp(dist_diff, bot_done_mask_f * CONFIRMATION_WEIGHT, goal_in_reach_mask_f)
+        act_clr_mask_f = one_hot(act_clr_idx, cfg.N_RCVR_CLR_CLASSES).float()
+        heur_clr_idx = self.get_heur_data(obj_in_frame, obj_dist, near_src_ahead)
 
-        if self.shared_reward:
-            shared_reward = reward.reshape(self.sim.n_envs, -1).mean(-1)
-            shared_reward = shared_reward.repeat_interleave(self.sim.n_bots, output_size=self.sim.n_all_bots)
+        cell_idx, cell_idy = torch.bucketize(self.bot_pos, self.cell_delims).unbind(1)
+        new_cell_found = self.cell_exploration[self.row_idcs, cell_idx, cell_idy]
+        self.cell_exploration[self.row_idcs, cell_idx, cell_idy] *= 0.
 
-            reward += shared_reward
+        n_segments = self.sim.constructor.n_supgrid_segments
+        total_exploration = self.cell_exploration.reshape(n_envs, n_bots, n_segments, n_segments).mean(1, keepdim=True)
+        obs_spa = torch.cat((self.cell_state, total_exploration), dim=1)
 
-        if self.result_reward:
-            result_reward = env_done_ctr * rst_env_mask.float()
-            result_reward = result_reward.repeat_interleave(self.sim.n_bots, output_size=self.sim.n_all_bots)
+        goal_delta = torch.where(self.last_path_len == 0., 0., self.last_path_len - self.goal_path_len)
 
-            reward += result_reward
-
-        # Pairwise distances for auxiliary rewards and com. weights
-        # Nx2 -> ExBx2 -> Ex1xBx2 - ExBx1x2 -> ExBxBx2
-        pos_loc = self.bot_pos.reshape(self.sim.n_envs, -1, 2)
-        pos_diff_loc = pos_loc.unsqueeze(1) - pos_loc.unsqueeze(2)
-
-        # Set high value on diagonal to suppress own signal in distance calculation
-        for pos_diff_i in pos_diff_loc:
-            pos_diff_i[..., 0].fill_diagonal_(ENV_DIAG_SPAN)
-            pos_diff_i[..., 1].fill_diagonal_(ENV_DIAG_SPAN)
-
-        # ExBxBx2 -> NxBx2 -> NxBx1
-        pos_diff = pos_diff_loc.reshape(self.sim.n_all_bots, -1, 2)
-        pos_dist: Tensor = torch.linalg.norm(pos_diff, dim=-1, keepdim=True)
-
-        # Proximity weights via processed inv. prop. characteristic
-        prox_weights_near = norm_distance(pos_dist, 3.*cfg.BOT_WIDTH, 1.)
-        prox_weights_far = norm_distance(pos_dist, ENV_DIAG_SPAN, 1., exp=0.7)
-
-        # Angle-range weights
-        # NOTE: Own angles are arbitrary, but the weight should already be suppressed via distance
-        incoming_angle = torch.atan2(pos_diff[..., 1], pos_diff[..., 0])
-        rcvr_angles = clip_angle_range(get_eulz_from_quat(self.bot_ori) + self.rcvr_rel_phases)
-
-        # NxB, Nx4 -> NxBx1 - Nx1x4 -> NxBx4
-        rel_angles = incoming_angle.unsqueeze(-1) - rcvr_angles.unsqueeze(1)
-        rel_angles = clip_angle_range(rel_angles)
-
-        # Phase-shifted filters
-        ang_weights = torch.cos(rel_angles).clip(0.)
-
-        # Combined weights
-        # NxBx4 * NxBx1 -> NxBx4 -> 2xNxBx4
-        prox_weights_near = ang_weights * prox_weights_near
-        prox_weights_far = ang_weights * prox_weights_far
-        com_weights = torch.stack((prox_weights_far, prox_weights_near))
-
-        # Auxiliary rewards
-        prox_channels = prox_weights_near.sum(1)
-        colliding = (self.net_contacts[self.collider_indices, :2].abs().sum(-1) != 0.).float()
-
-        if self.contact_penalty:
-            proximity_penalty = (1. - pos_dist.squeeze(-1)/(2.*cfg.BOT_WIDTH)).clip(0.).sum(-1) * PROXIMITY_WEIGHT
-            collision_penalty = colliding * COLLISION_WEIGHT
-
-            reward -= proximity_penalty + collision_penalty
-
-        rgb_in_use = (act_rgb != 0.).any(-1)
-
-        if self.energy_penalty:
-            self.rgb_nrg_used += rgb_in_use
-
-            reward -= torch.where(~self.rgb_in_use, RGB_INIT_WEIGHT, RGB_ON_WEIGHT) * (
-                rgb_in_use & (self.rgb_nrg_used > RGB_NRG_THRESHOLD))
-
-        indices = torch.bucketize(self.bot_pos, self.heatmap_bounds)
-        idx, idy = indices[:, 0], indices[:, 1]
-
-        heat = torch.where(goal_in_fov_mask, 0., self.heatmap[self.row_idcs, idx, idy])
-
-        if self.idling_penalty:
-            reward -= heat
-
-            for i in range(HEAT_KERN_SIZE):
-                for j in range(HEAT_KERN_SIZE):
-                    self.heatmap[
-                        self.row_idcs,
-                        (idx + (i - HEAT_KERN_SIZE // 2)).clamp(0, self.heatmap.shape[1]-1),
-                        (idy + (j - HEAT_KERN_SIZE // 2)).clamp(0, self.heatmap.shape[2]-1)] += self.heat_kernel[i, j]
-
-        # Vector observations
-        bot_vel, *obs_imu = self.imu(loc_ori)
-
-        # NOTE: Differencing reported DOF pos. would be less noisy
-        # https://forums.developer.nvidia.com/t/inaccuracy-of-dof-state-readings/197373/5
-        dof_vel = self.dof_vel * SCALE_DOF
-
-        if self.keep_rgb_over_hsv:
-            goal_clr = self.goal_rgb
-            act_clr = act_rgb
+        # Get rewards
+        if self.use_team_reward:
+            main_reward = self.bot_rst_mask * self.avg_done_ctr.repeat_interleave(n_bots, output_size=n_all_bots)
 
         else:
-            goal_clr = rgb_to_hsv(self.goal_rgb)
-            act_clr = rgb_to_hsv(act_rgb)
+            main_reward = bot_done_mask_f * COMPLETION_WEIGHT + new_cell_found * EXPLORATION_WEIGHT
+
+        colliding = self.net_contacts[self.collider_indices, :2].abs().sum(-1) != 0.
+        near_src_prox_sum = (1. - src_dist / (2.*cfg.BOT_WIDTH)).clip(0.).sum(-1)
+
+        # If envs. have reset, suppress rewards for incorrect (unbelonging) state/obs.
+        aux_reward = ~self.bot_rst_mask * (colliding * COLLISION_WEIGHT + near_src_prox_sum * PROXIMITY_WEIGHT)
+
+        reward = torch.stack((main_reward, -aux_reward), dim=-1)
+
+        # Assemble vec. inputs
+        env_stats = torch.stack((
+            min_src_dist,
+            bot_vel_norm,
+            goal_delta,
+            self.goal_path_len / ENV_DIAG_SPAN,
+            self.bot_time_on_task * TIME_SCALE
+        ), dim=-1).reshape(n_envs, n_bots, -1).mean(1)
+
+        env_stats = torch.cat((
+            # Bot avg. (5+1)
+            env_stats,
+            avg_throughput.unsqueeze(-1),
+            # Common (9+1)
+            obj_throughput,
+            time_left.unsqueeze(-1) * TIME_SCALE
+        ), dim=-1).repeat_interleave(n_bots, dim=0, output_size=n_all_bots)
 
         obs_vec = torch.cat((
-            # Main vec. obs. (27)
-            self.bot_time_at_goal.unsqueeze(-1),
+            # Main vec. obs. (94 = 21+12+61)
+            # DOF, IMU, AHRS, & GPS (4+9+4+2+2)
             act_trq,
-            dof_vel,
             *obs_imu,
-            goal_clr,
-            act_clr,
-            # Hidden state (33); mainly intended for the critic for better value estimation
-            self.zero_column.expand(-1, cfg.N_OBJ_COLOURS),
-            goal_in_fov_mask.unsqueeze(-1).float(),
+            self.bot_ori,
+            self.bot_pos / MAX_ENV_HALFWIDTH,
+            bot_vel[:, :2],
+            # Task specification (9+3)
+            goal_mask_f,
+            self.speaker_mask_f,
+            self.bot_time_at_goal.unsqueeze(-1),
+            throughput.unsqueeze(-1),
+            # Communication (11+50)
+            act_clr_mask_f,
+            obs_sound,
+            # Hidden state (68 = 37+11+4+16); mainly intended for the critic for better value estimation
+            # Aux. targets, incl. obj. in frame, obj. masked coords., & obj. proximity (1+4*9)
+            goal_in_frame.unsqueeze(-1).float(),
+            self.zero_column.expand(-1, 4*cfg.N_OBJ_COLOURS),
+            # Task state & progress (11)
             goal_dir,
             goal_proximity.unsqueeze(-1),
             goal_path_dir,
             goal_path_proximity.unsqueeze(-1),
             self.goal_pos / MAX_ENV_HALFWIDTH,
-            self.bot_pos / MAX_ENV_HALFWIDTH,
-            prox_channels,
-            colliding.unsqueeze(-1),
-            (self.bot_time_on_task * SCALE_TIME).unsqueeze(-1),
-            (time_left * SCALE_TIME).unsqueeze(-1),
+            goal_delta.unsqueeze(-1),
             bot_done_mask_f.unsqueeze(-1),
-            throughput.unsqueeze(-1),
-            dist_diff.unsqueeze(-1),
-            rgb_in_use.unsqueeze(-1).float(),
-            self.rgb_nrg_used.unsqueeze(-1) / RGB_NRG_THRESHOLD,
-            heat.unsqueeze(-1).tanh(),
-            # Other/meta (3)
-            # NOTE: Action indices are set outside, if at all
-            nearest_obj_dist.unsqueeze(-1),
-            nearest_obj_idx.unsqueeze(-1),
-            self.zero_column), dim=-1)
+            self.bot_time_on_task.unsqueeze(-1) * TIME_SCALE,
+            # Aux. reward info (4)
+            new_cell_found.unsqueeze(-1),
+            near_src_ahead.unsqueeze(-1).float(),
+            near_src_prox_sum.unsqueeze(-1),
+            colliding.unsqueeze(-1),
+            # Bot avg. & common env. stats (16)
+            env_stats,
+            # Other (1); mainly intended for a communication heuristic
+            heur_clr_idx.unsqueeze(-1).float()
+        ), dim=-1)
 
-        # Set pre-shuffle indices for all objectives
-        for i in range(obj_prox.shape[1]):
-            obs_vec[self.row_idcs, self.obj_idx_map[:, i] + cfg.OBS_VEC_SIZE] = obj_prox[:, i]
+        # Set according to original indices for all objectives
+        obj_in_frame = obj_in_frame.float()
 
-        self.throughput.copy_(throughput)
+        for i in range(self.sim.n_objects):
+            obj_idx = self.obj_idx_map[:, i]
+            obs_vec[self.row_idcs, obj_idx + cfg.OBS_VEC_SIZE] = obj_in_frame[:, i]
+            obs_vec[self.row_idcs, obj_idx + (cfg.OBS_VEC_SIZE + cfg.N_OBJ_COLOURS)] = obj_masked_pos[:, i, 0]
+            obs_vec[self.row_idcs, obj_idx + (cfg.OBS_VEC_SIZE + 2*cfg.N_OBJ_COLOURS)] = obj_masked_pos[:, i, 1]
+            obs_vec[self.row_idcs, obj_idx + (cfg.OBS_VEC_SIZE + 3*cfg.N_OBJ_COLOURS)] = obj_prox[:, i]
+
         self.bot_old_vel.copy_(bot_vel)
-        self.rgb_in_use.copy_(rgb_in_use)
+        self.bot_rst_mask.copy_(bot_rst_mask)
+        self.avg_done_ctr.copy_(avg_done_ctr)
 
-        return obs_vec, com_weights, reward, bot_done_mask, bot_rst_mask, rst_env_mask
+        return obs_vec, obs_spa, reward, bot_done_mask, rst_env_mask
 
-    def imu(self, loc_ori: Tensor) -> 'tuple[Tensor, ...]':
+    def get_obj_data(self, loc_ori: Tensor) -> 'tuple[Tensor, ...]':
+        """Get mask, direction, and distance/proximity to each objective."""
+
+        n_objects = self.sim.n_objects
+
+        # NxLx2, Nx2 -> NxLx2 - Nx1x2 -> NxLx2
+        obj_diff = self.obj_pos - self.bot_pos[:, None]
+
+        # NxLx2 -> NxLx3
+        zero_padding = self.zero_column.unsqueeze(1).expand(-1, n_objects, -1)
+        obj_diff3 = torch.cat((obj_diff, zero_padding), dim=-1)
+
+        # Nx4, NxLx3 -> (N*L)x4, (N*L)x3
+        loc_ori = loc_ori.repeat_interleave(n_objects, dim=0, output_size=self.sim.n_all_bots * n_objects)
+        obj_diff3 = obj_diff3.reshape(-1, 3)
+
+        # (N*L)x4, (N*L)x3 -> (N*L)x3 -> N*L
+        loc_diff3 = apply_quat_rot(loc_ori, obj_diff3)
+        obj_in_fov = check_fov(loc_diff3)
+
+        # NxL, N*L -> NxL
+        obj_in_frame = self.obj_in_sight & obj_in_fov.reshape(self.sim.n_all_bots, n_objects)
+
+        # NxLx2 -> NxL
+        obj_dist = torch.linalg.norm(obj_diff, dim=-1)
+        obj_prox = 1. - obj_dist / ENV_DIAG_SPAN
+
+        # NxL, NxLx2 -> NxLx2
+        obj_masked_pos = self.obj_pos / MAX_ENV_HALFWIDTH
+
+        if not self.long_range_obj_signal:
+            self.obj_found |= obj_in_frame & (obj_dist < 3*cfg.GOAL_RADIUS)
+            obj_masked_pos = torch.where(self.obj_found.unsqueeze(-1), obj_masked_pos, 0.)
+
+        return obj_in_frame, obj_diff, obj_dist, obj_prox, obj_masked_pos
+
+    def get_sound_data(self, obj_diff: Tensor, obj_dist: Tensor, act_clr_idx: Tensor) -> 'tuple[Tensor, ...]':
+        """
+        Weight signal transmissions by strength (proximity) and incoming angle
+        wrt. 4 oriented receivers, each covering an angle of 90 degrees.
+        """
+
+        # Pairwise distances
+        # Nx2 -> ExBx2 -> Ex1xBx2 - ExBx1x2 -> ExBxBx2 -> NxBx2
+        bot_pos = self.bot_pos.reshape(self.sim.n_envs, -1, 2)
+        bot_diff = bot_pos.unsqueeze(1) - bot_pos.unsqueeze(2)
+        bot_diff = bot_diff.reshape(self.sim.n_all_bots, -1, 2)
+
+        # NxBx2, NxL -> NxBx1, NxLx1
+        bot_dist = torch.linalg.norm(bot_diff, dim=-1, keepdim=True)
+        obj_dist = obj_dist.unsqueeze(-1)
+
+        # Suppress own signal in distance calculation
+        bot_dist = torch.where(bot_dist == 0., torch.inf, bot_dist)
+
+        # Suppress obj. signal beyond noise threshold
+        if not self.long_range_obj_signal:
+            obj_dist = torch.where(obj_dist > 2*cfg.GOAL_RADIUS, torch.inf, obj_dist)
+
+        # Proximity weights via clipped inverse prop. characteristic
+        bot_wsignal_strength = 0.1 / bot_dist.clip(cfg.BOT_RADIUS)
+        bot_csignal_strength = 1. / bot_dist.clip(cfg.BOT_RADIUS)
+        obj_csignal_strength = (1. if self.long_range_obj_signal else 0.05) / obj_dist.clip(cfg.OBJECT_RADIUS)
+
+        # Angle-range weights
+        # NxBx2, NxLx2 -> Nx(B+L)x2
+        src_diff = torch.cat((bot_diff, obj_diff), dim=1)
+
+        # NOTE: Own angles are arbitrary, but their weight should already be suppressed
+        incoming_angle = torch.atan2(src_diff[..., 1], src_diff[..., 0])
+        rcvr_angles = clip_angle_range(get_eulz_from_quat(self.bot_ori) + self.rcvr_rel_phases)
+
+        # Nx(B+L), Nx4 -> Nx(B+L)x1 - Nx1x4 -> Nx(B+L)x4
+        rel_angles = incoming_angle.unsqueeze(-1) - rcvr_angles.unsqueeze(1)
+        rel_angles = clip_angle_range(rel_angles)
+
+        # Phase-shifted filters
+        rcvr_weights = torch.cos(rel_angles).clip(0.)
+
+        # Nx(BxL)x4 -> NxBx4, NxLx4
+        bot_rcvr_weights, obj_rcvr_weights = rcvr_weights[:, :self.sim.n_bots], rcvr_weights[:, self.sim.n_bots:]
+
+        # Combined weights
+        # NxB|Lx4 * NxB|Lx1 -> NxB|Lx4
+        bot_wsignal_strengths = bot_rcvr_weights * bot_wsignal_strength
+        bot_csignal_strengths = bot_rcvr_weights * bot_csignal_strength
+        obj_csignal_strengths = obj_rcvr_weights * obj_csignal_strength
+
+        # Source detection
+        # NxBx4, NxBx1 -> NxB -> N
+        src_dist = bot_dist.squeeze(-1)
+        near_src_ahead = ((bot_rcvr_weights[..., 0] > 0.) & (src_dist < 3*cfg.BOT_WIDTH)).any(-1)
+
+        # Indices into mask
+        bot_signal_mask = one_hot(act_clr_idx, cfg.N_RCVR_CLR_CLASSES).float()
+        obj_signal_mask = one_hot(self.obj_idx_map, cfg.N_OBJ_COLOURS).float()
+
+        # Weighted sum
+        # NxV, NxBx4 -> NxVx4
+        bot_wsignal_sum = weighted_sum(bot_signal_mask[:, 1:2], bot_wsignal_strengths, self.sim.n_envs)
+        bot_csignal_sum = weighted_sum(bot_signal_mask[:, 2:], bot_csignal_strengths, self.sim.n_envs)
+
+        # Own feedback
+        # bot_wsignal_sum += bot_signal_mask[:, 1:2, None] * (0.1 / (3*cfg.BOT_WIDTH))
+        # bot_csignal_sum += bot_signal_mask[:, 2:, None] * (1. / ENV_DIAG_SPAN)
+
+        # NxLxV, NxLx4 -> NxVx4
+        obj_csignal_sum = torch.einsum('nsv,nsw->nvw', obj_signal_mask, obj_csignal_strengths)
+
+        # Concatenate, normalise, log norm
+        signal_sums = torch.cat((bot_wsignal_sum, bot_csignal_sum + obj_csignal_sum), dim=1)
+        norm_of_sums = torch.linalg.norm(signal_sums, dim=-1, keepdim=True)
+
+        signal_sums = signal_sums / norm_of_sums.clip(1e-6)
+        norm_of_sums = symlog(norm_of_sums)
+
+        # Add norm to flattened signal vector
+        # NxVx4, NxVx1 -> NxVx(4+1) -> Nx(V*5)
+        signal_vec = torch.cat((signal_sums, norm_of_sums), dim=-1).flatten(1)
+
+        return near_src_ahead, src_dist, signal_vec
+
+    def get_heur_data(self, obj_in_frame: Tensor, obj_dist: Tensor, near_src_ahead: Tensor) -> Tensor:
+        """Obj. colour if seen and near, white if obstructed, black otherwise."""
+
+        # Expel values for objs. out of frame
+        obj_dist = obj_dist + ~obj_in_frame * ENV_DIAG_SPAN
+
+        nearest_obj_dist, nearest_obj_idx = torch.min(obj_dist, dim=-1)
+        nearest_obj_idx = self.obj_idx_map[self.row_idcs, nearest_obj_idx]
+
+        heur_clr_idx = torch.where(
+            nearest_obj_dist < 3*cfg.GOAL_RADIUS,
+            nearest_obj_idx + 2,
+            near_src_ahead.long())
+
+        return heur_clr_idx
+
+    def get_imu_data(self, bot_vel: Tensor, loc_ori: Tensor) -> 'tuple[Tensor, ...]':
         """
         Simulate angular velocity, acceleration, and magnetic flux density,
         as if reported by the gyroscope, accelerometer, and magnetometer
         of a 9-DoF inertial measurement unit.
         """
 
-        bot_vel = self.bot_vel.reshape(-1, 3).contiguous()
         acc = (bot_vel - self.bot_old_vel) / self.dt
 
         mag = apply_quat_rot(loc_ori, self.mag_ref)
         acc = apply_quat_rot(loc_ori, self.acc_ref + acc)
-        vel = apply_quat_rot(loc_ori, bot_vel)
 
-        acc = torch.tanh(acc / SCALE_ACC) * SCALE_ACC
-        ang_vel = self.bot_ang_vel.reshape(-1, 3) * SCALE_ANG_VEL
+        # Expecting at most |0. - 0.3m/0.25s| / 0.25s at abrupt stop from full speed
+        acc = acc / 5.
 
-        return bot_vel, vel, ang_vel, acc, mag
+        # Expecting at most one turn per 6 seconds
+        ang_vel = self.bot_ang_vel.reshape(-1, 3)
+
+        return ang_vel, acc, mag
 
     async def async_step_graphics(self, other_task: asyncio.Task):
         self.gym.step_graphics(self.sim.handle)

@@ -61,7 +61,7 @@ LEVEL_PARAMS = {
         'n_graph_points': 181,
         'n_bots': 128,
         'n_objects': 8,
-        'ep_duration': 420,
+        'ep_duration': 360,
         'rng_seed': 64578}}
 
 
@@ -152,33 +152,29 @@ SEG_CLS_CARGO = 6
 N_SEG_CLASSES = 7
 
 # Model IO components
-DOF_VEC_SIZE = 4
-XYZ_VEC_SIZE = 3
-IMU_VEC_SIZE = 3 * XYZ_VEC_SIZE
-RGB_VEC_SIZE = 3
-RCVR_VEC_SIZE = 4
+N_DOF_MOT = 4
+N_DIM_RGB = 3
+N_DIM_POS = 3
 
-# 27 total:
-# 1 confirmation status (time) at goal,
-# 4 torque cmd., 4 whl. ang. vel., 3 vel., 3x3 IMU, 3 RGB cmd., 3 RGB task
-OBS_VEC_SIZE = 1 + 2*DOF_VEC_SIZE + XYZ_VEC_SIZE + IMU_VEC_SIZE + 2*RGB_VEC_SIZE
-OBS_RGB_SLICE = slice(OBS_VEC_SIZE-RGB_VEC_SIZE, OBS_VEC_SIZE)
-
-# 50 total:
-# 10x4 clr. channels, 10 clr. channel norm
-OBS_COM_SIZE = (N_RCVR_CLR_CLASSES - 1) * (RCVR_VEC_SIZE + 1)
+# 94 total:
+# 4 torque cmd., 3x3 IMU, 4 ori. quat., 2 bot xy pos., 2 global frame bot xy vel.,
+# 9 goal spec., 1 speaker spec., 1 time at goal, 1 own throughput,
+# 11 colour cmd., 10x4 clr. channels, 10 clr. channel norm
+OBS_LOC_SIZE = N_DOF_MOT + 3*3 + 4 + 2*(N_DIM_POS-1) + N_OBJ_COLOURS + 3 + N_RCVR_CLR_CLASSES
+OBS_VEC_SIZE = OBS_LOC_SIZE + (N_RCVR_CLR_CLASSES-1) * (4+1)
+OBS_ROLE_SLICE = slice(30, 31)
 
 # Resolution mostly important for effective viewing distance
 OBS_IMG_RES_WIDTH = 96
 OBS_IMG_RES_HEIGHT = 48
-OBS_IMG_CHANNELS = RGB_VEC_SIZE + 1                             # RGB or HSV, depth (4)
+OBS_IMG_CHANNELS = N_DIM_RGB + 1                                # RGB or HSV, depth (4)
 ENC_IMG_CHANNEL_SPLIT = (OBS_IMG_CHANNELS, 2, 1)                # HSVD, clr. seg. + func. (type) seg., px. weights (7)
 DEC_IMG_CHANNEL_SPLIT = (N_ALL_CLR_CLASSES, N_SEG_CLASSES, 1)   # Clr. softmax, func. softmax, depth value (31)
 ALL_IMG_CHANNEL_SPLIT = ENC_IMG_CHANNEL_SPLIT + DEC_IMG_CHANNEL_SPLIT
 
 # Torque cmd., rgb radial emitter
-ACT_VEC_SPLIT = (DOF_VEC_SIZE, RGB_VEC_SIZE)
-ACT_VEC_SIZE = sum(ACT_VEC_SPLIT)
+ACT_SPLIT = (N_DOF_MOT, N_DIM_RGB)
+ACT_SIZE = sum(ACT_SPLIT)
 
 ACT_DOF_MODES_BASE = [
     [0., 0., 0., 0.],
@@ -187,70 +183,78 @@ ACT_DOF_MODES_BASE = [
     [-1., 1., -1., 1.],
     [1., -1., 1., -1.]]
 
-# 13 total:
-# 9 prox. of obj. in fov., 1 goal in fov. mask, 2 air xy dir., 1 air prox.
-AUX_VEC_SPLIT = (N_OBJ_COLOURS+1, XYZ_VEC_SIZE)
-AUX_VEC_SIZE = sum(AUX_VEC_SPLIT)
+# 28 total:
+# 1 goal in frame, 9 obj. in frame, 2*9 obj. xy pos.
+AUX_VAL_SPLIT = (1 + N_OBJ_COLOURS, 2*N_OBJ_COLOURS)
+AUX_VAL_SIZE = sum(AUX_VAL_SPLIT)
+AUX_VAL_SLICE = slice(OBS_VEC_SIZE + AUX_VAL_SPLIT[0], OBS_VEC_SIZE + AUX_VAL_SIZE)
 
-GUIDE_VEC_SLICE = slice(OBS_VEC_SIZE + AUX_VEC_SPLIT[0], OBS_VEC_SIZE + AUX_VEC_SIZE)
-OBS_EXT_SLICE = slice(None, OBS_VEC_SIZE + AUX_VEC_SIZE)
+# 1 heuristic clr. index
+META_VAL_SIZE = 1
 
-# 3 total:
-# 1 nearest obj. proximity, 1 nearest obj. index, 1 last selected clr. index
-META_VEC_SIZE = 3
-META_VEC_SLICE = slice(-META_VEC_SIZE, None)
+# 16 total:
+# 1 avg. closest bot dist., 1 avg. vel. norm, 1 avg. goal delta, 1 avg. goal path len.,
+# 1 avg. time on task, 1 avg. throughput, 9 throughput per obj., 1 time until end of episode
+ENV_STAT_SIZE = 6 + N_OBJ_COLOURS + 1
 
-# 60 total:
-# 27 obs., 13 aux.,
-# 2 a* path xy dir., 1 a* path prox., 2 goal xy pos., 2 bot xy pos.,
-# 4 bot proximity, 1 colliding flag,
-# 1 time spent on task, 1 time until end of episode, 1 num. of completed tasks, 1 throughput, 1 dist. diff.,
-# 1 nrg. in use, 1 nrg. used, 1 heat
-STATE_VEC_SIZE = OBS_VEC_SIZE + AUX_VEC_SIZE + XYZ_VEC_SIZE + 2*(XYZ_VEC_SIZE-1) + RCVR_VEC_SIZE + 9
-STATE_VEC_SLICE = slice(None, -META_VEC_SIZE)
+# 112 total:
+# 44 obs., 28 aux. val., 9 obj. prox., 3 air xy dir. & prox., 3 a* path xy dir. & prox.,
+# 2 goal xy pos., # 1 own goal delta, 1 task completed, 1 time spent on task,
+# 1 cell found, 1 bot ahead, 1 near bot prox. sum, 1 colliding flag,
+# 16 env. stats.
+STATE_VEC_SIZE = OBS_LOC_SIZE + N_OBJ_COLOURS + AUX_VAL_SIZE + 2*N_DIM_POS + (N_DIM_POS-1) + 7 + ENV_STAT_SIZE
+STATE_VEC_SLICE = slice(OBS_VEC_SIZE, -META_VAL_SIZE)
 
-# 43 total:
-# 27 obs., 10 obj. ext., 3 guide ext., 3 meta
-IPT_VEC_SPLIT = (OBS_VEC_SIZE, *AUX_VEC_SPLIT, META_VEC_SIZE)
+# 16 total:
+# 4 NESW cell connections, 2 wall hue & saturation, 9 obj. presence, 1 cell exploration
+STATE_SPA_CHANNELS = 4 + 2 + N_OBJ_COLOURS + 1
 
 
 # Training setup
 DATA_DIR = 'data'   # Training meta data and model checkpoints
 LOG_DIR = 'runs'    # Tracked scalars
 
-# Should be a divisor of num. of all bots in the sim.
-MINIBATCH_SIZE = 256
-N_AUX_MINIBATCHES = 1
+# TODO: Override hardcoded `--n_envs 8` arg. in `runner`
+N_ENVS = 8
+
+# TODO: Override with `act_freq` arg. in `session`
+STEPS_PER_SECOND = 4
 
 # GAE length etc.
-STEPS_PER_SECOND = 4
-N_TRUNCATED_STEPS = STEPS_PER_SECOND * 4
-N_ROLLOUT_STEPS = 16#240
+N_PASSES_PER_BATCH = 10
+N_TRUNCATED_STEPS = 15  # STEPS_PER_SECOND * 4
+N_ROLLOUT_STEPS = 120
 N_ROLLOUTS_PER_EPOCH = 6
 N_AUX_ITERS_PER_EPOCH = 8
 SECONDS_PER_EPOCH = N_ROLLOUT_STEPS * N_ROLLOUTS_PER_EPOCH // STEPS_PER_SECOND
 
 # Main + aux. updates
 N_UPDATES_PER_EPOCH = (
-    N_ROLLOUT_STEPS // N_TRUNCATED_STEPS * N_ROLLOUTS_PER_EPOCH
+    N_ROLLOUT_STEPS // N_TRUNCATED_STEPS * N_ROLLOUTS_PER_EPOCH * N_PASSES_PER_BATCH
     + N_ROLLOUT_STEPS * N_ROLLOUTS_PER_EPOCH // N_TRUNCATED_STEPS * N_AUX_ITERS_PER_EPOCH)
 
-# 1 plot point and checkpoint per 4 virtual minutes, 15 per hour, 360 per day, 2520 per week
-LOG_EPOCH_INTERVAL = max(1, 4 * 60 // SECONDS_PER_EPOCH)
+# 1 plot point and checkpoint per 3 virtual minutes, 20 per hour, 480 per day, 3360 per week
+LOG_EPOCH_INTERVAL = max(1, 3 * 60 // SECONDS_PER_EPOCH)
 CKPT_EPOCH_INTERVAL = LOG_EPOCH_INTERVAL
 
-# 1 branch per half virtual hour, 48 per day, 360 per week
+# 1 branch per half virtual hour, 48 per day, 336 per week
 BRANCH_EPOCH_INTERVAL = 30 * 60 // SECONDS_PER_EPOCH
 
-# 4-30 virtual minutes to warm up, 14+5 hours to train, 5 hours to cool down, 24 hours total
+# 4-30 virtual minutes to warm up, 1-5 hours to train per stage, 10-24 hours total per agent
 TIME_MILESTONE_MAP = {
-    1: (4 * 60, 40 * 60, 40 * 60),
-    2: (4 * 60, 80 * 60, 80 * 60),
-    3: (4 * 60, 120 * 60, 120 * 60),
-    4: (8 * 60, 160 * 60, 160 * 60),
-    5: (12 * 60, 200 * 60, 200 * 60),
-    6: (16 * 60, 240 * 60, 240 * 60),
-    7: (28 * 60, 280 * 60, 320 * 60)}
+    '128e-2a-15s': (4 * 60, 40 * 60, 40 * 60),
+    '64e-4a-30s': (4 * 60, 80 * 60, 80 * 60),
+    '32e-8a-60s': (4 * 60, 120 * 60, 120 * 60),
+    '16e-16a-90s': (8 * 60, 160 * 60, 160 * 60),
+    '8e-32a-150s': (12 * 60, 200 * 60, 200 * 60),
+    '4e-64a-240s': (16 * 60, 240 * 60, 240 * 60),
+    '2e-128a-360s': (28 * 60, 280 * 60, 320 * 60),
+    '8e-32a-1m': (4 * 60, 120 * 60, 120 * 60),
+    '8e-32c-1m': (4 * 60, 20 * 60, 20 * 60),
+    '8e-32a-2m': (8 * 60, 120 * 60, 120 * 60),
+    '8e-32a-3m': (12 * 60, 120 * 60, 120 * 60),
+    '8e-64a-4m': (16 * 60, 120 * 60, 120 * 60),
+    '8e-128a-5m': (20 * 60, 20 * 60, 120 * 60)}
 
 N_EPOCHS_MAP = {k: tv[-1] // SECONDS_PER_EPOCH for k, tv in TIME_MILESTONE_MAP.items()}
 
@@ -258,7 +262,7 @@ UPDATE_MILESTONE_MAP = {
     k: tuple([v * N_UPDATES_PER_EPOCH // SECONDS_PER_EPOCH for v in tv])
     for k, tv in TIME_MILESTONE_MAP.items()}
 
-WEIGHT_DECAY = 1e-2
+WEIGHT_DECAY = 1e-4
 VALUE_WEIGHT = 1.
 AUX_WEIGHT = 1e-2
 ENT_WEIGHT_MILESTONES = (1e-2, 1e-3)

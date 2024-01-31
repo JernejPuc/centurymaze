@@ -14,7 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from discit.accel import capture_graph
 from discit.data import LoadedDataset, SideLoadingDataset
-from discit.optim import NAdamW, PlateauScheduler
+from discit.optim import NAdamW, AnnealingScheduler
 from discit.track import CheckpointTracker
 
 import config as cfg
@@ -51,13 +51,13 @@ class Trainer:
         self.ckpter = CheckpointTracker(model_name, cfg.DATA_DIR, device, rng_seed)
 
         self.model = VisNet()
-        self.optimiser = NAdamW(self.model.parameters(), lr=args.lr_init, weight_decay=1e-2, device=device)
-        self.ckpter.load_model(self.model, self.optimiser)
+        self.optimizer = NAdamW(self.model.parameters(), lr=args.lr_max, weight_decay=1e-2, device=device)
+        self.ckpter.load_model(self.model, self.optimizer)
 
-        self.scheduler = PlateauScheduler(
-            self.optimiser,
+        self.scheduler = AnnealingScheduler(
+            self.optimizer,
             step_milestones=[lr_main_start_epoch, lr_main_end_epoch, self.n_epochs],
-            lr_milestones=[args.lr_init, args.lr_max, args.lr_final],
+            lr_div_factors=[args.lr_max/args.lr_init, args.lr_max/args.lr_final],
             starting_step=self.ckpter.meta['update_step'])
 
         # Logging
@@ -91,11 +91,11 @@ class Trainer:
             ref_batches = self.dataset.data[:batch_size*4].to(device).chunk(4)
 
             for batch in ref_batches[:3]:
-                self.optimiser.zero_grad(set_to_none=True)
+                self.optimizer.zero_grad(set_to_none=True)
                 self.update(batch)
 
             # Capture computational graph
-            self.optimiser.zero_grad(set_to_none=True)
+            self.optimizer.zero_grad(set_to_none=True)
 
             self.update, self.graph = capture_graph(
                 self.update,
@@ -129,7 +129,7 @@ class Trainer:
                     batch = batch.flip(-1)
 
                 if self.graph is None:
-                    self.optimiser.zero_grad()
+                    self.optimizer.zero_grad()
 
                 self.update(batch)
 
@@ -220,7 +220,7 @@ class Trainer:
         loss = dep_mse + clr_fce + typ_fce
         loss.backward()
 
-        self.optimiser.step()
+        self.optimizer.step()
 
         # Stats for logging
         with torch.no_grad():
@@ -713,17 +713,17 @@ class Student:
         self.ckpter = CheckpointTracker(model_name, cfg.DATA_DIR, device, rng_seed)
 
         self.model = VisNet()
-        self.optimiser = NAdamW(self.model.parameters(), lr=args.lr_init, weight_decay=1e-2, device=device)
+        self.optimizer = NAdamW(self.model.parameters(), lr=args.lr_max, weight_decay=1e-2, device=device)
 
         self.model.load_state_dict(
             torch.load(os.path.join(cfg.DATA_DIR, file_name[:-13] + '_stud.pt'), map_location=device))
 
-        self.ckpter.load_model(self.model, self.optimiser)
+        self.ckpter.load_model(self.model, self.optimizer)
 
-        self.scheduler = PlateauScheduler(
-            self.optimiser,
+        self.scheduler = AnnealingScheduler(
+            self.optimizer,
             step_milestones=[lr_main_start_epoch, lr_main_end_epoch, self.n_epochs],
-            lr_milestones=[args.lr_init, args.lr_max, args.lr_final],
+            lr_div_factors=[args.lr_max/args.lr_init, args.lr_max/args.lr_final],
             starting_step=self.ckpter.meta['update_step'])
 
         # Logging
@@ -760,11 +760,11 @@ class Student:
             ref_batches = self.dataset.data[:batch_size*4].to(device).chunk(4)
 
             for batch in ref_batches[:3]:
-                self.optimiser.zero_grad(set_to_none=True)
+                self.optimizer.zero_grad(set_to_none=True)
                 self.update(batch)
 
             # Capture computational graph
-            self.optimiser.zero_grad(set_to_none=True)
+            self.optimizer.zero_grad(set_to_none=True)
 
             self.update, self.graph = capture_graph(
                 self.update,
@@ -794,7 +794,7 @@ class Student:
                 self.print_progress(progress, remaining_time, epoch_step, iter_step)
 
                 if self.graph is None:
-                    self.optimiser.zero_grad()
+                    self.optimizer.zero_grad()
 
                 self.update(batch)
 
@@ -888,7 +888,7 @@ class Student:
         loss = dep_mse + clr_fce + typ_fce + dep_mse_t + clr_fce_t + typ_fce_t
         loss.backward()
 
-        self.optimiser.step()
+        self.optimizer.step()
 
         # Stats for logging
         with torch.no_grad():
