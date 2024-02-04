@@ -175,7 +175,7 @@ class VisNet(Module):
 class SpaEncoder(Module):
     """Conv. encoder for processing global state information in spatial form."""
 
-    ENC_SIZE = 160
+    ENC_SIZE = 128
 
     def __init__(self):
         super().__init__()
@@ -232,29 +232,34 @@ class Policy(Module):
     LONG_MEM_HALF_LIFE = 60 * cfg.STEPS_PER_SECOND
     MAX_MEM_HORIZON = 300 * cfg.STEPS_PER_SECOND
 
+    FEAT_CONDITIONAL = 3
     FEAT_TRAINED = 2
     FEAT_EXTERNAL = 1
     FEAT_DISABLED = 0
 
-    def __init__(self, com_state: int, guide_state: int, com_bias: bool):
+    def __init__(self, com_state: int, guide_state: int, com_bias: bool, n_agents_per_env: int, n_envs: int):
         super().__init__()
 
         self.com_state = com_state
         self.guide_state = guide_state
         self.com_bias = com_bias
 
-        self.input_sizes = (
-            VisEncoder.ENC_SIZE + cfg.OBS_VEC_SIZE + cfg.AUX_VAL_SPLIT[0],
-            cfg.AUX_VAL_SPLIT[1],
-            cfg.META_VAL_SIZE)
+        self.n_bots = n_agents_per_env
+        self.n_envs = n_envs
+        self.n_all_bots = n_agents_per_env * n_envs
+
+        self.input_sizes = (VisEncoder.ENC_SIZE + cfg.OBS_VEC_SIZE, cfg.AUX_VAL_SIZE, cfg.META_VAL_SIZE)
 
         trq_values = torch.tensor(cfg.ACT_DOF_MODES_BASE)
         clr_values = torch.tensor(cfg.RCVR_CLR_CLASSES)
-
         self.trq_values = nn.Parameter(trq_values, requires_grad=False)
         self.clr_values = nn.Parameter(clr_values, requires_grad=False)
         self.out_values = (self.trq_values, self.clr_values)
         self.output_sizes = (len(trq_values), len(clr_values))
+
+        trql_mask = torch.tensor((cfg.ACT_DOF_MOTION_MASK,), dtype=torch.float32)
+        self.trql_mask = nn.Parameter(trql_mask, requires_grad=False)
+        self.trql_bias = nn.Parameter(torch.tensor(-20.), requires_grad=False)
 
         coml_silent = torch.full((1, len(clr_values)), -20.)
         coml_silent[:, 0] = 0.
@@ -262,15 +267,17 @@ class Policy(Module):
 
         self.activ = nn.Tanh()
 
-        # E + 94 + 10 -> 320
-        self.fcin = nn.Linear(self.input_sizes[0], 320)
+        # E + 94 + 46|0 -> 320
+        self.fcin = nn.Linear(
+            self.input_sizes[0]+(cfg.AUX_VAL_SIZE if guide_state in (self.FEAT_EXTERNAL, self.FEAT_CONDITIONAL) else 0),
+            320)
 
         # 320 + Mc|Mm -> Mm|Mc
         self.rnn_m = nn.GRUCell(320 + self.COM_MEM_SIZE, self.MOT_MEM_SIZE)
         self.rnn_c = nn.GRUCell(320 + self.MOT_MEM_SIZE, self.COM_MEM_SIZE)
 
         # M -> A
-        self.fcaux = nn.Linear(self.MEM_SIZE, cfg.AUX_VAL_SPLIT[1])
+        self.fcaux = nn.Linear(self.MEM_SIZE, cfg.AUX_VAL_SIZE)
 
         # Mm|Mc -> 5|11
         self.fcout_m = nn.Linear(self.MOT_MEM_SIZE, self.output_sizes[0])
@@ -324,19 +331,30 @@ class Policy(Module):
                 rnn.bias_hh[mem_size:-mem_size] = horizons.log_()
 
     def forward(self, x: Tensor, memp: Tensor, detach: bool) -> 'tuple[Tensor, ...]':
-        x, aux_pos, heur_com_idx = x.split(self.input_sizes, dim=-1)
+        x, x_aux, heur_com_idx = x.split(self.input_sizes, dim=-1)
         mem_m, mem_c = memp.split(self.mem_sizes, dim=-1)
+        speaker_mask = x[:, cfg.OBS_ROLE_SLICE]
 
         # Process observations
+        if self.guide_state == self.FEAT_CONDITIONAL:
+            obj_in_frame, obj_dirprox, obj_found = x_aux.split(cfg.AUX_VAL_SPLIT, dim=-1)
+            obj_dirprox = obj_dirprox.reshape(-1, cfg.N_DIM_POS, cfg.N_OBJ_COLOURS) * obj_found.unsqueeze(1)
+            obj_dirprox = obj_dirprox.flatten(1)
+
+            x = torch.cat((x, obj_in_frame, obj_dirprox, obj_found), dim=-1)
+
+        elif self.guide_state == self.FEAT_EXTERNAL:
+            x = torch.cat((x, x_aux), dim=-1)
+
         x = self.activ(self.fcin(x))
 
         # Update com. memory/state and output
-        if self.com_state == self.FEAT_TRAINED:
+        if self.com_state >= self.FEAT_TRAINED:
             mem_c = self.rnn_c(torch.cat((x, mem_m.detach()), dim=-1), mem_c)
             clr_logits = self.fcout_c(mem_c)
 
             # Detach grads. from non-speakers
-            clr_logits = torch.lerp(clr_logits.detach(), clr_logits, x[:, cfg.OBS_ROLE_SLICE])
+            clr_logits = torch.lerp(clr_logits.detach(), clr_logits, speaker_mask)
 
         # Override - heuristic
         # Obj. colour if seen and near, white if obstructed, black otherwise
@@ -345,21 +363,42 @@ class Policy(Module):
 
         # Override - silent
         else:
-            mem_c = self.mem_initial.expand(len(x), -1)
             clr_logits = self.coml_initial.expand(len(x), -1)
 
         # Update mot. memory/state and output
         mem_m = self.rnn_m(torch.cat((x, mem_c.detach()), dim=-1), mem_m)
         trq_logits = self.fcout_m(mem_m)
 
+        # Freeze translation for speakers when com. training is emphasised
+        if self.com_state == self.FEAT_CONDITIONAL:
+            trq_logits = torch.lerp(trq_logits, self.trql_bias, self.trql_mask * speaker_mask)
+
         memp = torch.cat((mem_m, mem_c), dim=-1)
         x = torch.cat((trq_logits, clr_logits), dim=-1)
 
         # Auxiliary obj. estimates
-        a = self.fcaux(GradScaler.apply(memp, 0.01) if self.guide_state and not detach else memp.detach())
+        if self.guide_state == self.FEAT_TRAINED:
+            a = self.fcaux(memp.detach() if detach else GradScaler.apply(memp, 0.01))
+            a_01, a_dir = a.split((cfg.AUX_VAL_SIZE - 2*cfg.N_OBJ_COLOURS, 2*cfg.N_OBJ_COLOURS), dim=-1)
 
-        # Detach error grads. for unfound objs.
-        a = torch.where(aux_pos == 0., 0., a)
+            a_01 = a_01.sigmoid()
+            a_in_frame, a_prox, a_found = a_01.split((cfg.N_OBJ_COLOURS+1,) + (cfg.N_OBJ_COLOURS,)*2, dim=-1)
+
+            a_dir = a_dir.reshape(len(x), 2, -1)
+            a_dir = a_dir / torch.linalg.norm(a_dir, dim=1, keepdim=True)
+
+            # Detach error grads. for unfound objs.
+            obj_found = x_aux[:, -cfg.AUX_VAL_SPLIT[-1]:]
+            any_found = obj_found.reshape(self.n_envs, self.n_bots, -1).any(1)
+            any_found = any_found.repeat_interleave(self.n_bots, dim=0, output_size=self.n_all_bots)
+
+            a_dirprox = torch.cat((a_dir, a_prox.unsqueeze(1)), dim=1) * any_found.unsqueeze(1)
+            a_dirprox = a_dirprox.flatten(1)
+
+            a = torch.cat((a_in_frame, a_dirprox, a_found), dim=-1)
+
+        else:
+            a = self.fcaux(memp.detach())
 
         return x, a, memp
 
@@ -422,10 +461,10 @@ class Valuator(Module):
 
         self.activ = nn.Tanh()
 
-        # 20x20x16 -> 160
+        # 20x20x16 -> 128
         self.spaencoder = SpaEncoder()
 
-        # 112 + 160 + Mp -> 512
+        # 122 + 128 + Mp -> 512
         self.fcin = nn.Linear(cfg.STATE_VEC_SIZE + SpaEncoder.ENC_SIZE + Policy.MEM_SIZE, 512)
 
         # 512 -> M
@@ -503,7 +542,7 @@ class ActorCritic(ActorCriticTemplate):
         super().__init__()
 
         self.visencoder = VisEncoder()
-        self.policy = Policy(com_state, guide_state, com_bias)
+        self.policy = Policy(com_state, guide_state, com_bias, n_agents_per_env, n_envs)
         self.valuator = Valuator(n_agents_per_env, n_envs)
 
         for param in self.visencoder.parameters():

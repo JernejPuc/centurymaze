@@ -42,6 +42,7 @@ TIME_SCALE = 1. / 60.
 
 # Max. env. distances
 MAX_ENV_WIDTH = cfg.LEVEL_PARAMS[7]['env_width']
+MAX_MIN_OBJ_SPACING = MAX_ENV_WIDTH / 3.
 MAX_ENV_HALFWIDTH = MAX_ENV_WIDTH / 2.
 MAX_IMG_DEPTH = MAX_ENV_WIDTH * 2 / 3.
 ENV_DIAG_SPAN = np.floor(MAX_ENV_WIDTH * 2**0.5)
@@ -50,11 +51,14 @@ ENV_DIAG_SPAN = np.floor(MAX_ENV_WIDTH * 2**0.5)
 COLOURS = {clr_group: np.array(clrs) for clr_group, clrs in cfg.COLOURS.items()}
 
 # Reward params.
-COMPLETION_WEIGHT = 2.
-EXPLORATION_WEIGHT = 0.05  # COMPLETION_WEIGHT / (cfg.LEVEL_PARAMS[7]['n_grid_segments']**2 / 10)
+MAX_DELTA_PER_STEP = 0.3
+DELTA_WEIGHT = 0.025        # MAX_DELTA_PER_STEP / MAX_MIN_OBJ_SPACING
 
-COLLISION_WEIGHT = 2. * EXPLORATION_WEIGHT
-PROXIMITY_WEIGHT = 2. * COLLISION_WEIGHT
+COMPLETION_WEIGHT = 1.      # DELTA_WEIGHT * STEPS_PER_SECOND * 10
+EXPLORATION_WEIGHT = 0.02   # COMPLETION_WEIGHT / (LEVEL_PARAMS[7]['n_grid_segments']**2 / LEVEL_PARAMS[7]['n_objects'])
+
+COLLISION_WEIGHT = -0.01    # EXPLORATION_WEIGHT / -2.
+PROXIMITY_WEIGHT = -0.02    # 2. * COLLISION_WEIGHT
 
 
 class BasicInterface:
@@ -165,8 +169,7 @@ class MazeTask:
         uniform_task_sampling: bool = False,
         distribute_env_resets: bool = False,
         full_env_regeneration: bool = False,
-        long_range_obj_signal: bool = False,
-        use_team_reward: bool = True,
+        obj_signal_strength: float = 0.,
         num_speakers_per_env: int = None,
         device: str = 'cuda'
     ):
@@ -181,8 +184,7 @@ class MazeTask:
         self.uniform_task_sampling = uniform_task_sampling
         self.distribute_env_resets = distribute_env_resets
         self.full_env_regeneration = full_env_regeneration
-        self.long_range_obj_signal = long_range_obj_signal
-        self.use_team_reward = use_team_reward
+        self.obj_signal_strength = obj_signal_strength
         self.n_speakers = sim.n_bots if num_speakers_per_env is None else min(sim.n_bots, num_speakers_per_env)
 
         self.rst_env_indices: 'list[int]' = []
@@ -326,7 +328,7 @@ class MazeTask:
         self.speaker_mask = torch.zeros(sim.n_bots, dtype=torch.bool, device=device)
         self.speaker_mask[:self.n_speakers] = True
         self.speaker_mask = self.speaker_mask.repeat(sim.n_envs)
-        self.speaker_mask_f = self.speaker_mask.unsqueeze(-1).float()
+        self.speaker_mask_f = self.speaker_mask.float()
 
         # Landmarks/objectives
         # ExLxL -> NxLxL
@@ -644,9 +646,10 @@ class MazeTask:
                 self.interface.sync_redraw(after_eval=False)
 
         # Reset environments
-        # NOTE: Resets and final rewards are evaluated one step ahead
-        # to ensure that setter fns., followed by a sim. step, take effect before getting new observations,
-        # at the cost of viewing the final actions taken in flagged environments as arbitrary (which they generally are)
+        # NOTE: Resets are one step delayed to ensure that setter fns.,
+        # followed by a sim. step, take effect before getting new observations,
+        # at the cost of viewing the final actions taken in flagged environments
+        # as arbitrary (which they generally are)
         self.eval_reset()
 
         # Async update tensors and colours, step physics
@@ -790,6 +793,8 @@ class MazeTask:
 
     def eval_state(self, act_trq: Tensor, act_clr_idx: Tensor) -> 'tuple[Tensor, ...]':
         n_envs, n_bots, n_all_bots = self.sim.n_envs, self.sim.n_bots, self.sim.n_all_bots
+        n_bots_per_obj = n_bots / self.sim.n_objects
+
         loc_ori = self.bot_ori * self.quat_inv
 
         # Get distance and direction to goal objective
@@ -829,7 +834,7 @@ class MazeTask:
         self.obj_done_ctr += goal_done_mask_f.reshape(n_envs, n_bots, -1).sum(1)
 
         scaled_run_time = self.env_run_times.clip(MIN_TASK_DURATION) / THROUGHPUT_WINDOW
-        obj_throughput = self.obj_done_ctr / scaled_run_time.unsqueeze(-1) * (self.sim.n_objects / n_bots)
+        obj_throughput = self.obj_done_ctr / scaled_run_time.unsqueeze(-1) / n_bots_per_obj
 
         avg_done_ctr = self.bot_done_ctr.reshape(n_envs, -1).mean(-1)
         avg_throughput = avg_done_ctr / scaled_run_time
@@ -844,7 +849,7 @@ class MazeTask:
         bot_rst_mask = rst_env_mask.repeat_interleave(n_bots, output_size=n_all_bots)
 
         # Get observations
-        obj_in_frame, obj_diff, obj_dist, obj_prox, obj_masked_pos = self.get_obj_data(loc_ori)
+        obj_in_frame, obj_diff, obj_dir, obj_dist, obj_prox = self.get_obj_data(loc_ori)
         near_src_ahead, src_dist, obs_sound = self.get_sound_data(obj_diff, obj_dist, act_clr_idx)
         min_src_dist = src_dist.min(dim=-1)[0]
 
@@ -863,22 +868,25 @@ class MazeTask:
         total_exploration = self.cell_exploration.reshape(n_envs, n_bots, n_segments, n_segments).mean(1, keepdim=True)
         obs_spa = torch.cat((self.cell_state, total_exploration), dim=1)
 
-        goal_delta = torch.where(self.last_path_len == 0., 0., self.last_path_len - self.goal_path_len)
-
         # Get rewards
-        if self.use_team_reward:
-            main_reward = self.bot_rst_mask * self.avg_done_ctr.repeat_interleave(n_bots, output_size=n_all_bots)
+        goal_delta = torch.where(self.last_path_len == 0., 0., self.last_path_len - self.goal_path_len)
+        goal_delta_scaled = goal_delta / MAX_MIN_OBJ_SPACING
 
-        else:
-            main_reward = bot_done_mask_f * COMPLETION_WEIGHT + new_cell_found * EXPLORATION_WEIGHT
+        avg_delta_scaled = goal_delta_scaled.reshape(n_envs, n_bots).mean(-1)
+        avg_delta_scaled *= max(1., n_bots / max(1, n_bots_per_obj * self.n_speakers - self.n_speakers))
+        avg_delta_scaled = avg_delta_scaled.repeat_interleave(n_bots, output_size=n_all_bots)
 
         colliding = self.net_contacts[self.collider_indices, :2].abs().sum(-1) != 0.
         near_src_prox_sum = (1. - src_dist / (2.*cfg.BOT_WIDTH)).clip(0.).sum(-1)
 
-        # If envs. have reset, suppress rewards for incorrect (unbelonging) state/obs.
-        aux_reward = ~self.bot_rst_mask * (colliding * COLLISION_WEIGHT + near_src_prox_sum * PROXIMITY_WEIGHT)
+        aux_reward = bot_done_mask_f * COMPLETION_WEIGHT + new_cell_found * EXPLORATION_WEIGHT
+        aux_penalty = colliding * COLLISION_WEIGHT + near_src_prox_sum * PROXIMITY_WEIGHT
 
-        reward = torch.stack((main_reward, -aux_reward), dim=-1)
+        long_term_reward = torch.lerp(goal_delta_scaled, avg_delta_scaled, self.speaker_mask_f)
+        short_term_reward = torch.lerp(aux_reward + aux_penalty, aux_penalty, self.speaker_mask_f)
+
+        # If envs. have reset, suppress rewards for incorrect (unbelonging) state/obs.
+        reward = ~self.bot_rst_mask.unsqueeze(-1) * torch.stack((long_term_reward, short_term_reward), dim=-1)
 
         # Assemble vec. inputs
         env_stats = torch.stack((
@@ -899,7 +907,7 @@ class MazeTask:
         ), dim=-1).repeat_interleave(n_bots, dim=0, output_size=n_all_bots)
 
         obs_vec = torch.cat((
-            # Main vec. obs. (94 = 21+12+61)
+            # Main vec. obs. (94 = 21+12+61); for the actors
             # DOF, IMU, AHRS, & GPS (4+9+4+2+2)
             act_trq,
             *obs_imu,
@@ -908,16 +916,16 @@ class MazeTask:
             bot_vel[:, :2],
             # Task specification (9+3)
             goal_mask_f,
-            self.speaker_mask_f,
+            self.speaker_mask_f.unsqueeze(-1),
             self.bot_time_at_goal.unsqueeze(-1),
             throughput.unsqueeze(-1),
             # Communication (11+50)
             act_clr_mask_f,
             obs_sound,
-            # Hidden state (68 = 37+11+4+16); mainly intended for the critic for better value estimation
-            # Aux. targets, incl. obj. in frame, obj. masked coords., & obj. proximity (1+4*9)
+            # Hidden state (78 = 46+11+4+17); mainly intended for the critic for better value estimation
+            # Aux. targets, incl. obj. in frame, dir., proximity, & if found (1+5*9)
             goal_in_frame.unsqueeze(-1).float(),
-            self.zero_column.expand(-1, 4*cfg.N_OBJ_COLOURS),
+            self.zero_column.expand(-1, 5*cfg.N_OBJ_COLOURS),
             # Task state & progress (11)
             goal_dir,
             goal_proximity.unsqueeze(-1),
@@ -932,7 +940,8 @@ class MazeTask:
             near_src_ahead.unsqueeze(-1).float(),
             near_src_prox_sum.unsqueeze(-1),
             colliding.unsqueeze(-1),
-            # Bot avg. & common env. stats (16)
+            # Bot avg. & common env. stats (1+16)
+            avg_delta_scaled.unsqueeze(-1),
             env_stats,
             # Other (1); mainly intended for a communication heuristic
             heur_clr_idx.unsqueeze(-1).float()
@@ -940,13 +949,15 @@ class MazeTask:
 
         # Set according to original indices for all objectives
         obj_in_frame = obj_in_frame.float()
+        obj_found = self.obj_found.float()
 
         for i in range(self.sim.n_objects):
             obj_idx = self.obj_idx_map[:, i]
-            obs_vec[self.row_idcs, obj_idx + cfg.OBS_VEC_SIZE] = obj_in_frame[:, i]
-            obs_vec[self.row_idcs, obj_idx + (cfg.OBS_VEC_SIZE + cfg.N_OBJ_COLOURS)] = obj_masked_pos[:, i, 0]
-            obs_vec[self.row_idcs, obj_idx + (cfg.OBS_VEC_SIZE + 2*cfg.N_OBJ_COLOURS)] = obj_masked_pos[:, i, 1]
-            obs_vec[self.row_idcs, obj_idx + (cfg.OBS_VEC_SIZE + 3*cfg.N_OBJ_COLOURS)] = obj_prox[:, i]
+            obs_vec[self.row_idcs, obj_idx + cfg.AUX_VAL_DELIMS[0]] = obj_in_frame[:, i]
+            obs_vec[self.row_idcs, obj_idx + cfg.AUX_VAL_DELIMS[1]] = obj_dir[:, i, 0]
+            obs_vec[self.row_idcs, obj_idx + cfg.AUX_VAL_DELIMS[2]] = obj_dir[:, i, 1]
+            obs_vec[self.row_idcs, obj_idx + cfg.AUX_VAL_DELIMS[3]] = obj_prox[:, i]
+            obs_vec[self.row_idcs, obj_idx + cfg.AUX_VAL_DELIMS[4]] = obj_found[:, i]
 
         self.bot_old_vel.copy_(bot_vel)
         self.bot_rst_mask.copy_(bot_rst_mask)
@@ -962,6 +973,10 @@ class MazeTask:
         # NxLx2, Nx2 -> NxLx2 - Nx1x2 -> NxLx2
         obj_diff = self.obj_pos - self.bot_pos[:, None]
 
+        # NxLx2 -> NxL
+        obj_dist = torch.linalg.norm(obj_diff, dim=-1)
+        obj_prox = 1. - obj_dist / ENV_DIAG_SPAN
+
         # NxLx2 -> NxLx3
         zero_padding = self.zero_column.unsqueeze(1).expand(-1, n_objects, -1)
         obj_diff3 = torch.cat((obj_diff, zero_padding), dim=-1)
@@ -976,19 +991,12 @@ class MazeTask:
 
         # NxL, N*L -> NxL
         obj_in_frame = self.obj_in_sight & obj_in_fov.reshape(self.sim.n_all_bots, n_objects)
+        self.obj_found |= obj_in_frame & (obj_dist < 3*cfg.GOAL_RADIUS)
 
-        # NxLx2 -> NxL
-        obj_dist = torch.linalg.norm(obj_diff, dim=-1)
-        obj_prox = 1. - obj_dist / ENV_DIAG_SPAN
+        # (N*L)x3 -> NxLx2
+        obj_dir = loc_diff3.reshape(self.sim.n_all_bots, n_objects, 3)[..., :2] / obj_dist.unsqueeze(-1)
 
-        # NxL, NxLx2 -> NxLx2
-        obj_masked_pos = self.obj_pos / MAX_ENV_HALFWIDTH
-
-        if not self.long_range_obj_signal:
-            self.obj_found |= obj_in_frame & (obj_dist < 3*cfg.GOAL_RADIUS)
-            obj_masked_pos = torch.where(self.obj_found.unsqueeze(-1), obj_masked_pos, 0.)
-
-        return obj_in_frame, obj_diff, obj_dist, obj_prox, obj_masked_pos
+        return obj_in_frame, obj_diff, obj_dir, obj_dist, obj_prox
 
     def get_sound_data(self, obj_diff: Tensor, obj_dist: Tensor, act_clr_idx: Tensor) -> 'tuple[Tensor, ...]':
         """
@@ -1010,13 +1018,13 @@ class MazeTask:
         bot_dist = torch.where(bot_dist == 0., torch.inf, bot_dist)
 
         # Suppress obj. signal beyond noise threshold
-        if not self.long_range_obj_signal:
+        if self.obj_signal_strength > 0.1:
             obj_dist = torch.where(obj_dist > 2*cfg.GOAL_RADIUS, torch.inf, obj_dist)
 
         # Proximity weights via clipped inverse prop. characteristic
         bot_wsignal_strength = 0.1 / bot_dist.clip(cfg.BOT_RADIUS)
         bot_csignal_strength = 1. / bot_dist.clip(cfg.BOT_RADIUS)
-        obj_csignal_strength = (1. if self.long_range_obj_signal else 0.05) / obj_dist.clip(cfg.OBJECT_RADIUS)
+        obj_csignal_strength = self.obj_signal_strength / obj_dist.clip(cfg.OBJECT_RADIUS)
 
         # Angle-range weights
         # NxBx2, NxLx2 -> Nx(B+L)x2

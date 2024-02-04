@@ -178,10 +178,10 @@ class Interface(BasicInterface):
             return
 
         obs_vec = tmp[0 if len(tmp[0].shape) == 2 else 1]
-        obs_vec = obs_vec[self.env_idx*self.sim.n_bots:(self.env_idx+1)*self.sim.n_bots, 27:40].cpu()
+        obs_vec = obs_vec[self.env_idx*self.sim.n_bots:(self.env_idx+1)*self.sim.n_bots, 94:143].cpu()
 
-        obj_in_sight = obs_vec[:, :9].any(-1, keepdim=True)
-        goal_in_sight = obs_vec[:, 9:10]
+        obj_in_sight = obs_vec[:, 1:10].any(-1, keepdim=True)
+        goal_in_sight = obs_vec[:, :1]
 
         # TODO: Show the agents' internal dir. estimation
         # if self.prev_reconstruct ...
@@ -289,28 +289,28 @@ class Interface(BasicInterface):
             f'Goal com. chn.  |                Front: {goal_com[0]: .2f}\n'
             f'                | Left:  {goal_com[3]: .2f} | Back:  {goal_com[2]: .2f} | Right: {goal_com[1]: .2f}\n'
             f'Goal com. dir.  | Front: {goal_com[0] - goal_com[2]: .2f} | Left: {goal_com[3] - goal_com[1]: .2f}\n'
-            f'Air direction   | Front: {obs_vec[131]: .2f} | Left: {obs_vec[132]: .2f}\n'
-            f'A*  direction   | Front: {obs_vec[134]: .2f} | Left: {obs_vec[135]: .2f}\n'
-            f'Air proximity   |        {obs_vec[133]: .2f}\n'
-            f'A*  proximity   |        {obs_vec[136]: .2f}\n'
-            f'Goal position   | X:     {obs_vec[137]: .2f} | Y:    {obs_vec[138]: .2f}\n'
+            f'Air direction   | Front: {obs_vec[140]: .2f} | Left: {obs_vec[141]: .2f}\n'
+            f'A*  direction   | Front: {obs_vec[143]: .2f} | Left: {obs_vec[144]: .2f}\n'
+            f'Air proximity   |        {obs_vec[142]: .2f}\n'
+            f'A*  proximity   |        {obs_vec[145]: .2f}\n'
+            f'Goal position   | X:     {obs_vec[146]: .2f} | Y:    {obs_vec[147]: .2f}\n'
             f'Goal in sight   | {"TRUE" if obs_vec[94] else "FALSE"}\n'
             f'Obj. in sight   | {"|".join(" X " if obj_in_frame else " _ " for obj_in_frame in obs_vec[95:104])}\n'
             f'Obj. proximity  | {"|".join(f"{obj_prox:.1f}" for obj_prox in 10*obs_vec[122:131])}\n\n'
 
             'INTERACTION\n'
-            f'Contact flag    | {"TRUE" if obs_vec[149] else "FALSE"}\n\n'
+            f'Contact flag    | {"TRUE" if obs_vec[154] else "FALSE"}\n\n'
 
             'TASK\n'
-            f'Spec. index     | {np.argmax(obs_vec[21:30])}\n'
+            f'Goal spec.      | {"|".join(" X " if spec_flag else " _ " for spec_flag in 10*obs_vec[21:30])}\n'
             f'Speaking role   | {"TRUE" if obs_vec[30] else "FALSE"}\n'
             f'Time at goal    | {obs_vec[31]: .2f}s\n'
             f'Own throughput  | {obs_vec[32]: .2f} (per 30s)\n'
-            f'Avg. throughput | {obs_vec[151]: .2f} (per bot per 30s)\n'
-            f'Time to ep. end | {obs_vec[161] / TIME_SCALE: .2f}s\n'
-            f'Time on task    | {obs_vec[141] / TIME_SCALE: .2f}s\n'
-            f'New/done tasks  | {obs_vec[140]: .0f}\n'
-            f'Dist. diff.     | {obs_vec[139]: .2f}m\n\n'
+            f'Avg. throughput | {obs_vec[161]: .2f} (per bot per 30s)\n'
+            f'Time to ep. end | {obs_vec[170] / TIME_SCALE: .2f}s\n'
+            f'Time on task    | {obs_vec[150] / TIME_SCALE: .2f}s\n'
+            f'New/done tasks  | {obs_vec[149]: .0f}\n'
+            f'Dist. diff.     | {obs_vec[148]: .2f}m\n\n'
 
             'OBSERVATION\n'
             f'Avg. img. chan. | R: {obs_img[0]: .2f} | G: {obs_img[1]: .2f} | B: {obs_img[2]: .2f}\n'
@@ -579,8 +579,8 @@ class Session(MazeTask):
         {'name': '--com_state', 'type': int, 'default': Policy.FEAT_TRAINED, 'help': 'St. of inter-ag. communication.'},
         {'name': '--guide_state', 'type': int, 'default': Policy.FEAT_DISABLED, 'help': 'St. of directional guidance.'},
         {'name': '--com_bias', 'type': int, 'default': 0, 'help': 'Option to bias twd. unassociated com.'},
+        {'name': '--com_ref', 'type': float, 'default': 0., 'help': 'Option to have objs. emit a const. signal.'},
         {'name': '--prob_actor', 'type': int, 'default': 1, 'help': 'Option to keep probabilistic inference.'},
-        {'name': '--team_reward', 'type': int, 'default': 1, 'help': 'Final group score instead of individ. rewards.'},
         {'name': '--rng_seed', 'type': int, 'default': 42, 'help': 'Seed for numpy and torch RNGs.'},
         {'name': '--schedule_key', 'type': str, 'default': '', 'help': 'Key of a training curriculum stage.'}]
 
@@ -600,15 +600,13 @@ class Session(MazeTask):
         self.prob_actor = bool(args.prob_actor)
 
         if not args.schedule_key:
-            self.schedule_key = '128e-2a-15s'
+            self.schedule_key = 'default'
 
         elif args.schedule_key not in cfg.TIME_MILESTONE_MAP:
             raise KeyError(f'Unknown schedule: {args.schedule_key}')
 
         else:
             self.schedule_key = args.schedule_key
-
-        self.frozen_actor = self.schedule_key.split('-')[1][-1] != 'a'
 
         self.ckpter = CheckpointTracker(
             args.model_name, cfg.DATA_DIR, args.sim_device, args.rng_seed,
@@ -641,8 +639,7 @@ class Session(MazeTask):
             uniform_task_sampling=self.ctrl_mode == self.CTRL_GEN,
             distribute_env_resets=self.ctrl_mode == self.CTRL_RL,
             full_env_regeneration=preset_path is None and args.regen,
-            long_range_obj_signal=args.guide_state == Policy.FEAT_EXTERNAL,
-            use_team_reward=bool(args.team_reward),
+            obj_signal_strength=args.com_ref,
             num_speakers_per_env=args.n_speakers if args.n_speakers >= 0 else None,
             device=args.sim_device)
 
@@ -745,14 +742,7 @@ class Session(MazeTask):
 
         model.to(self.ckpter.device)
         model.visencoder.load_state_dict(torch.load(encoder_path, map_location=self.ckpter.device))
-
-        if self.frozen_actor:
-            self.ckpter.load_model(model)
-            self.ckpter.optimizer = optimizer
-            model.valuator.random_init()
-
-        else:
-            self.ckpter.load_model(model, optimizer)
+        self.ckpter.load_model(model, optimizer)
 
         # Init. LR scheduler
         scheduler = AnnealingScheduler(
@@ -767,8 +757,8 @@ class Session(MazeTask):
 
         # Assemble discount factors wrt. different rewards
         gammas = (
-            0.5 ** (1. / (60 * self.steps_per_second)),     # Long-term (main) rewards: Half-life at 1 minute
-            0.5 ** (1. / (3 * self.steps_per_second)))      # Short-term (aux.) rewards: Half-life at 3 seconds
+            0.5 ** (1. / (60 * self.steps_per_second)),  # Long-term rewards: Half-life at 1 minute, gamma 0.997
+            0.5 ** (1. / (3 * self.steps_per_second)))   # Short-term rewards: Half-life at 3 seconds, gamma 0.944
 
         entropy_scheduler = CoeffScheduler(
             cfg.UPDATE_MILESTONE_MAP[self.schedule_key][-1],
@@ -791,7 +781,6 @@ class Session(MazeTask):
             cfg.N_ROLLOUTS_PER_EPOCH,
             cfg.N_AUX_ITERS_PER_EPOCH,
             gammas,
-            policy_weight=float(not self.frozen_actor),
             value_weight=cfg.VALUE_WEIGHT,
             aux_weight=cfg.AUX_WEIGHT,
             entropy_weight=entropy_scheduler,

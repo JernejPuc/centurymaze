@@ -25,50 +25,38 @@ for i in range(1, 8):
 
 
 # Curriculum
+AGENT_TYPE_CONFIGS = {
+    'basic': {'com_state': 0, 'guide_state': 3, 'com_bias': 0, 'com_ref': 0.05, 'com_rls_stage': None, 'n_speakers': 0},
+    'guide': {'com_state': 0, 'guide_state': 1, 'com_bias': 0, 'com_ref': 1., 'com_rls_stage': None, 'n_speakers': 0},
+    'heur': {'com_state': 1, 'guide_state': 3, 'com_bias': 0, 'com_ref': 0.05, 'com_rls_stage': None, 'n_speakers': -1},
+    'free': {'com_state': 2, 'guide_state': 3, 'com_bias': 1, 'com_ref': 0.05, 'com_rls_stage': None, 'n_speakers': -1},
+    'cond': {'com_state': 3, 'guide_state': 3, 'com_bias': 1, 'com_ref': 0.05, 'com_rls_stage': 4, 'n_speakers': ...}}
+
+N_ENVS = 8
+
 for seed in (0, 42, 100):
-    for agent_type in ('basic', 'prog', 'free', 'heur', 'guide'):
+    for agent_type, args in AGENT_TYPE_CONFIGS.items():
         cmd_seq = []
         model_name = ''
 
-        com_state = 2 if agent_type in ('prog', 'free') else (1 if agent_type == 'heur' else 0)
-        guide_state = 2 if agent_type == 'guide' else 0
-        com_bias = int(com_state == 2)
-        n_speakers = -1 if agent_type in ('free', 'heur') else 0
-        n_bots = 32
+        for stage, level in enumerate((5,)*5 + (6, 7, 7)):
+            n_bots = 2 ** level
+            n_speakers = 2 ** stage if args['n_speakers'] is ... else args['n_speakers']
+            com_state = 2 if args['com_rls_stage'] is not None and stage >= args['com_rls_stage'] else args['com_state']
+            guide_state, com_bias, com_ref = args['guide_state'], args['com_bias'], args['com_ref']
 
-        for stage, mode in zip([0]*2 + list(range(1, 9)), ['a', 'c'] + ['a']*8):
-            team_reward = int(stage > 0)
-
-            if stage == 6:
-                n_bots = 64
-
-            elif stage >= 7:
-                n_bots = 128
-
-            if agent_type == 'free' and not team_reward:
-                n_speakers = 0
-                guide_state = 1
-
-            elif agent_type == 'prog':
-                if team_reward:
-                    n_speakers = 2 ** (stage-1)
-
-                else:
-                    guide_state = 1
-
-            ep_duration = 60 + stage // 2 * 60
-            mul_duration = ep_duration / 360
-            schedule_key = f'8e-{n_bots}{mode}-{ep_duration//60}m'
+            ep_duration = 1 if stage < 4 else level - 3
+            mul_duration = ep_duration / (level - 3)
+            schedule_key = f'{N_ENVS}e-{n_bots}a-{ep_duration}m'
 
             transfer_name = model_name
             model_name = f'{agent_type}{seed}v{stage}_{schedule_key}'
 
             cmd_seq.append(
-                f'python src/mazebots/session.py --level 7 --n_envs 8 --n_bots {n_bots} --ctrl_mode 2 --headless 1 '
+                f'python src/mazebots/session.py --level {level} --n_envs {N_ENVS} --ctrl_mode 2 --headless 1 '
                 f'--model_name "{model_name}" --transfer_name "{transfer_name}" --rng_seed {seed} '
-                f'--n_speakers {n_speakers} --mul_duration {mul_duration} --team_reward {team_reward} '
-                f'--com_state {com_state} --guide_state {guide_state} --com_bias {com_bias} '
-                f'--schedule_key "{schedule_key}"')
+                f'--n_speakers {n_speakers} --mul_duration {mul_duration} --schedule_key "{schedule_key}" '
+                f'--com_state {com_state} --guide_state {guide_state} --com_bias {com_bias} --com_ref {com_ref}')
 
         CMD_PRESETS[f'curr_{agent_type}{seed}'] = cmd_seq
 

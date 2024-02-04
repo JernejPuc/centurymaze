@@ -29,7 +29,7 @@ LEVEL_PARAMS = {
         'n_graph_points': 16,
         'n_bots': 8,
         'n_objects': 4,
-        'ep_duration': 60,
+        'ep_duration': 50,
         'rng_seed': 5927},
     4: {
         'env_width': 12.6,
@@ -37,7 +37,7 @@ LEVEL_PARAMS = {
         'n_graph_points': 28,
         'n_bots': 16,
         'n_objects': 5,
-        'ep_duration': 90,
+        'ep_duration': 80,
         'rng_seed': 12},
     5: {
         'env_width': 18.0,
@@ -45,7 +45,7 @@ LEVEL_PARAMS = {
         'n_graph_points': 51,
         'n_bots': 32,
         'n_objects': 6,
-        'ep_duration': 150,
+        'ep_duration': 120,
         'rng_seed': 50},
     6: {
         'env_width': 25.2,
@@ -53,7 +53,7 @@ LEVEL_PARAMS = {
         'n_graph_points': 95,
         'n_bots': 64,
         'n_objects': 7,
-        'ep_duration': 240,
+        'ep_duration': 180,
         'rng_seed': 1},
     7: {
         'env_width': 36.0,
@@ -61,7 +61,7 @@ LEVEL_PARAMS = {
         'n_graph_points': 181,
         'n_bots': 128,
         'n_objects': 8,
-        'ep_duration': 360,
+        'ep_duration': 270,
         'rng_seed': 64578}}
 
 
@@ -183,26 +183,32 @@ ACT_DOF_MODES_BASE = [
     [-1., 1., -1., 1.],
     [1., -1., 1., -1.]]
 
-# 28 total:
-# 1 goal in frame, 9 obj. in frame, 2*9 obj. xy pos.
-AUX_VAL_SPLIT = (1 + N_OBJ_COLOURS, 2*N_OBJ_COLOURS)
+ACT_DOF_MOTION_MASK = [False, True, True, False, False]
+
+# 46 total:
+# 1 goal in frame, 9 obj. in frame, 3*9 obj. xy dir. & prox., 9 obj. found
+AUX_VAL_SPLIT = (1 + N_OBJ_COLOURS, N_DIM_POS*N_OBJ_COLOURS, N_OBJ_COLOURS)
 AUX_VAL_SIZE = sum(AUX_VAL_SPLIT)
-AUX_VAL_SLICE = slice(OBS_VEC_SIZE + AUX_VAL_SPLIT[0], OBS_VEC_SIZE + AUX_VAL_SIZE)
+AUX_VAL_SLICE = slice(OBS_VEC_SIZE, OBS_VEC_SIZE + AUX_VAL_SIZE)
+AUX_VAL_DELIMS = (OBS_VEC_SIZE + 1,)
+
+for i in range(AUX_VAL_SIZE // N_OBJ_COLOURS - 1):
+    AUX_VAL_DELIMS += (AUX_VAL_DELIMS[-1] + N_OBJ_COLOURS,)
 
 # 1 heuristic clr. index
 META_VAL_SIZE = 1
 
-# 16 total:
+# 17 total:
 # 1 avg. closest bot dist., 1 avg. vel. norm, 1 avg. goal delta, 1 avg. goal path len.,
-# 1 avg. time on task, 1 avg. throughput, 9 throughput per obj., 1 time until end of episode
-ENV_STAT_SIZE = 6 + N_OBJ_COLOURS + 1
+# 1 avg. time on task, 1 avg. path done, 1 avg. throughput, 9 throughput per obj., 1 time until end of episode
+ENV_STAT_SIZE = 7 + N_OBJ_COLOURS + 1
 
-# 112 total:
-# 44 obs., 28 aux. val., 9 obj. prox., 3 air xy dir. & prox., 3 a* path xy dir. & prox.,
+# 122 total:
+# 44 obs., 46 aux. val., 3 air xy dir. & prox., 3 a* path xy dir. & prox.,
 # 2 goal xy pos., # 1 own goal delta, 1 task completed, 1 time spent on task,
 # 1 cell found, 1 bot ahead, 1 near bot prox. sum, 1 colliding flag,
-# 16 env. stats.
-STATE_VEC_SIZE = OBS_LOC_SIZE + N_OBJ_COLOURS + AUX_VAL_SIZE + 2*N_DIM_POS + (N_DIM_POS-1) + 7 + ENV_STAT_SIZE
+# 17 env. stats.
+STATE_VEC_SIZE = OBS_LOC_SIZE + AUX_VAL_SIZE + 2*N_DIM_POS + (N_DIM_POS-1) + 7 + ENV_STAT_SIZE
 STATE_VEC_SLICE = slice(OBS_VEC_SIZE, -META_VAL_SIZE)
 
 # 16 total:
@@ -240,21 +246,13 @@ CKPT_EPOCH_INTERVAL = LOG_EPOCH_INTERVAL
 # 1 branch per half virtual hour, 48 per day, 336 per week
 BRANCH_EPOCH_INTERVAL = 30 * 60 // SECONDS_PER_EPOCH
 
-# 4-30 virtual minutes to warm up, 1-5 hours to train per stage, 10-24 hours total per agent
+# 5-20 virtual minutes to warm up, 1-2 hours to train per stage, 1-8 hours total per agent
 TIME_MILESTONE_MAP = {
-    '128e-2a-15s': (4 * 60, 40 * 60, 40 * 60),
-    '64e-4a-30s': (4 * 60, 80 * 60, 80 * 60),
-    '32e-8a-60s': (4 * 60, 120 * 60, 120 * 60),
-    '16e-16a-90s': (8 * 60, 160 * 60, 160 * 60),
-    '8e-32a-150s': (12 * 60, 200 * 60, 200 * 60),
-    '4e-64a-240s': (16 * 60, 240 * 60, 240 * 60),
-    '2e-128a-360s': (28 * 60, 280 * 60, 320 * 60),
-    '8e-32a-1m': (4 * 60, 120 * 60, 120 * 60),
-    '8e-32c-1m': (4 * 60, 20 * 60, 20 * 60),
-    '8e-32a-2m': (8 * 60, 120 * 60, 120 * 60),
-    '8e-32a-3m': (12 * 60, 120 * 60, 120 * 60),
-    '8e-64a-4m': (16 * 60, 120 * 60, 120 * 60),
-    '8e-128a-5m': (20 * 60, 20 * 60, 120 * 60)}
+    'default': (5 * 60, 30 * 60, 60 * 60),
+    '8e-32a-1m': (8 * 60, 120 * 60, 120 * 60),
+    '8e-32a-2m': (12 * 60, 120 * 60, 120 * 60),
+    '8e-64a-3m': (16 * 60, 120 * 60, 120 * 60),
+    '8e-128a-4m': (20 * 60, 20 * 60, 120 * 60)}
 
 N_EPOCHS_MAP = {k: tv[-1] // SECONDS_PER_EPOCH for k, tv in TIME_MILESTONE_MAP.items()}
 
