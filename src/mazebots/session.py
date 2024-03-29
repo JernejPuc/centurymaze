@@ -566,6 +566,9 @@ class Session(MazeTask):
         {'name': '--n_bots', 'type': int, 'default': -1, 'help': 'Number of agents per environment.'},
         {'name': '--n_speakers', 'type': int, 'default': -1, 'help': 'Number of communicating agents per environment.'},
         {'name': '--n_envs', 'type': int, 'default': -1, 'help': 'Number of parallel environments.'},
+        {'name': '--n_objects', 'type': int, 'default': -1, 'help': 'Number of landmarks per environment.'},
+        {'name': '--n_colours', 'type': int, 'default': -1, 'help': 'Number of colours that landmarks draw from.'},
+        {'name': '--clr_idx', 'type': int, 'default': -1, 'help': 'Index of the colour to always keep in selection.'},
         {'name': '--mul_duration', 'type': float, 'default': 1., 'help': 'Episode duration multiplier.'},
         {'name': '--end_step', 'type': int, 'default': -1, 'help': 'Max steps until auto-termination.'},
         {'name': '--ctrl_mode', 'type': int, 'default': CTRL_MAN, 'help': 'Sim/agent control mode.'},
@@ -573,6 +576,7 @@ class Session(MazeTask):
         {'name': '--preview', 'type': int, 'default': 0, 'help': 'Option to view input or recons. images in side GUI.'},
         {'name': '--headless', 'type': int, 'default': 0, 'help': 'Option to run without a viewer.'},
         {'name': '--act_freq', 'type': int, 'default': cfg.STEPS_PER_SECOND, 'help': 'Inference steps per second.'},
+        {'name': '--clr_step', 'type': int, 'default': -3, 'help': 'Recolouring interval.'},
         {'name': '--transfer_name', 'type': str, 'default': '', 'help': 'Starting model name/ID string.'},
         {'name': '--transfer_ver', 'type': int, 'default': -1, 'help': 'Starting model ckpt. version.'},
         {'name': '--model_name', 'type': str, 'default': 'mazeai', 'help': 'Model name/ID string.'},
@@ -580,6 +584,7 @@ class Session(MazeTask):
         {'name': '--guide_state', 'type': int, 'default': Policy.FEAT_DISABLED, 'help': 'St. of directional guidance.'},
         {'name': '--com_bias', 'type': int, 'default': 0, 'help': 'Option to bias twd. unassociated com.'},
         {'name': '--com_ref', 'type': float, 'default': 0., 'help': 'Option to have objs. emit a const. signal.'},
+        {'name': '--com_spawn', 'type': int, 'default': 0, 'help': 'Option to spawn speakers near objects.'},
         {'name': '--prob_actor', 'type': int, 'default': 1, 'help': 'Option to keep probabilistic inference.'},
         {'name': '--rng_seed', 'type': int, 'default': 42, 'help': 'Seed for numpy and torch RNGs.'},
         {'name': '--schedule_key', 'type': str, 'default': '', 'help': 'Key of a training curriculum stage.'}]
@@ -595,6 +600,7 @@ class Session(MazeTask):
         self.model_options = {
             'com_state': args.com_state,
             'guide_state': args.guide_state,
+            'com_out_size': (2 + args.clr_idx + 1) if 0 <= args.clr_idx < cfg.N_OBJ_COLOURS else cfg.N_RCVR_CLR_CLASSES,
             'com_bias': bool(args.com_bias)}
 
         self.prob_actor = bool(args.prob_actor)
@@ -614,13 +620,28 @@ class Session(MazeTask):
             ver_to_transfer=args.transfer_ver if args.transfer_ver >= 0 else None,
             reset_step_on_transfer=True)
 
+        if self.ctrl_mode == self.CTRL_RL:
+            self.ckpter.logger.info(f'Training with args.:\n{{{str(args)[10:-1]}}}')
+
         # Init IsaacGym and generate initial envs
         self.steps_per_second: int = min(args.act_freq, 64)
         frames_per_second = self.steps_per_second if args.headless else 64
 
         preset_path = os.path.join(cfg.ASSET_DIR, args.preset_name) if args.preset_name else None
 
-        sim = MazeSim(args.level, args.n_bots, args.n_envs, frames_per_second, args, self.ckpter.rng, preset_path)
+        sim = MazeSim(
+            args.level,
+            args.n_bots,
+            args.n_envs,
+            args.n_objects,
+            args.n_speakers if args.com_spawn else None,
+            args.n_colours if args.n_colours > 1 else None,
+            (args.clr_idx,) if 0 <= args.clr_idx < cfg.N_OBJ_COLOURS else None,
+            frames_per_second,
+            args,
+            self.ckpter.rng,
+            preset_path)
+
         interface = Interface(self, sim, args.sim_device) if not args.headless else None
 
         # Extend or diminish standard episode duration
@@ -635,12 +656,13 @@ class Session(MazeTask):
             render_cameras=self.ctrl_mode > self.CTRL_MAN or self.rec_mode > self.REC_NONE or self.preview,
             keep_segmentation=self.rec_mode > self.REC_NONE,
             keep_rgb_over_hsv=self.ctrl_mode == self.CTRL_GEN,
-            spawn_with_random_rgb=self.ctrl_mode == self.CTRL_GEN,
+            spawn_with_random_clr=self.ctrl_mode == self.CTRL_GEN,
             uniform_task_sampling=self.ctrl_mode == self.CTRL_GEN,
             distribute_env_resets=self.ctrl_mode == self.CTRL_RL,
             full_env_regeneration=preset_path is None and args.regen,
             obj_signal_strength=args.com_ref,
             num_speakers_per_env=args.n_speakers if args.n_speakers >= 0 else None,
+            steps_per_clr_change=args.clr_step,
             device=args.sim_device)
 
         # self.accelerate()
@@ -735,18 +757,24 @@ class Session(MazeTask):
         # Load model
         model = ActorCritic(self.sim.n_bots, self.sim.n_envs, **self.model_options)
 
-        optimizer = NAdamW(
-            (param for param in model.parameters() if param.requires_grad),
-            lr=1e-4,
-            weight_decay=cfg.WEIGHT_DECAY)
-
         model.to(self.ckpter.device)
         model.visencoder.load_state_dict(torch.load(encoder_path, map_location=self.ckpter.device))
-        self.ckpter.load_model(model, optimizer)
+        self.ckpter.load_model(model)
 
-        # Init. LR scheduler
+        # Override loaded mask
+        with torch.no_grad():
+            model.policy.coml_mask[0, :] = 1.
+            model.policy.coml_mask[0, :self.model_options['com_out_size']] = 0.
+
+        # Init. optimizer and LR scheduler
+        self.ckpter.optimizer = NAdamW(
+            (param for param in model.parameters() if param.requires_grad),
+            lr=1e-4,
+            weight_decay=cfg.WEIGHT_DECAY,
+            device=self.ckpter.device)
+
         scheduler = AnnealingScheduler(
-            optimizer,
+            self.ckpter.optimizer,
             step_milestones=cfg.UPDATE_MILESTONE_MAP[self.schedule_key],
             starting_step=self.ckpter.meta['update_step'])
 
@@ -803,6 +831,11 @@ class Session(MazeTask):
         model.to(self.ckpter.device)
         self.ckpter.load_model(model)
 
+        # Override loaded mask
+        with torch.no_grad():
+            model.policy.coml_mask[0, :] = 1.
+            model.policy.coml_mask[0, :self.model_options['com_out_size']] = 0.
+
         # Accelerate actor
         mem = model.init_mem(self.sim.n_all_bots)
         # model.act_partial = self.accel_action(model.act_partial, mem)
@@ -818,7 +851,7 @@ class Session(MazeTask):
                 obs, reward, rst_mask_f, *_ = self.step(actions, action_indices, get_info=False)
                 obs = self.post_step(obs, reward, rst_mask_f)
 
-                if not rst_mask_f.all():
+                if rst_mask_f.any():
                     mem = model.reset_mem(mem, 1. - rst_mask_f)
 
     def play(self):

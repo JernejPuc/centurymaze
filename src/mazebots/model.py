@@ -237,7 +237,15 @@ class Policy(Module):
     FEAT_EXTERNAL = 1
     FEAT_DISABLED = 0
 
-    def __init__(self, com_state: int, guide_state: int, com_bias: bool, n_agents_per_env: int, n_envs: int):
+    def __init__(
+        self,
+        com_state: int,
+        guide_state: int,
+        com_out_size: int,
+        com_bias: bool,
+        n_agents_per_env: int,
+        n_envs: int
+    ):
         super().__init__()
 
         self.com_state = com_state
@@ -249,6 +257,7 @@ class Policy(Module):
         self.n_all_bots = n_agents_per_env * n_envs
 
         self.input_sizes = (VisEncoder.ENC_SIZE + cfg.OBS_VEC_SIZE, cfg.AUX_VAL_SIZE, cfg.META_VAL_SIZE)
+        self.role_slice = slice(cfg.OBS_ROLE_IDX + VisEncoder.ENC_SIZE, cfg.OBS_ROLE_IDX + VisEncoder.ENC_SIZE + 1)
 
         trq_values = torch.tensor(cfg.ACT_DOF_MODES_BASE)
         clr_values = torch.tensor(cfg.RCVR_CLR_CLASSES)
@@ -259,7 +268,11 @@ class Policy(Module):
 
         trql_mask = torch.tensor((cfg.ACT_DOF_MOTION_MASK,), dtype=torch.float32)
         self.trql_mask = nn.Parameter(trql_mask, requires_grad=False)
-        self.trql_bias = nn.Parameter(torch.tensor(-20.), requires_grad=False)
+        self.null_bias = nn.Parameter(torch.tensor(-20.), requires_grad=False)
+
+        coml_mask = torch.ones((1, cfg.N_RCVR_CLR_CLASSES))
+        coml_mask[0, :com_out_size] = 0.
+        self.coml_mask = nn.Parameter(coml_mask, requires_grad=False)
 
         coml_silent = torch.full((1, len(clr_values)), -20.)
         coml_silent[:, 0] = 0.
@@ -333,7 +346,7 @@ class Policy(Module):
     def forward(self, x: Tensor, memp: Tensor, detach: bool) -> 'tuple[Tensor, ...]':
         x, x_aux, heur_com_idx = x.split(self.input_sizes, dim=-1)
         mem_m, mem_c = memp.split(self.mem_sizes, dim=-1)
-        speaker_mask = x[:, cfg.OBS_ROLE_SLICE]
+        speaker_mask = x[:, self.role_slice]
 
         # Process observations
         if self.guide_state == self.FEAT_CONDITIONAL:
@@ -353,9 +366,6 @@ class Policy(Module):
             mem_c = self.rnn_c(torch.cat((x, mem_m.detach()), dim=-1), mem_c)
             clr_logits = self.fcout_c(mem_c)
 
-            # Detach grads. from non-speakers
-            clr_logits = torch.lerp(clr_logits.detach(), clr_logits, speaker_mask)
-
         # Override - heuristic
         # Obj. colour if seen and near, white if obstructed, black otherwise
         elif self.com_state == self.FEAT_EXTERNAL:
@@ -369,9 +379,14 @@ class Policy(Module):
         mem_m = self.rnn_m(torch.cat((x, mem_c.detach()), dim=-1), mem_m)
         trq_logits = self.fcout_m(mem_m)
 
-        # Freeze translation for speakers when com. training is emphasised
+        # Freeze translation and mask colours for speakers when com. training is emphasised
         if self.com_state == self.FEAT_CONDITIONAL:
-            trq_logits = torch.lerp(trq_logits, self.trql_bias, self.trql_mask * speaker_mask)
+            trq_logits = torch.lerp(trq_logits, self.null_bias, self.trql_mask * speaker_mask)
+            clr_logits = torch.lerp(clr_logits, self.null_bias, self.coml_mask * speaker_mask)
+
+        # Detach grads. from non-speakers
+        elif self.com_state == self.FEAT_TRAINED:
+            clr_logits = torch.lerp(clr_logits.detach(), clr_logits, speaker_mask)
 
         memp = torch.cat((mem_m, mem_c), dim=-1)
         x = torch.cat((trq_logits, clr_logits), dim=-1)
@@ -399,6 +414,12 @@ class Policy(Module):
 
         else:
             a = self.fcaux(memp.detach())
+
+        # Detach grads. from non-speakers
+        if self.com_state == self.FEAT_CONDITIONAL:
+            x = torch.lerp(x.detach(), x, speaker_mask)
+            a = torch.lerp(a.detach(), a, speaker_mask)
+            memp = torch.lerp(memp.detach(), memp, speaker_mask)
 
         return x, a, memp
 
@@ -453,8 +474,11 @@ class Valuator(Module):
     SHORT_MEM_HALF_LIFE = Policy.SHORT_MEM_HALF_LIFE
     LONG_MEM_HALF_LIFE = MAX_MEM_HORIZON = Policy.MAX_MEM_HORIZON
 
-    def __init__(self, n_agents_per_env: int, n_envs: int):
+    def __init__(self, com_state: int, n_agents_per_env: int, n_envs: int):
         super().__init__()
+
+        self.detach_cond = com_state == Policy.FEAT_CONDITIONAL
+        self.role_slice = slice(cfg.OBS_ROLE_IDX, cfg.OBS_ROLE_IDX + 1)
 
         self.n_bots = n_agents_per_env
         self.n_all_bots = n_agents_per_env * n_envs
@@ -525,6 +549,12 @@ class Valuator(Module):
         # Map to value distribution parameters
         x = self.mlpout(memv)
 
+        # Detach grads. from non-speakers
+        if self.detach_cond:
+            speaker_mask = x_vec[:, self.role_slice]
+            x = torch.lerp(x.detach(), x, speaker_mask)
+            memv = torch.lerp(memv.detach(), memv, speaker_mask)
+
         return x, memv
 
 
@@ -537,13 +567,14 @@ class ActorCritic(ActorCriticTemplate):
         n_envs: int = 1,
         com_state: int = Policy.FEAT_TRAINED,
         guide_state: int = Policy.FEAT_DISABLED,
+        com_out_size: int = cfg.N_RCVR_CLR_CLASSES,
         com_bias: bool = True
     ):
         super().__init__()
 
         self.visencoder = VisEncoder()
-        self.policy = Policy(com_state, guide_state, com_bias, n_agents_per_env, n_envs)
-        self.valuator = Valuator(n_agents_per_env, n_envs)
+        self.policy = Policy(com_state, guide_state, com_out_size, com_bias, n_agents_per_env, n_envs)
+        self.valuator = Valuator(com_state, n_agents_per_env, n_envs)
 
         for param in self.visencoder.parameters():
             param.requires_grad = False

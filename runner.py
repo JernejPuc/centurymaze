@@ -26,37 +26,65 @@ for i in range(1, 8):
 
 # Curriculum
 AGENT_TYPE_CONFIGS = {
-    'basic': {'com_state': 0, 'guide_state': 3, 'com_bias': 0, 'com_ref': 0.05, 'com_rls_stage': None, 'n_speakers': 0},
-    'guide': {'com_state': 0, 'guide_state': 1, 'com_bias': 0, 'com_ref': 1., 'com_rls_stage': None, 'n_speakers': 0},
-    'heur': {'com_state': 1, 'guide_state': 3, 'com_bias': 0, 'com_ref': 0.05, 'com_rls_stage': None, 'n_speakers': -1},
-    'free': {'com_state': 2, 'guide_state': 3, 'com_bias': 1, 'com_ref': 0.05, 'com_rls_stage': None, 'n_speakers': -1},
-    'cond': {'com_state': 3, 'guide_state': 3, 'com_bias': 1, 'com_ref': 0.05, 'com_rls_stage': 4, 'n_speakers': ...}}
+    'base': {'transfer': None, 'com_state': 0, 'guide_state': 3, 'com_ref': 0.1, 'n_speakers': 0},
+    'orac': {'transfer': None, 'com_state': 0, 'guide_state': 1, 'com_ref': 1., 'n_speakers': 0},
+    'hear': {'transfer': None, 'com_state': 1, 'guide_state': 3, 'com_ref': 1., 'n_speakers': -1},
+    'free': {'transfer': None, 'com_state': 2, 'guide_state': 3, 'com_ref': 0.1, 'n_speakers': -1},
+    'heur': {'transfer': 'hear', 'com_state': 1, 'guide_state': 3, 'com_ref': 0.1, 'n_speakers': -1},
+    'cond': {'transfer': 'hear', 'com_state': 3, 'guide_state': 3, 'com_ref': 0.1, 'n_speakers': ...}}
 
 N_ENVS = 8
+N_BOTS = 256
 
 for seed in (0, 42, 100):
     for agent_type, args in AGENT_TYPE_CONFIGS.items():
         cmd_seq = []
-        model_name = ''
 
-        for stage, level in enumerate((5,)*5 + (6, 7, 7)):
+        transfer_key = args['transfer']
+        model_name = '' if transfer_key is None else f'{transfer_key}{seed}v7_{N_ENVS}e-128a-4m'
+
+        speaker_curriculum = args['n_speakers'] is ...
+        speaker_phase = speaker_curriculum and transfer_key is not None
+
+        levels = (((2,)*9 + (3, 4)) if speaker_phase else ((5,)*11)) + (5, 5, 5, 6, 7)
+        durations = (0.25 if speaker_phase else 1,)*11 + (1, 1.5, 2, 3, 4)
+
+        for stage, (level, ep_duration) in enumerate(zip(levels, durations)):
             n_bots = 2 ** level
-            n_speakers = 2 ** stage if args['n_speakers'] is ... else args['n_speakers']
-            com_state = 2 if args['com_rls_stage'] is not None and stage >= args['com_rls_stage'] else args['com_state']
-            guide_state, com_bias, com_ref = args['guide_state'], args['com_bias'], args['com_ref']
+            n_speakers = 2 ** max(0, stage - 8) if speaker_curriculum else args['n_speakers']
+            n_envs = max(N_ENVS, N_BOTS // n_bots)
+            n_objects = -1
 
-            ep_duration = 1 if stage < 4 else level - 3
-            mul_duration = ep_duration / (level - 3)
-            schedule_key = f'{N_ENVS}e-{n_bots}a-{ep_duration}m'
+            com_state = 2 if speaker_phase and stage >= 11 else args['com_state']
+            guide_state, com_ref = args['guide_state'], args['com_ref']
+
+            clr_idx = stage if stage < 8 else -1
+            com_spawn = int(speaker_phase and stage < 11)
+
+            if com_spawn:
+                n_objects = level
+                level = 7
+
+            schedule_key = 'default' if stage < 11 else f'{N_ENVS}e-{n_bots}a-{int(ep_duration)}m'
+
+            if level == 7:
+                mul_duration = ep_duration / 4.5
+
+            elif level == 5:
+                mul_duration = ep_duration / 2.
+
+            else:
+                mul_duration = 1.
 
             transfer_name = model_name
             model_name = f'{agent_type}{seed}v{stage}_{schedule_key}'
 
             cmd_seq.append(
-                f'python src/mazebots/session.py --level {level} --n_envs {N_ENVS} --ctrl_mode 2 --headless 1 '
+                f'python src/mazebots/session.py --level {level} --n_envs {n_envs} --ctrl_mode 2 --headless 1 '
+                f'--n_bots {n_bots} --n_objects {n_objects} --n_colours 8 --clr_idx {clr_idx} '
                 f'--model_name "{model_name}" --transfer_name "{transfer_name}" --rng_seed {seed} '
                 f'--n_speakers {n_speakers} --mul_duration {mul_duration} --schedule_key "{schedule_key}" '
-                f'--com_state {com_state} --guide_state {guide_state} --com_bias {com_bias} --com_ref {com_ref}')
+                f'--com_state {com_state} --guide_state {guide_state} --com_spawn {com_spawn} --com_ref {com_ref}')
 
         CMD_PRESETS[f'curr_{agent_type}{seed}'] = cmd_seq
 

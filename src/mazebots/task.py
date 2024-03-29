@@ -43,6 +43,7 @@ TIME_SCALE = 1. / 60.
 # Max. env. distances
 MAX_ENV_WIDTH = cfg.LEVEL_PARAMS[7]['env_width']
 MAX_MIN_OBJ_SPACING = MAX_ENV_WIDTH / 3.
+MAX_OBJ_SOUND_RADIUS = cfg.WALL_LENGTH * 2.5
 MAX_ENV_HALFWIDTH = MAX_ENV_WIDTH / 2.
 MAX_IMG_DEPTH = MAX_ENV_WIDTH * 2 / 3.
 ENV_DIAG_SPAN = np.floor(MAX_ENV_WIDTH * 2**0.5)
@@ -165,12 +166,13 @@ class MazeTask:
         render_cameras: bool = False,
         keep_segmentation: bool = False,
         keep_rgb_over_hsv: bool = False,
-        spawn_with_random_rgb: bool = False,
+        spawn_with_random_clr: bool = False,
         uniform_task_sampling: bool = False,
         distribute_env_resets: bool = False,
         full_env_regeneration: bool = False,
         obj_signal_strength: float = 0.,
         num_speakers_per_env: int = None,
+        steps_per_clr_change: int = 1,
         device: str = 'cuda'
     ):
         self.sim = sim
@@ -180,12 +182,13 @@ class MazeTask:
         self.render_cameras = render_cameras
         self.keep_segmentation = keep_segmentation
         self.keep_rgb_over_hsv = keep_rgb_over_hsv
-        self.spawn_with_random_rgb = spawn_with_random_rgb
-        self.uniform_task_sampling = uniform_task_sampling
+        self.spawn_with_random_clr = spawn_with_random_clr
+        self.uniform_task_sampling = uniform_task_sampling or sim.n_objects < 3
         self.distribute_env_resets = distribute_env_resets
         self.full_env_regeneration = full_env_regeneration
         self.obj_signal_strength = obj_signal_strength
         self.n_speakers = sim.n_bots if num_speakers_per_env is None else min(sim.n_bots, num_speakers_per_env)
+        self.recolour_interval = steps_per_clr_change
 
         self.rst_env_indices: 'list[int]' = []
 
@@ -352,7 +355,7 @@ class MazeTask:
         self.obj_idx_map = torch.from_numpy(self.obj_idx_map).to(device, dtype=torch.int64)
 
         # Sample initial tasks
-        self.goal_pos_idx = self.sample_tasks(uniform=True)
+        self.goal_pos_idx = self.distribute_tasks(self.sim.n_envs)
 
         # Clone not to write over reference tensors
         self.goal_idx = self.obj_idx_map[self.row_idcs, self.goal_pos_idx].clone()
@@ -404,7 +407,7 @@ class MazeTask:
         # Action feedback
         self.rcvr_clr_classes = torch.tensor(cfg.RCVR_CLR_CLASSES, device=device)
 
-        if self.spawn_with_random_rgb:
+        if self.spawn_with_random_clr:
             self.act_trq = torch.zeros((sim.n_all_bots, cfg.N_DOF_MOT), device=device)
             self.act_rgb = self.sample_colours()
 
@@ -415,6 +418,7 @@ class MazeTask:
             self.act_trq, self.act_rgb = torch.split(self.actions, cfg.ACT_SPLIT, dim=1)
 
         self.act_clr_idx = self.get_closest_colour_index(self.act_rgb)
+        self.act_clr_ctr = torch.zeros((sim.n_all_bots, cfg.N_RCVR_CLR_CLASSES), dtype=torch.int64, device=device)
 
         # Grid cell states
         self.cell_delims = torch.from_numpy(sim.open_grid_delims).to(device, dtype=torch.float32)
@@ -504,7 +508,7 @@ class MazeTask:
 
             self.bot_old_vel[bot_rst_indices] = 0.
 
-            if self.spawn_with_random_rgb:
+            if self.spawn_with_random_clr:
                 self.act_trq[bot_rst_indices] = act_trq = \
                     torch.zeros((len(bot_rst_indices), cfg.N_DOF_MOT), device=self.device)
 
@@ -519,19 +523,30 @@ class MazeTask:
                 self.act_clr_idx[bot_rst_indices] = 0
                 self.actions[bot_rst_indices] = 0.
 
+            self.act_clr_ctr[bot_rst_indices] = 0
+
             bot_rclr_mask = self.bot_done_mask | self.bot_rst_mask
 
         else:
+            bot_rst_indices = None
             bot_rclr_mask = self.bot_done_mask
 
         # Based on env resets and task completions
         if torch.any(bot_rclr_mask).item():
-            bot_rclr_indices = torch.nonzero(bot_rclr_mask, as_tuple=True)[0]
+            bot_done_indices = torch.nonzero(self.bot_done_mask, as_tuple=True)[0]
+            goal_pos_idx = self.sample_tasks(bot_done_indices, self.uniform_task_sampling)
+            self.goal_pos_idx[bot_done_indices] = goal_pos_idx
+
+            if bot_rst_indices is None:
+                bot_rclr_indices = bot_done_indices
+
+            else:
+                bot_rclr_indices = torch.nonzero(bot_rclr_mask, as_tuple=True)[0]
+                self.goal_pos_idx[bot_rst_indices] = self.distribute_tasks(len(self.rst_env_indices))
+                goal_pos_idx = self.goal_pos_idx[bot_rclr_indices]
+
             bot_rclr_idx_arr = bot_rclr_indices.cpu().numpy()
 
-            goal_pos_idx = self.sample_tasks(bot_rclr_indices, self.uniform_task_sampling)
-
-            self.goal_pos_idx[bot_rclr_indices] = goal_pos_idx
             self.goal_idx[bot_rclr_indices] = self.obj_idx_map[bot_rclr_indices, goal_pos_idx]
             self.goal_rgb[bot_rclr_indices] = goal_rgb = self.obj_rgb[bot_rclr_indices, goal_pos_idx]
             self.goal_pos[bot_rclr_indices] = goal_pos = self.obj_pos[bot_rclr_indices, goal_pos_idx]
@@ -606,6 +621,17 @@ class MazeTask:
         task_idx = torch.multinomial(probs, 1)
 
         return task_idx.flatten()
+
+    def distribute_tasks(self, n_envs: int = 1) -> Tensor:
+        """
+        Create assignments in order, so that none is left unassigned
+        if there are at least as many bots as there are objectives.
+        """
+
+        task_idx = torch.arange(self.sim.n_objects)
+        task_idx = task_idx.tile((int(np.ceil(self.sim.n_bots / self.sim.n_objects)),))[:self.sim.n_bots]
+
+        return task_idx.repeat(n_envs).to(self.device)
 
     def step(
         self,
@@ -685,6 +711,31 @@ class MazeTask:
 
         if action_indices is None:
             action_indices = self.get_closest_colour_index(self.act_rgb)
+
+        # Defer colour switch to potential spike
+        if self.recolour_interval > 1:
+            self.act_clr_ctr[self.row_idcs, action_indices] += 1
+
+            clr_ctr, clr_idx = self.act_clr_ctr.max(dim=-1)
+            spike_mask = clr_ctr >= self.recolour_interval
+
+            self.act_clr_ctr[spike_mask] = 0
+
+            action_indices = torch.where(spike_mask, clr_idx, self.act_clr_idx)
+            self.act_rgb = self.rcvr_clr_classes.index_select(0, action_indices)
+
+        # Only permit colour change via neutral transition
+        elif self.recolour_interval < 0:
+            self.act_clr_ctr[self.row_idcs, action_indices] += 1
+
+            clr_ctr, clr_idx = self.act_clr_ctr.max(dim=-1)
+            spike_mask = clr_ctr >= -self.recolour_interval
+            valid_mask = (clr_idx < 2) | (self.act_clr_idx < 2)
+
+            self.act_clr_ctr[spike_mask] = 0
+
+            action_indices = torch.where(spike_mask & valid_mask, clr_idx, self.act_clr_idx)
+            self.act_rgb = self.rcvr_clr_classes.index_select(0, action_indices)
 
         # NOTE: Default is short-range (white) signal, not silence (black)
         self.act_trq = torch.clamp(self.act_trq, -MOT_MAX_TORQUE, MOT_MAX_TORQUE)
@@ -872,9 +923,13 @@ class MazeTask:
         goal_delta = torch.where(self.last_path_len == 0., 0., self.last_path_len - self.goal_path_len)
         goal_delta_scaled = goal_delta / MAX_MIN_OBJ_SPACING
 
-        avg_delta_scaled = goal_delta_scaled.reshape(n_envs, n_bots).mean(-1)
-        avg_delta_scaled *= max(1., n_bots / max(1, n_bots_per_obj * self.n_speakers - self.n_speakers))
-        avg_delta_scaled = avg_delta_scaled.repeat_interleave(n_bots, output_size=n_all_bots)
+        nearest_obj_pos_idx = obj_dist.argmin(dim=-1)
+        nearest_obj_idx = self.obj_idx_map[self.row_idcs, nearest_obj_pos_idx]
+        avg_delta_scaled = (goal_mask_f * goal_delta_scaled.unsqueeze(-1)).reshape(n_envs, n_bots, -1).sum(1)
+        avg_delta_scaled /= goal_mask_f.reshape(n_envs, n_bots, -1).sum(1).clip(1.)
+        avg_delta_scaled = avg_delta_scaled.repeat_interleave(n_bots, dim=0, output_size=n_all_bots)
+        avg_delta_scaled = avg_delta_scaled[self.row_idcs, nearest_obj_idx]
+        avg_delta = avg_delta_scaled * MAX_MIN_OBJ_SPACING
 
         colliding = self.net_contacts[self.collider_indices, :2].abs().sum(-1) != 0.
         near_src_prox_sum = (1. - src_dist / (2.*cfg.BOT_WIDTH)).clip(0.).sum(-1)
@@ -882,8 +937,19 @@ class MazeTask:
         aux_reward = bot_done_mask_f * COMPLETION_WEIGHT + new_cell_found * EXPLORATION_WEIGHT
         aux_penalty = colliding * COLLISION_WEIGHT + near_src_prox_sum * PROXIMITY_WEIGHT
 
-        long_term_reward = torch.lerp(goal_delta_scaled, avg_delta_scaled, self.speaker_mask_f)
-        short_term_reward = torch.lerp(aux_reward + aux_penalty, aux_penalty, self.speaker_mask_f)
+        if self.n_speakers == 1:
+            long_term_reward = torch.lerp(goal_delta_scaled, avg_delta_scaled, self.speaker_mask_f)
+
+        else:
+            long_term_reward = torch.where(
+                self.speaker_mask & (act_clr_idx > 1),
+                torch.where(
+                    self.obj_in_sight[self.row_idcs, nearest_obj_pos_idx],
+                    avg_delta_scaled,
+                    -DELTA_WEIGHT),
+                goal_delta_scaled)
+
+        short_term_reward = aux_reward + aux_penalty
 
         # If envs. have reset, suppress rewards for incorrect (unbelonging) state/obs.
         reward = ~self.bot_rst_mask.unsqueeze(-1) * torch.stack((long_term_reward, short_term_reward), dim=-1)
@@ -941,7 +1007,7 @@ class MazeTask:
             near_src_prox_sum.unsqueeze(-1),
             colliding.unsqueeze(-1),
             # Bot avg. & common env. stats (1+16)
-            avg_delta_scaled.unsqueeze(-1),
+            avg_delta.unsqueeze(-1),
             env_stats,
             # Other (1); mainly intended for a communication heuristic
             heur_clr_idx.unsqueeze(-1).float()
@@ -1018,8 +1084,8 @@ class MazeTask:
         bot_dist = torch.where(bot_dist == 0., torch.inf, bot_dist)
 
         # Suppress obj. signal beyond noise threshold
-        if self.obj_signal_strength > 0.1:
-            obj_dist = torch.where(obj_dist > 2*cfg.GOAL_RADIUS, torch.inf, obj_dist)
+        if self.obj_signal_strength < 1.:
+            obj_dist = torch.where(obj_dist > MAX_OBJ_SOUND_RADIUS, torch.inf, obj_dist)
 
         # Proximity weights via clipped inverse prop. characteristic
         bot_wsignal_strength = 0.1 / bot_dist.clip(cfg.BOT_RADIUS)

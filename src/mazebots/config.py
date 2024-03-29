@@ -162,7 +162,7 @@ N_DIM_POS = 3
 # 11 colour cmd., 10x4 clr. channels, 10 clr. channel norm
 OBS_LOC_SIZE = N_DOF_MOT + 3*3 + 4 + 2*(N_DIM_POS-1) + N_OBJ_COLOURS + 3 + N_RCVR_CLR_CLASSES
 OBS_VEC_SIZE = OBS_LOC_SIZE + (N_RCVR_CLR_CLASSES-1) * (4+1)
-OBS_ROLE_SLICE = slice(30, 31)
+OBS_ROLE_IDX = 30
 
 # Resolution mostly important for effective viewing distance
 OBS_IMG_RES_WIDTH = 96
@@ -246,7 +246,7 @@ CKPT_EPOCH_INTERVAL = LOG_EPOCH_INTERVAL
 # 1 branch per half virtual hour, 48 per day, 336 per week
 BRANCH_EPOCH_INTERVAL = 30 * 60 // SECONDS_PER_EPOCH
 
-# 5-20 virtual minutes to warm up, 1-2 hours to train per stage, 1-8 hours total per agent
+# 5-20 virtual minutes to warm up, 1-2 hours to train per stage, 1-24 hours total per agent (incl. reps.)
 TIME_MILESTONE_MAP = {
     'default': (5 * 60, 30 * 60, 60 * 60),
     '8e-32a-1m': (8 * 60, 120 * 60, 120 * 60),

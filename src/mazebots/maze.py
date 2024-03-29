@@ -346,6 +346,9 @@ class MazeConstructor:
         n_graph_points: int,
         n_bots: int,
         n_objects: int,
+        n_near_bots: int = None,
+        n_obj_colours: int = None,
+        mandated_clr_indices: 'tuple[int, ...]' = None,
         rng: 'None | int | np.random.Generator' = None,
         supenv_width: int = None,
         n_supgrid_segments: int = None
@@ -384,6 +387,10 @@ class MazeConstructor:
         self.n_graph_points = n_graph_points
         self.n_bots = n_bots
         self.n_objects = n_objects
+
+        self.n_near_bots = n_near_bots
+        self.n_obj_colours = n_obj_colours if n_obj_colours is not None else cfg.N_OBJ_COLOURS
+        self.mandated_clr_indices = mandated_clr_indices
 
         if isinstance(rng, np.random.Generator):
             self.rng = rng
@@ -497,20 +504,7 @@ class MazeConstructor:
             # as objectives and bot spawn points, respectively
             # Reconstruct the graph until all objects and spawn points are selected
             try:
-                object_points = self.select_points(
-                    candidate_points,
-                    self.n_objects, self.min_object_spacing,
-                    None, 0.,
-                    grid_wall_pairs, cfg.OBJECT_TO_WALL_BUFFER,
-                    self.MAX_OBJECT_SHUFFLES)
-
-                bot_spawn_points = self.select_points(
-                    candidate_points,
-                    self.n_bots, cfg.BOT_TO_BOT_BUFFER,
-                    object_points, cfg.BOT_TO_OBJECT_BUFFER,
-                    grid_wall_pairs, cfg.BOT_TO_WALL_BUFFER,
-                    self.MAX_BOT_SHUFFLES)
-
+                object_points, bot_spawn_points = self.select_spawns(candidate_points, grid_wall_pairs)
                 break
 
             except AssertionError:
@@ -594,20 +588,7 @@ class MazeConstructor:
                 max_dist_to_graph_pts=cfg.WALL_HALFLENGTH - cfg.OBJECT_TO_WALL_BUFFER)
 
             try:
-                data.obj_points = self.select_points(
-                    candidate_points,
-                    self.n_objects, self.min_object_spacing,
-                    None, 0.,
-                    data.grid_wall_pairs, cfg.OBJECT_TO_WALL_BUFFER,
-                    self.MAX_OBJECT_SHUFFLES)
-
-                data.bot_spawn_points = self.select_points(
-                    candidate_points,
-                    self.n_bots, cfg.BOT_TO_BOT_BUFFER,
-                    data.obj_points, cfg.BOT_TO_OBJECT_BUFFER,
-                    data.grid_wall_pairs, cfg.BOT_TO_WALL_BUFFER,
-                    self.MAX_BOT_SHUFFLES)
-
+                data.obj_points, data.bot_spawn_points = self.select_spawns(candidate_points, data.grid_wall_pairs)
                 break
 
             except AssertionError:
@@ -616,14 +597,79 @@ class MazeConstructor:
         obj_trans_probs = 0.8 + 0.2 * self.rng.uniform(size=(self.n_objects, self.n_objects))
         obj_trans_probs[np.diag_indices_from(obj_trans_probs)] = 0.
         obj_trans_probs /= obj_trans_probs.sum(axis=-1)[..., None]
-
         data.obj_trans_probs = obj_trans_probs
-        data.obj_clr_idcs = self.rng.permutation(cfg.N_OBJ_COLOURS)[:self.n_objects]
+
+        if self.mandated_clr_indices:
+            other_clr_indices = tuple(set(range(self.n_obj_colours)) - set(self.mandated_clr_indices))
+            n_other_clrs = self.n_objects - len(self.mandated_clr_indices)
+
+            data.obj_clr_idcs = self.rng.permutation(np.concatenate((
+                np.array(self.mandated_clr_indices),
+                self.rng.permutation(other_clr_indices)[:n_other_clrs])))
+
+        else:
+            data.obj_clr_idcs = self.rng.permutation(self.n_obj_colours)[:self.n_objects]
+
         data.bot_spawn_angles = self.rng.uniform(low=-np.pi, high=np.pi, size=self.n_bots)
 
         data.init_path_map(reset='regcon_graph_paths' not in data.__dict__, precompute=precompute_paths)
 
         return data
+
+    def select_spawns(self, candidate_points: ndarray, grid_wall_pairs: ndarray) -> 'tuple[ndarray, ndarray]':
+        """
+        Select objective and bot starting points, either through random selection
+        or based on dichotomous distance criteria (near or far from objectives).
+        """
+
+        if not self.n_near_bots:
+            object_points = self.select_points(
+                candidate_points,
+                self.n_objects, self.min_object_spacing,
+                None, 0.,
+                grid_wall_pairs, cfg.OBJECT_TO_WALL_BUFFER,
+                self.MAX_OBJECT_SHUFFLES)
+
+            bot_spawn_points = self.select_points(
+                candidate_points,
+                self.n_bots, cfg.BOT_TO_BOT_BUFFER,
+                object_points, cfg.BOT_TO_OBJECT_BUFFER,
+                grid_wall_pairs, cfg.BOT_TO_WALL_BUFFER,
+                self.MAX_BOT_SHUFFLES)
+
+        else:
+            min_object_spacing = np.sin(np.pi / self.n_objects) * self.supenv_halfwidth * 2
+
+            object_points = self.select_points(
+                candidate_points,
+                self.n_objects, min_object_spacing,
+                None, 0.,
+                grid_wall_pairs, cfg.OBJECT_TO_WALL_BUFFER,
+                self.MAX_OBJECT_SHUFFLES)
+
+            candidate_dists = np.linalg.norm(candidate_points[:, None] - object_points[None], axis=-1)
+            near_idcs = candidate_dists.min(axis=-1).argsort()
+
+            candidate_dists = np.linalg.norm(candidate_points - object_points.mean(axis=0), axis=-1)
+            far_idcs = candidate_dists.argsort()
+
+            near_spawn_points = self.select_points(
+                candidate_points[near_idcs],
+                self.n_near_bots, cfg.BOT_TO_BOT_BUFFER,
+                object_points, cfg.BOT_TO_OBJECT_BUFFER,
+                grid_wall_pairs, cfg.BOT_TO_WALL_BUFFER,
+                0)
+
+            far_spawn_points = self.select_points(
+                candidate_points[far_idcs],
+                self.n_bots - self.n_near_bots, cfg.BOT_TO_BOT_BUFFER,
+                object_points, cfg.BOT_TO_OBJECT_BUFFER,
+                grid_wall_pairs, cfg.BOT_TO_WALL_BUFFER,
+                0)
+
+            bot_spawn_points = np.concatenate((near_spawn_points, far_spawn_points))
+
+        return object_points, bot_spawn_points
 
     def select_points(
         self,
@@ -644,10 +690,11 @@ class MazeConstructor:
 
         points = np.zeros((n_to_select, 2))
 
-        for _ in range(max_shuffles):
+        for _ in range(max(1, max_shuffles)):
             last_idx = 0
 
-            self.rng.shuffle(candidate_points)
+            if max_shuffles > 0:
+                self.rng.shuffle(candidate_points)
 
             for point in candidate_points:
                 # Check distance to points of a different kind
@@ -716,6 +763,10 @@ class MazeConstructor:
             max_y = min_y + self.env_width
 
             pts = pts[(pts[:, 0] > min_x) & (pts[:, 0] < max_x) & (pts[:, 1] > min_y) & (pts[:, 1] < max_y)]
+
+        # TODO: While variance is beneficial, a uniform pool often undermines the intent of distance-based priority
+        if self.n_near_bots:
+            return pts, env_idcs
 
         # Sample nodes from within the env., with replacement
         candidate_indices = self.rng.choice(len(pts), n_to_sample, replace=True)

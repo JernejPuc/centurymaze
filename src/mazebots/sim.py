@@ -470,6 +470,10 @@ class MazeSim:
         level: int = 4,
         n_bots: int = 0,
         n_envs: int = 0,
+        n_objects: int = 0,
+        n_near_bots: int = None,
+        n_obj_colours: int = None,
+        mandated_clr_indices: 'tuple[int, ...]' = None,
         fps: int = 60,
         args: Namespace = DEFAULT_SIM_ARGS,
         rng: 'None | np.random.Generator' = None,
@@ -545,6 +549,7 @@ class MazeSim:
         for key, val in cfg.LEVEL_PARAMS[level].items():
             setattr(self, key, val)
 
+        self.n_objects = n_objects if n_objects > 0 else self.n_objects
         self.n_bots = n_bots if n_bots > 0 else self.n_bots
         self.n_envs = n_envs if n_envs > 0 else 1
         self.n_envs_per_row: int = round(self.n_envs**0.5)
@@ -576,6 +581,9 @@ class MazeSim:
             self.n_graph_points,
             self.n_bots,
             self.n_objects,
+            n_near_bots,
+            n_obj_colours,
+            mandated_clr_indices,
             self.rng_seed if rng is None else rng,
             supenv_width,
             n_supgrid_segments)
