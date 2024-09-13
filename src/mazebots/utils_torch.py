@@ -70,14 +70,22 @@ def get_eulz_from_quat(q: Tensor, keepdim: bool = True) -> Tensor:
     z6 = torch.atan2(2 * (q0 * q3 + q1 * q2), 1 - 2*(q2 * q2 + q3 * q3))
     """
 
-    q0 = q[..., -1]
-    q1 = q[..., 0]
-    q2 = q[..., 1]
-    q3 = q[..., 2]
+    qx, qy, qz, qw = q.unbind(-1)
 
-    eulz = torch.atan2(2. * (q0 * q3 - q1 * q2), 1. - 2.*(q2 * q2 + q3 * q3))
+    eulz = torch.atan2(2. * (qw * qz - qx * qy), 1. - 2. * (qy**2 + qz**2))
 
     return eulz.unsqueeze(-1) if keepdim else eulz
+
+
+def get_trigonz_from_quat(q: Tensor):
+    """Infer Euler angle z-component sine and cosine from quaternion q."""
+
+    qx, qy, qz, qw = q.unbind(-1)
+
+    sin_z = 2. * (qw * qz - qx * qy)
+    cos_z = 1. - 2. * (qy**2 + qz**2)
+
+    return torch.stack((sin_z, cos_z), axis=-1)
 
 
 def rgb_to_hsv(img: Tensor, unstack_dim: int = -1, stack_dim: int = -1) -> Tensor:
@@ -109,19 +117,3 @@ def rgb_to_hsv(img: Tensor, unstack_dim: int = -1, stack_dim: int = -1) -> Tenso
     hue = torch.fmod((hue / 6. + 1.), 1.)
 
     return torch.stack((hue, sat, max_channel_val), dim=stack_dim)
-
-
-def weighted_sum(values: Tensor, weights: Tensor, n_groups: int = 1) -> Tensor:
-    """Accumulate values with a group-wise weighted sum."""
-
-    n_all_sources = len(values)
-    n_sources_per_group = n_all_sources // n_groups
-
-    # NxV -> GxSxV -> NxSxV
-    values = values.reshape(n_groups, n_sources_per_group, -1)
-    values = values.repeat_interleave(n_sources_per_group, dim=0, output_size=n_all_sources)
-
-    # NxSxV, NxSxW -> NxVxW
-    value_sums = torch.einsum('nsv,nsw->nvw', values, weights)
-
-    return value_sums

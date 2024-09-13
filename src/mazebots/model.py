@@ -3,19 +3,20 @@
 import torch
 from torch import nn, Tensor
 from torch.nn import Module
-from torch.nn.functional import one_hot, scaled_dot_product_attention
+from torch.nn.functional import scaled_dot_product_attention
 
-from discit.distr import FixedVarNormal, MultiCategorical
+from discit.distr import FixedVarNormal, Categorical
 from discit.func import GradScaler
 from discit.rl import ActorCritic as ActorCriticTemplate
 
 import config as cfg
 
 
+# ------------------------------------------------------------------------------
+# MARK: VisEncoder
+
 class VisEncoder(Module):
     """Compresses image data into a vector encoding of visual information."""
-
-    ENC_SIZE = 224
 
     def __init__(self):
         super().__init__()
@@ -42,7 +43,7 @@ class VisEncoder(Module):
 
         # 4x2x80 -> 1x1x240 -> 1x1xE
         self.conv4_dw = nn.Conv2d(80, 240, (2, 4), 1, groups=80, bias=False)
-        self.conv4_cw = nn.Conv2d(240, self.ENC_SIZE, 1, 1)
+        self.conv4_cw = nn.Conv2d(240, cfg.VIS_ENC_SIZE, 1, 1)
 
         nn.init.xavier_normal_(self.conv1.weight)
         nn.init.xavier_normal_(self.conv2_dw.weight)
@@ -60,6 +61,9 @@ class VisEncoder(Module):
 
         return x
 
+
+# ------------------------------------------------------------------------------
+# MARK: UpBlock
 
 class UpBlock(Module):
     def __init__(self, in_channels: int, out_channels: int, r_factor: 'int | tuple[int, ...]', n_groups: int = 1):
@@ -80,6 +84,9 @@ class UpBlock(Module):
     def forward(self, x: Tensor) -> Tensor:
         return self.reshape(self.conv(self.norm(x)))
 
+
+# ------------------------------------------------------------------------------
+# MARK: ResBlock
 
 class ResBlock(Module):
     def __init__(self, in_channels: int, mid_channels: int, n_groups: int = 1):
@@ -107,6 +114,9 @@ class ResBlock(Module):
         return x + self.id_mul * x0
 
 
+# ------------------------------------------------------------------------------
+# MARK: VisDecoder
+
 class VisDecoder(Module):
     """Reproduces image data from a vector encoding of visual information."""
 
@@ -115,7 +125,7 @@ class VisDecoder(Module):
 
         # 1x1xE -> 1x1x1024 -> 4x2x128
         # 4x2x128 -> 4x2x256 -> 4x2x128 (2)
-        self.up4 = UpBlock(VisEncoder.ENC_SIZE, 1024, (-1, 128, 2, 4), 1)
+        self.up4 = UpBlock(cfg.VIS_ENC_SIZE, 1024, (-1, 128, 2, 4), 1)
         self.res4_1 = ResBlock(128, 256, 1)
         self.res4_2 = ResBlock(128, 256, 1)
 
@@ -154,6 +164,9 @@ class VisDecoder(Module):
         return x
 
 
+# ------------------------------------------------------------------------------
+# MARK: VisNet
+
 class VisNet(Module):
     """
     Visual auto-encoder network for image processing via compact form.
@@ -172,18 +185,19 @@ class VisNet(Module):
         return self.dec(self.enc(x))
 
 
-class SpaEncoder(Module):
-    """Conv. encoder for processing global state information in spatial form."""
+# ------------------------------------------------------------------------------
+# MARK: MapEncoder
 
-    ENC_SIZE = 128
+class MapEncoder(Module):
+    """Conv. encoder for processing global state information in spatial form."""
 
     def __init__(self):
         super().__init__()
 
         self.activ = nn.CELU(0.1)
 
-        # 20x20x16 -> 20x20x16
-        self.conv1 = nn.Conv2d(cfg.STATE_SPA_CHANNELS, 16, 3, padding=1)
+        # 20x20x15 -> 20x20x16
+        self.conv1 = nn.Conv2d(cfg.STATE_MAP_CHANNELS, 16, 3, padding=1)
         self.norm1 = nn.GroupNorm(4, 16)
 
         # 20x20x16 -> 10x10x24
@@ -199,8 +213,8 @@ class SpaEncoder(Module):
         self.norm3 = nn.GroupNorm(1, 48)
 
         # 5x5x48 -> 1x1xE
-        self.conv4 = nn.Conv2d(48, self.ENC_SIZE, 5)
-        self.norm4 = nn.GroupNorm(1, self.ENC_SIZE)
+        self.conv4 = nn.Conv2d(48, cfg.MAP_ENC_SIZE, 5)
+        self.norm4 = nn.GroupNorm(1, cfg.MAP_ENC_SIZE)
 
         nn.init.xavier_normal_(self.conv1.weight)
         nn.init.zeros_(self.conv1.bias)
@@ -218,211 +232,157 @@ class SpaEncoder(Module):
         return x.flatten(1)
 
 
-class Policy(Module):
-    """
-    Bicameral policy, where the motor and speaker subnetworks interact through
-    detached memory vectors to limit interference during optimisation.
-    """
+# ------------------------------------------------------------------------------
+# MARK: TopMAC
 
-    MOT_MEM_SIZE = 192
-    COM_MEM_SIZE = 64
-    MEM_SIZE = MOT_MEM_SIZE + COM_MEM_SIZE
+class TopMAC(Module):
 
-    SHORT_MEM_HALF_LIFE = 3 * cfg.STEPS_PER_SECOND
-    LONG_MEM_HALF_LIFE = 60 * cfg.STEPS_PER_SECOND
-    MAX_MEM_HORIZON = 300 * cfg.STEPS_PER_SECOND
-
-    FEAT_CONDITIONAL = 3
-    FEAT_TRAINED = 2
-    FEAT_EXTERNAL = 1
-    FEAT_DISABLED = 0
-
-    def __init__(
-        self,
-        com_state: int,
-        guide_state: int,
-        com_out_size: int,
-        com_bias: bool,
-        n_agents_per_env: int,
-        n_envs: int
-    ):
+    def __init__(self, n_envs: int, n_bots: int):
         super().__init__()
 
-        self.com_state = com_state
-        self.guide_state = guide_state
-        self.com_bias = com_bias
-
-        self.n_bots = n_agents_per_env
         self.n_envs = n_envs
-        self.n_all_bots = n_agents_per_env * n_envs
+        self.n_bots = n_bots
+        self.n_all_bots = n_envs * n_bots
 
-        self.input_sizes = (VisEncoder.ENC_SIZE + cfg.OBS_VEC_SIZE, cfg.AUX_VAL_SIZE, cfg.META_VAL_SIZE)
-        self.role_slice = slice(cfg.OBS_ROLE_IDX + VisEncoder.ENC_SIZE, cfg.OBS_ROLE_IDX + VisEncoder.ENC_SIZE + 1)
+        self.q = nn.Parameter(torch.empty(1, cfg.N_TOPICS, cfg.K_DIM))
+        self.k = nn.Parameter(torch.empty(1, cfg.N_TOPICS, cfg.K_DIM))
 
-        trq_values = torch.tensor(cfg.ACT_DOF_MODES_BASE)
-        clr_values = torch.tensor(cfg.RCVR_CLR_CLASSES)
-        self.trq_values = nn.Parameter(trq_values, requires_grad=False)
-        self.clr_values = nn.Parameter(clr_values, requires_grad=False)
-        self.out_values = (self.trq_values, self.clr_values)
-        self.output_sizes = (len(trq_values), len(clr_values))
+    def forward(self, qkv: Tensor, mask: Tensor) -> Tensor:
+        qkv = qkv.reshape(self.n_envs, self.n_bots, -1)
+        q, k, v = qkv.split(cfg.QKV_SPLIT, dim=-1)
 
-        trql_mask = torch.tensor((cfg.ACT_DOF_MOTION_MASK,), dtype=torch.float32)
-        self.trql_mask = nn.Parameter(trql_mask, requires_grad=False)
-        self.null_bias = nn.Parameter(torch.tensor(-20.), requires_grad=False)
+        top_q = self.q.expand(self.n_envs, -1, -1)
+        top_k = self.k.expand(self.n_envs, -1, -1)
 
-        coml_mask = torch.ones((1, cfg.N_RCVR_CLR_CLASSES))
-        coml_mask[0, :com_out_size] = 0.
-        self.coml_mask = nn.Parameter(coml_mask, requires_grad=False)
+        # N -> Ex1xB
+        mask = torch.where(mask.bool(), 0., -1e+6).reshape(self.n_envs, 1, self.n_bots)
 
-        coml_silent = torch.full((1, len(clr_values)), -20.)
-        coml_silent[:, 0] = 0.
-        self.coml_initial = nn.Parameter(coml_silent, requires_grad=False)
+        # ExTxQ, ExBxK, ExBxV -> ExTxV
+        top_v = scaled_dot_product_attention(top_q, k, v, mask)
+
+        # ExBxQ, ExTxK, ExTxV -> ExBxV
+        x = scaled_dot_product_attention(q, top_k, top_v)
+
+        return x.reshape(self.n_all_bots, -1)
+
+
+# ------------------------------------------------------------------------------
+# MARK: TarMAC
+
+class TarMAC:
+    def __init__(self, n_envs: int, n_bots: int):
+        self.n_envs = n_envs
+        self.n_bots = n_bots
+        self.n_all_bots = n_envs * n_bots
+
+    def __call__(self, qkv: Tensor, mask: Tensor) -> Tensor:
+        qkv = qkv.reshape(self.n_envs, self.n_bots, -1)
+        q, k, v = qkv.split(cfg.QKV_SPLIT, dim=-1)
+
+        # N -> Ex1xB
+        mask = torch.where(mask.bool(), 0., -1e+6).reshape(self.n_envs, 1, self.n_bots)
+
+        # ExBxQ, ExBxK, ExBxV -> ExBxV
+        x = scaled_dot_product_attention(q, k, v, mask)
+
+        return x.reshape(self.n_all_bots, -1)
+
+
+# ------------------------------------------------------------------------------
+# MARK: NoMAC
+
+class NoMAC(Module):
+    def __init__(self, n_envs: int, n_bots: int):
+        super().__init__()
+
+        self.zeros = nn.Parameter(torch.empty(n_envs * n_bots, cfg.V_DIM), requires_grad=False)
+
+    def forward(self, qkv: Tensor, mask: Tensor) -> Tensor:
+        return self.zeros
+
+
+# ------------------------------------------------------------------------------
+# MARK: Policy
+
+class Policy(Module):
+    def __init__(self, com_mode: int, n_envs: int, n_bots: int):
+        super().__init__()
+
+        self.com_mode = com_mode
+        self.n_envs = n_envs
+        self.n_bots = n_bots
+        self.n_all_bots = n_envs * n_bots
+
+        self.com_mask_idx = cfg.VIS_ENC_SIZE + cfg.LED_ON_IDX
+        self.qkv_initial = nn.Parameter(torch.zeros(1, sum(cfg.QKV_SPLIT)), requires_grad=False)
+
+        act_values = torch.tensor(cfg.ACT_VALUES)
+        self.act_values = nn.Parameter(act_values, requires_grad=False)
+        self.out_sizes = (len(cfg.ACT_VALUES), *cfg.AUX_VAL_SPLIT, sum(cfg.QKV_SPLIT))
 
         self.activ = nn.Tanh()
 
-        # E + 94 + 46|0 -> 320
-        self.fcin = nn.Linear(
-            self.input_sizes[0]+(cfg.AUX_VAL_SIZE if guide_state in (self.FEAT_EXTERNAL, self.FEAT_CONDITIONAL) else 0),
-            320)
+        # 128 -> 64
+        self.com = (NoMAC, TarMAC, TopMAC)[com_mode](n_envs, n_bots)
 
-        # 320 + Mc|Mm -> Mm|Mc
-        self.rnn_m = nn.GRUCell(320 + self.COM_MEM_SIZE, self.MOT_MEM_SIZE)
-        self.rnn_c = nn.GRUCell(320 + self.MOT_MEM_SIZE, self.COM_MEM_SIZE)
+        # 224 + 28 + 64 -> 320
+        self.fcin = nn.Linear(cfg.VIS_ENC_SIZE + cfg.OBS_VEC_SIZE + cfg.V_DIM, cfg.POL_ENC_SIZE)
 
-        # M -> A
-        self.fcaux = nn.Linear(self.MEM_SIZE, cfg.AUX_VAL_SIZE)
+        # 320 -> 256
+        self.rnn = nn.GRUCell(cfg.POL_ENC_SIZE, cfg.MEM_SIZE)
 
-        # Mm|Mc -> 5|11
-        self.fcout_m = nn.Linear(self.MOT_MEM_SIZE, self.output_sizes[0])
-        self.fcout_c = nn.Linear(self.COM_MEM_SIZE, self.output_sizes[1])
+        # 256 -> 10 + 13 + 128
+        self.fcout = nn.Linear(cfg.MEM_SIZE, sum(self.out_sizes))
 
         # https://r2rt.com/non-zero-initial-states-for-recurrent-neural-networks.html
-        self.mem_initial = nn.Parameter(torch.zeros(1, self.MEM_SIZE).uniform_(-1., 1.))
-        self.mem_sizes = (self.MOT_MEM_SIZE, self.COM_MEM_SIZE)
+        self.mem_initial = nn.Parameter(torch.zeros(1, cfg.MEM_SIZE).uniform_(-1., 1.))
 
     def random_init(self):
         nn.init.orthogonal_(self.fcin.weight)
         nn.init.zeros_(self.fcin.bias)
-        nn.init.orthogonal_(self.fcout_m.weight, gain=0.001)
-        nn.init.zeros_(self.fcout_m.bias)
-        nn.init.orthogonal_(self.fcout_c.weight, gain=0.001)
-        nn.init.zeros_(self.fcout_c.bias)
-        nn.init.orthogonal_(self.fcaux.weight, gain=0.001)
-        nn.init.zeros_(self.fcaux.bias)
+        nn.init.orthogonal_(self.fcout.weight, gain=0.001)
+        nn.init.zeros_(self.fcout.bias)
 
-        # Init. bias twd. neutral com. (short-range, unassociated with any obj.)
-        if self.com_bias:
-            coml_bias = torch.tensor([0.1/10., 0.9] + 9*[0.1/10.]).log_()
-            coml_bias -= coml_bias.max()
+        for weight in (self.rnn.weight_ih, self.rnn.weight_hh):
+            nn.init.orthogonal_(weight[:cfg.MEM_SIZE])
+            nn.init.orthogonal_(weight[cfg.MEM_SIZE:-cfg.MEM_SIZE])
+            nn.init.orthogonal_(weight[-cfg.MEM_SIZE:])
 
-            with torch.no_grad():
-                self.fcout_c.bias.copy_(coml_bias)
+        nn.init.zeros_(self.rnn.bias_ih)
+        nn.init.zeros_(self.rnn.bias_hh)
 
-        for rnn, mem_size in zip((self.rnn_m, self.rnn_c), self.mem_sizes):
-            for weight in (rnn.weight_ih, rnn.weight_hh):
-                nn.init.orthogonal_(weight[:mem_size])
-                nn.init.orthogonal_(weight[mem_size:-mem_size])
-                nn.init.orthogonal_(weight[-mem_size:])
+        # Multi-horizon chrono init.
+        with torch.no_grad():
+            chrono_bias = torch.cat([
+                torch.empty(cfg.CHRONO_SIZE).uniform_(ti, tj)
+                for ti, tj in zip(cfg.CHRONO_RANGES[:-1], cfg.CHRONO_RANGES[1:])])
 
-            nn.init.zeros_(rnn.bias_ih)
-            nn.init.zeros_(rnn.bias_hh)
+            self.rnn.bias_hh[cfg.MEM_SIZE:-cfg.MEM_SIZE] = chrono_bias.mul_(cfg.STEPS_PER_SECOND).log_()
 
-            # Chrono init. wrt. discount factors and max. episode length
-            with torch.no_grad():
-                gamma_short = 0.5 ** (1. / self.SHORT_MEM_HALF_LIFE)
-                gamma_long = 0.5 ** (1. / self.LONG_MEM_HALF_LIFE)
+    def forward(self, x: Tensor, qkv: Tensor, mem: Tensor) -> 'tuple[Tensor, ...]':
+        goal_found_mask = x[:, cfg.GOAL_FOUND_SLICE]
+        speaking_mask = x[:, self.com_mask_idx]
 
-                probs_short = torch.tensor([gamma_short**i for i in range(1, self.MAX_MEM_HORIZON)])
-                probs_short /= probs_short.sum()
-
-                probs_long = torch.tensor([gamma_long**i for i in range(1, self.MAX_MEM_HORIZON)])
-                probs_long /= probs_long.sum()
-
-                probs = 0.5 * probs_short + 0.5 * probs_long
-                horizons = 1. + probs.multinomial(mem_size, replacement=True)
-
-                rnn.bias_hh[mem_size:-mem_size] = horizons.log_()
-
-    def forward(self, x: Tensor, memp: Tensor, detach: bool) -> 'tuple[Tensor, ...]':
-        x, x_aux, heur_com_idx = x.split(self.input_sizes, dim=-1)
-        mem_m, mem_c = memp.split(self.mem_sizes, dim=-1)
-        speaker_mask = x[:, self.role_slice]
+        # Process messages
+        msg = self.com(qkv, speaking_mask)
 
         # Process observations
-        if self.guide_state == self.FEAT_CONDITIONAL:
-            obj_in_frame, obj_dirprox, obj_found = x_aux.split(cfg.AUX_VAL_SPLIT, dim=-1)
-            obj_dirprox = obj_dirprox.reshape(-1, cfg.N_DIM_POS, cfg.N_OBJ_COLOURS) * obj_found.unsqueeze(1)
-            obj_dirprox = obj_dirprox.flatten(1)
+        x = self.activ(self.fcin(torch.cat((x, msg), dim=-1)))
 
-            x = torch.cat((x, obj_in_frame, obj_dirprox, obj_found), dim=-1)
+        # Update memory/state and output
+        mem = self.rnn(x, mem)
 
-        elif self.guide_state == self.FEAT_EXTERNAL:
-            x = torch.cat((x, x_aux), dim=-1)
+        # Split output into actions, beliefs, and message components
+        a, bs, bg, qkv = self.fcout(mem).split(self.out_sizes, dim=-1)
 
-        x = self.activ(self.fcin(x))
+        # Detach grads. for unfound goals
+        bg = torch.lerp(bg.detach(), bg, goal_found_mask)
 
-        # Update com. memory/state and output
-        if self.com_state >= self.FEAT_TRAINED:
-            mem_c = self.rnn_c(torch.cat((x, mem_m.detach()), dim=-1), mem_c)
-            clr_logits = self.fcout_c(mem_c)
+        return a, bs, bg, qkv, mem
 
-        # Override - heuristic
-        # Obj. colour if seen and near, white if obstructed, black otherwise
-        elif self.com_state == self.FEAT_EXTERNAL:
-            clr_logits = -20. * torch.logical_not(one_hot(heur_com_idx.squeeze(-1).long(), cfg.N_RCVR_CLR_CLASSES))
 
-        # Override - silent
-        else:
-            clr_logits = self.coml_initial.expand(len(x), -1)
-
-        # Update mot. memory/state and output
-        mem_m = self.rnn_m(torch.cat((x, mem_c.detach()), dim=-1), mem_m)
-        trq_logits = self.fcout_m(mem_m)
-
-        # Freeze translation and mask colours for speakers when com. training is emphasised
-        if self.com_state == self.FEAT_CONDITIONAL:
-            trq_logits = torch.lerp(trq_logits, self.null_bias, self.trql_mask * speaker_mask)
-            clr_logits = torch.lerp(clr_logits, self.null_bias, self.coml_mask * speaker_mask)
-
-        # Detach grads. from non-speakers
-        elif self.com_state == self.FEAT_TRAINED:
-            clr_logits = torch.lerp(clr_logits.detach(), clr_logits, speaker_mask)
-
-        memp = torch.cat((mem_m, mem_c), dim=-1)
-        x = torch.cat((trq_logits, clr_logits), dim=-1)
-
-        # Auxiliary obj. estimates
-        if self.guide_state == self.FEAT_TRAINED:
-            a = self.fcaux(memp.detach() if detach else GradScaler.apply(memp, 0.01))
-            a_01, a_dir = a.split((cfg.AUX_VAL_SIZE - 2*cfg.N_OBJ_COLOURS, 2*cfg.N_OBJ_COLOURS), dim=-1)
-
-            a_01 = a_01.sigmoid()
-            a_in_frame, a_prox, a_found = a_01.split((cfg.N_OBJ_COLOURS+1,) + (cfg.N_OBJ_COLOURS,)*2, dim=-1)
-
-            a_dir = a_dir.reshape(len(x), 2, -1)
-            a_dir = a_dir / torch.linalg.norm(a_dir, dim=1, keepdim=True)
-
-            # Detach error grads. for unfound objs.
-            obj_found = x_aux[:, -cfg.AUX_VAL_SPLIT[-1]:]
-            any_found = obj_found.reshape(self.n_envs, self.n_bots, -1).any(1)
-            any_found = any_found.repeat_interleave(self.n_bots, dim=0, output_size=self.n_all_bots)
-
-            a_dirprox = torch.cat((a_dir, a_prox.unsqueeze(1)), dim=1) * any_found.unsqueeze(1)
-            a_dirprox = a_dirprox.flatten(1)
-
-            a = torch.cat((a_in_frame, a_dirprox, a_found), dim=-1)
-
-        else:
-            a = self.fcaux(memp.detach())
-
-        # Detach grads. from non-speakers
-        if self.com_state == self.FEAT_CONDITIONAL:
-            x = torch.lerp(x.detach(), x, speaker_mask)
-            a = torch.lerp(a.detach(), a, speaker_mask)
-            memp = torch.lerp(memp.detach(), memp, speaker_mask)
-
-        return x, a, memp
-
+# ------------------------------------------------------------------------------
+# MARK: AttentionBlock
 
 class AttentionBlock(Module):
     def __init__(self, in_dim: int, embed_dim: int, n_heads: int, n_per_group: int):
@@ -459,6 +419,9 @@ class AttentionBlock(Module):
         return x
 
 
+# ------------------------------------------------------------------------------
+# MARK: Valuator
+
 class Valuator(Module):
     """
     Critic network attending to a variable number of agents per environment.
@@ -468,39 +431,30 @@ class Valuator(Module):
     to the agents, are critical to reliably anticipate future rewards.
     """
 
-    MEM_SIZE = 256
-    N_MEM_HALF_LIVES = 2
-
-    SHORT_MEM_HALF_LIFE = Policy.SHORT_MEM_HALF_LIFE
-    LONG_MEM_HALF_LIFE = MAX_MEM_HORIZON = Policy.MAX_MEM_HORIZON
-
-    def __init__(self, com_state: int, n_agents_per_env: int, n_envs: int):
+    def __init__(self, n_envs: int, n_bots: int):
         super().__init__()
 
-        self.detach_cond = com_state == Policy.FEAT_CONDITIONAL
-        self.role_slice = slice(cfg.OBS_ROLE_IDX, cfg.OBS_ROLE_IDX + 1)
-
-        self.n_bots = n_agents_per_env
-        self.n_all_bots = n_agents_per_env * n_envs
+        self.n_bots = n_bots
+        self.n_all_bots = n_envs * n_bots
 
         self.activ = nn.Tanh()
 
-        # 20x20x16 -> 128
-        self.spaencoder = SpaEncoder()
+        # 20x20x15 -> 128
+        self.mapenc = MapEncoder()
 
-        # 122 + 128 + Mp -> 512
-        self.fcin = nn.Linear(cfg.STATE_VEC_SIZE + SpaEncoder.ENC_SIZE + Policy.MEM_SIZE, 512)
+        # 108 + 128 + 256 -> 512
+        self.fcin = nn.Linear(cfg.STATE_VEC_SIZE + cfg.MAP_ENC_SIZE + cfg.MEM_SIZE, cfg.VAL_ENC_SIZE)
 
-        # 512 -> M
-        self.rnn = nn.GRUCell(512, self.MEM_SIZE)
+        # 512 -> 256
+        self.rnn = nn.GRUCell(cfg.VAL_ENC_SIZE, cfg.MEM_SIZE)
 
-        # M -> 256 -> V
+        # 256 -> 256 -> 3
         self.mlpout = nn.Sequential(
-            nn.Linear(self.MEM_SIZE, 256),
+            nn.Linear(cfg.MEM_SIZE, cfg.VAL_PEN_SIZE),
             self.activ,
-            nn.Linear(256, self.N_MEM_HALF_LIVES))
+            nn.Linear(cfg.VAL_PEN_SIZE, len(cfg.DISCOUNTS)))
 
-        self.mem_initial = nn.Parameter(torch.zeros(1, self.MEM_SIZE).uniform_(-1., 1.))
+        self.mem_initial = nn.Parameter(torch.zeros(1, cfg.MEM_SIZE).uniform_(-1., 1.))
 
     def random_init(self):
         nn.init.orthogonal_(self.fcin.weight)
@@ -511,36 +465,28 @@ class Valuator(Module):
         nn.init.zeros_(self.mlpout[2].bias)
 
         for weight in (self.rnn.weight_ih, self.rnn.weight_hh):
-            nn.init.orthogonal_(weight[:self.MEM_SIZE])
-            nn.init.orthogonal_(weight[self.MEM_SIZE:-self.MEM_SIZE])
-            nn.init.orthogonal_(weight[-self.MEM_SIZE:])
+            nn.init.orthogonal_(weight[:cfg.MEM_SIZE])
+            nn.init.orthogonal_(weight[cfg.MEM_SIZE:-cfg.MEM_SIZE])
+            nn.init.orthogonal_(weight[-cfg.MEM_SIZE:])
 
         nn.init.zeros_(self.rnn.bias_ih)
         nn.init.zeros_(self.rnn.bias_hh)
 
-        # Chrono init. wrt. discount factors and max. episode length
+        # Multi-horizon chrono init.
         with torch.no_grad():
-            gamma_short = 0.5 ** (1. / self.SHORT_MEM_HALF_LIFE)
-            gamma_long = 0.5 ** (1. / self.LONG_MEM_HALF_LIFE)
+            chrono_bias = torch.cat([
+                torch.empty(cfg.CHRONO_SIZE).uniform_(ti, tj)
+                for ti, tj in zip(cfg.CHRONO_RANGES[:-1], cfg.CHRONO_RANGES[1:])])
 
-            probs_short = torch.tensor([gamma_short**i for i in range(1, self.MAX_MEM_HORIZON)])
-            probs_short /= probs_short.sum()
+            self.rnn.bias_hh[cfg.MEM_SIZE:-cfg.MEM_SIZE] = chrono_bias.mul_(cfg.STEPS_PER_SECOND).log_()
 
-            probs_long = torch.tensor([gamma_long**i for i in range(1, self.MAX_MEM_HORIZON)])
-            probs_long /= probs_long.sum()
-
-            probs = 0.5 * probs_short + 0.5 * probs_long
-            horizons = 1. + probs.multinomial(self.MEM_SIZE, replacement=True)
-
-            self.rnn.bias_hh[self.MEM_SIZE:-self.MEM_SIZE] = horizons.log_()
-
-    def forward(self, x_vec: Tensor, x_spa: Tensor, memp: Tensor, memv: Tensor) -> 'tuple[Tensor, Tensor]':
+    def forward(self, x: Tensor, x_map: Tensor, memp: Tensor, memv: Tensor) -> 'tuple[Tensor, Tensor]':
 
         # Encode spatial state information
-        x_spa = self.spaencoder(x_spa).repeat_interleave(self.n_bots, dim=0, output_size=self.n_all_bots)
+        x_map = self.mapenc(x_map).repeat_interleave(self.n_bots, dim=0, output_size=self.n_all_bots)
 
         # Consolidate local observations with global state information
-        x = torch.cat((x_vec, x_spa, memp), dim=-1)
+        x = torch.cat((x, x_map, memp), dim=-1)
         x = self.activ(self.fcin(x))
 
         # Update temporal variables
@@ -549,32 +495,23 @@ class Valuator(Module):
         # Map to value distribution parameters
         x = self.mlpout(memv)
 
-        # Detach grads. from non-speakers
-        if self.detach_cond:
-            speaker_mask = x_vec[:, self.role_slice]
-            x = torch.lerp(x.detach(), x, speaker_mask)
-            memv = torch.lerp(memv.detach(), memv, speaker_mask)
-
         return x, memv
 
+
+# ------------------------------------------------------------------------------
+# MARK: ActorCritic
 
 class ActorCritic(ActorCriticTemplate):
     """Wrapper around the visual encoder, policy, and valuator networks."""
 
-    def __init__(
-        self,
-        n_agents_per_env: int = 1,
-        n_envs: int = 1,
-        com_state: int = Policy.FEAT_TRAINED,
-        guide_state: int = Policy.FEAT_DISABLED,
-        com_out_size: int = cfg.N_RCVR_CLR_CLASSES,
-        com_bias: bool = True
-    ):
+    def __init__(self, n_envs: int, n_bots: int, com_mode: int):
         super().__init__()
 
+        self.n_all_bots = n_envs * n_bots
+
         self.visencoder = VisEncoder()
-        self.policy = Policy(com_state, guide_state, com_out_size, com_bias, n_agents_per_env, n_envs)
-        self.valuator = Valuator(com_state, n_agents_per_env, n_envs)
+        self.policy = Policy(com_mode, n_envs, n_bots)
+        self.valuator = Valuator(n_envs, n_bots)
 
         for param in self.visencoder.parameters():
             param.requires_grad = False
@@ -583,45 +520,26 @@ class ActorCritic(ActorCriticTemplate):
         self.valuator.random_init()
 
     def init_mem(self, batch_size: int = 1) -> 'tuple[Tensor, Tensor]':
-        memp = self.policy.mem_initial.detach().expand(batch_size, -1).clone()
-        memv = self.valuator.mem_initial.detach().expand(batch_size, -1).clone()
+        qkv = self.policy.qkv_initial.detach().expand(self.n_all_bots, -1).clone()
+        memp = self.policy.mem_initial.detach().expand(self.n_all_bots, -1).clone()
+        memv = self.valuator.mem_initial.detach().expand(self.n_all_bots, -1).clone()
 
-        return memp, memv
+        return qkv, memp, memv
 
     def reset_mem(self, mem: 'tuple[Tensor, Tensor]', nonreset_mask: Tensor) -> 'tuple[Tensor, Tensor]':
-        memp, memv = mem
+        qkv, memp, memv = mem
 
+        qkv = torch.lerp(self.policy.qkv_initial, qkv, nonreset_mask)
         memp = torch.lerp(self.policy.mem_initial, memp, nonreset_mask)
         memv = torch.lerp(self.valuator.mem_initial, memv, nonreset_mask)
 
-        return memp, memv
+        return qkv, memp, memv
 
-    def get_distr(self, args: 'Tensor | tuple[Tensor, ...]', from_raw: bool) -> MultiCategorical:
-        if from_raw:
-            return MultiCategorical.from_raw(self.policy.out_values, args.split(self.policy.output_sizes, dim=-1))
-
-        return MultiCategorical(self.policy.out_values, args)
+    def get_distr(self, args: Tensor, from_raw: bool) -> Categorical:
+        return (Categorical.from_raw if from_raw else Categorical)(self.policy.act_values, args)
 
     def unwrap_sample(self, sample: 'tuple[Tensor, Tensor]') -> 'tuple[Tensor, Tensor]':
-        return sample[0], sample[1][:, 1]
-
-    def act_partial(
-        self,
-        img: Tensor,
-        vec: Tensor,
-        _spa: Tensor,
-        memp: Tensor,
-        _memv: Tensor
-    ) -> 'tuple[Tensor, Tensor]':
-
-        with torch.no_grad():
-            img_enc = self.visencoder(img).flatten(1)
-
-            inp = torch.cat((img_enc, vec[:, :cfg.OBS_VEC_SIZE+cfg.AUX_VAL_SIZE], vec[:, -cfg.META_VAL_SIZE:]), dim=-1)
-
-            x, _, memp = self.policy(inp, memp, False)
-
-        return x, memp
+        return sample[0], None
 
     def act(
         self,
@@ -630,64 +548,24 @@ class ActorCritic(ActorCriticTemplate):
         sample: bool
     ) -> 'tuple[tuple[Tensor, ...], tuple[Tensor, ...]]':
 
-        x, memp = self.act_partial(*obs, *mem)
-        act = self.get_distr(x, from_raw=True)
+        x_img, x_vec, _ = obs
+        qkv, memp, memv = mem
+
+        with torch.no_grad():
+            x_img = self.visencoder(x_img).flatten(1)
+            x = torch.cat((x_img, x_vec[:, :cfg.OBS_VEC_SIZE]), dim=-1)
+
+            a, _, _, qkv, memp = self.policy(x, qkv, memp)
+
+        act = self.get_distr(a, from_raw=True)
 
         if sample:
-            x = act.sample()
+            a = act.sample()
 
         else:
-            x = act.mode, torch.stack([lp.argmax(dim=-1) for lp in act.log_prob_tpl], dim=-1)
+            a = act.mode, a.log_probs.argmax(dim=-1).unsqueeze(-1)
 
-        return x, (memp, mem[-1])
-
-    def fwd_partial(
-        self,
-        inp: Tensor,
-        inv: Tensor,
-        spa: Tensor,
-        memp: Tensor,
-        memv: Tensor,
-        detach: bool
-    ) -> 'tuple[Tensor, ...]':
-
-        x, a, memp = self.policy(inp, memp, detach)
-        v, memv = self.valuator(inv, spa, memp.detach() if detach else GradScaler.apply(memp, 0.01), memv)
-
-        return x, v, a, memp, memv
-
-    def collect_static(
-        self,
-        img: Tensor,
-        vec: Tensor,
-        spa: Tensor,
-        memp: Tensor,
-        memv: Tensor
-    ) -> 'tuple[Tensor, ...]':
-
-        with torch.no_grad():
-            img_enc = self.visencoder(img).flatten(1)
-
-            inp = torch.cat((img_enc, vec[:, :cfg.OBS_VEC_SIZE+cfg.AUX_VAL_SIZE], vec[:, -cfg.META_VAL_SIZE:]), dim=-1)
-            inv = torch.cat((vec[:, :cfg.OBS_LOC_SIZE], vec[:, cfg.STATE_VEC_SLICE]), dim=-1)
-
-            x, v, _, memp, memv = self.fwd_partial(inp, inv, spa, memp, memv, detach=False)
-
-        return x, v, inp, inv, memp, memv
-
-    def collect_copied(
-        self,
-        inp: Tensor,
-        inv: Tensor,
-        spa: Tensor,
-        memp: Tensor,
-        memv: Tensor
-    ) -> 'tuple[Tensor, ...]':
-
-        with torch.no_grad():
-            x, v, _, memp, memv = self.fwd_partial(inp, inv, spa, memp, memv, detach=False)
-
-        return x, v, memp, memv
+        return a, (qkv, memp, memv)
 
     def collect(
         self,
@@ -696,26 +574,35 @@ class ActorCritic(ActorCriticTemplate):
         encode: bool
     ) -> 'tuple[Tensor, Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
 
-        if encode:
-            x, val_mean, inp, inv, memp, memv = self.collect_static(*obs, *mem)
-            obs = inp, inv, obs[-1].clone()
+        xp, xv, x_map = obs
+        qkv, memp, memv = mem
 
-        else:
-            x, val_mean, memp, memv = self.collect_copied(*obs, *mem)
+        with torch.no_grad():
+            if encode:
+                x_img = self.visencoder(xp).flatten(1)
+                xp = torch.cat((x_img, xv[:, :cfg.OBS_VEC_SIZE]), dim=-1)
 
-        return x, val_mean, obs, (memp, memv)
+            a, _, _, qkv, memp = self.policy(xp, qkv, memp)
+            v, memv = self.valuator(xv, x_map, GradScaler.apply(memp, 0.01), memv)
+
+        return a, v, (xp, xv, x_map), (qkv, memp, memv)
 
     def forward(
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]',
         detach: bool = False
-    ) -> 'tuple[MultiCategorical, FixedVarNormal, FixedVarNormal, tuple[Tensor, ...]]':
+    ) -> 'tuple[Categorical, FixedVarNormal, tuple[Categorical, FixedVarNormal], tuple[Tensor, ...]]':
 
-        x, v, a, memp, memv = self.fwd_partial(*obs, *mem, detach=detach)
+        xp, xv, x_map = obs
+        qkv, memp, memv = mem
 
-        act = self.get_distr(x, from_raw=True)
+        a, bs, bg, qkv, memp = self.policy(xp, qkv, memp)
+        v, memv = self.valuator(xv, x_map, memp.detach() if detach else GradScaler.apply(memp, 0.01), memv)
+
+        act = self.get_distr(a, from_raw=True)
         val = FixedVarNormal(v, skip_log_shift=True)
-        aux = FixedVarNormal(a, skip_log_shift=True)
+        bs = Categorical(bs)
+        bg = FixedVarNormal(bg, skip_log_shift=True)
 
-        return act, val, aux, (memp, memv)
+        return act, val, (bs, bg), (qkv, memp, memv)

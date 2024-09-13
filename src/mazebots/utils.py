@@ -1,29 +1,11 @@
 """Core/numpy utilities"""
 
 import os
-from typing import Any, Callable
-
 import numpy as np
 import numba
 from numpy import ndarray
 from numba.core import types
 from numba.typed import Dict
-from scipy.spatial import Delaunay
-
-
-def get_arg_defaults(fn: Callable) -> 'dict[str, Any]':
-    """Get the input argument defaults of the given function."""
-
-    varnames = fn.__code__.co_varnames
-    defaults = fn.__defaults__
-
-    if defaults is None:
-        defaults = ()
-
-    if len(defaults) < len(varnames):
-        defaults = (None,) * (len(varnames) - len(defaults)) + defaults
-
-    return {k: v for k, v in zip(varnames, defaults)}
 
 
 def get_available_file_idx(data_dir: str, prefix: str) -> int:
@@ -34,54 +16,6 @@ def get_available_file_idx(data_dir: str, prefix: str) -> int:
     return 1 + max((
         int(name.split('_')[-1].split('.')[0])
         for name in filenames if name.startswith(prefix)), default=-1)
-
-
-def urquhart(pts: ndarray) -> ndarray:
-    """
-    Form the (cyclical, connected) Urquhart graph from the Delaunay
-    triangulation of given points.
-    """
-
-    tri = Delaunay(pts)
-
-    # Get unique edges in the triangulation
-    edges = set()
-
-    for i, j, k in tri.simplices:
-        edges.add(tuple(sorted((i, j))))
-        edges.add(tuple(sorted((i, k))))
-        edges.add(tuple(sorted((j, k))))
-
-    # Remove the longest edge from each triangle in the triangulation
-    for simplex in tri.simplices:
-        i, j, k = simplex
-        pi, pj, pk = pts[simplex]
-
-        argmax = np.argmax(np.linalg.norm((pi - pj, pi - pk, pj - pk), axis=1))
-
-        if argmax == 0:
-            u, v = i, j
-
-        elif argmax == 1:
-            u, v = i, k
-
-        else:
-            u, v = j, k
-
-        try:
-            edges.remove(tuple(sorted((u, v))))
-
-        except KeyError:
-            pass
-
-    # Return remaining edges as pairs of coordinates
-    return np.array([[pts[idx] for idx in edge] for edge in edges])
-
-
-def any_intersections(p1: ndarray, p2: ndarray, edges: ndarray) -> bool:
-    """Check for intersections between a segment and a set of edges."""
-
-    return any(intersection(p1, p2, q1, q2) for q1, q2 in edges)
 
 
 @numba.jit(nopython=True, nogil=True, cache=True)
@@ -152,49 +86,67 @@ def ray_trace(
     p1: ndarray,
     grid_edge_pairs: ndarray
 ) -> bool:
-    """Bresenham line tracer checking for possible intersections on the go."""
+    """
+    Bresenham line tracer checking for possible intersections on the go.
 
-    x0, y0 = i0[0], i0[1]
+    Expects an aux. array of `(N_rows+1, N_cols+1, 2 edges, 2 points, 2 coords)`,
+    where the 2 edges are the left (western) vertical and the upper (northern)
+    horizontal side (wall) of a cell in a grid of `N_rows` by `N_cols`,
+    and masked with zeros to denote a clearing.
+    """
+
+    # Starting and ending coordinates
+    x, y = i0[0], i0[1]
     x1, y1 = i1[0], i1[1]
 
-    dx = abs(x1 - x0)
-    dy = -abs(y1 - y0)
+    # Opposite-signed coordinate distances
+    dx = -abs(x1 - x)
+    dy = abs(y1 - y)
 
+    # Initial balanced incremental error
     e = dx + dy
 
-    sx = 1 if x0 < x1 else -1
-    sy = 1 if y0 < y1 else -1
+    # Signed steps
+    sx = 1 if x < x1 else -1
+    sy = 1 if y < y1 else -1
 
-    while True:
-        for i in range(2):
-            if intersection(p0, p1, grid_edge_pairs[x0, y0, i, 0], grid_edge_pairs[x0, y0, i, 1]):
-                return False
+    # Cache to avoid repetition
+    cache = {}
 
-        if x0 == x1 and y0 == y1:
-            break
+    # Trace until the end is reached
+    while x != x1 or y != y1:
 
-        y0_ = y0 + sy
-        x0_ = x0 + sx
+        # Broad sweep around regardless of movement
+        # TODO: Bresenham's path may differ from path covered by line btw. cont. pts.
+        x_next = min(20, x + sx)
+        y_next = min(20, y + sy)
 
-        if y0 != y1:
-            for i in range(2):
-                if intersection(p0, p1, grid_edge_pairs[x0, y0_, i, 0], grid_edge_pairs[x0, y0_, i, 1]):
-                    return False
+        x_prev = max(0, x - sx)
+        y_prev = max(0, y - sy)
 
-        if x0 != x1:
-            for i in range(2):
-                if intersection(p0, p1, grid_edge_pairs[x0_, y0, i, 0], grid_edge_pairs[x0_, y0, i, 1]):
-                    return False
+        for tx in (x_prev, x, x_next):
+            for ty in (y_prev, y, y_next):
+                for tc in (0, 1):
+                    key = (tx, ty, tc)
 
+                    if key in cache:
+                        continue
+
+                    cache[key] = False
+
+                    if intersection(p0, p1, grid_edge_pairs[tx, ty, tc, 0], grid_edge_pairs[tx, ty, tc, 1]):
+                        return False
+
+        # Infer movement from error, increment coordinates and error
         e2 = 2*e
 
-        if e2 >= dy:
+        if e2 <= dy:
             e += dy
-            x0 = x0_
+            x = x_next
 
-        if e2 <= dx:
+        if e2 >= dx:
             e += dx
-            y0 = y0_
+            y = y_next
 
     return True
 
@@ -205,12 +157,11 @@ def eval_line_of_sight(
     target_pos: ndarray,
     target_idcs: ndarray,
     open_grid_delims: ndarray,
-    grid_edge_pair_list: ndarray
+    grid_edge_pairs: ndarray
 ) -> ndarray:
     """Run ray tracing from multiple origins to their targets."""
 
     origin_idcs = np.digitize(origin_pos, open_grid_delims)
-    grid_step = len(origin_pos) // len(grid_edge_pair_list)
 
     return np.array([
         ray_trace(
@@ -218,7 +169,7 @@ def eval_line_of_sight(
             target_idcs[i],
             origin_pos[i],
             target_pos[i],
-            grid_edge_pair_list[i // grid_step])
+            grid_edge_pairs)
         for i in range(len(origin_pos))])
 
 
@@ -358,74 +309,23 @@ def get_cached_paths(
 
         else:
             path = astar(graph, grid_square_centres, entry_node, exit_node)
+
+            path = prune_path_backward(
+                path,
+                exit_idcs[i],
+                target_pos[i],
+                grid_square_centres,
+                grid_edge_pairs,
+                n_squares_per_row)
+
             path_map[path_key] = path
 
-        path = prune_path_backward(
-            path,
-            exit_idcs[i],
-            target_pos[i],
-            grid_square_centres,
-            grid_edge_pairs,
-            n_squares_per_row)
+            # Add entries for all cells on the path as starting nodes
+            for j in range(1, len(path)-1):
+                path_key = path[j], exit_node
 
-        path = prune_path_forward(
-            path,
-            entry_idcs[i],
-            origin_pos[i],
-            grid_square_centres,
-            grid_edge_pairs,
-            n_squares_per_row)
-
-        dists[pt_i], dirs[pt_i] = eval_path(
-            path,
-            origin_pos[i],
-            target_pos[i],
-            grid_square_centres)
-
-    return dists, dirs
-
-
-@numba.jit(nopython=True, nogil=True, cache=True)
-def reconstruct_paths(
-    origin_pos: ndarray,
-    target_pos: ndarray,
-    sight_mask: ndarray,
-    path_map: 'dict[tuple[int, int], ndarray]',
-    open_grid_delims: ndarray,
-    grid_square_centres: ndarray,
-    grid_edge_pairs: ndarray
-) -> 'tuple[ndarray, ndarray]':
-    """
-    Estimate path length and starting direction from valid starting points
-    to target end points based on precomputed A* reference paths.
-    """
-
-    # Compute air distance to goal
-    diffs = target_pos - origin_pos
-    dists = np.sqrt(np.sum(diffs**2, axis=1))
-    dirs = diffs / np.expand_dims(dists, 1)
-
-    # Check for points without their goal in sight
-    remaining_pt_idcs = np.where(~sight_mask)[0]
-
-    if len(remaining_pt_idcs) == 0:
-        return dists, dirs
-
-    # For remaining points, find entry and exit nodes (bounding squares)
-    origin_pos = origin_pos[remaining_pt_idcs]
-    target_pos = target_pos[remaining_pt_idcs]
-
-    entry_idcs = np.digitize(origin_pos, open_grid_delims)
-    exit_idcs = np.digitize(target_pos, open_grid_delims)
-
-    # Node IDs are flattened grid indices
-    n_squares_per_row = len(open_grid_delims) + 1
-    entry_nodes = n_squares_per_row * entry_idcs[:, 0] + entry_idcs[:, 1]
-    exit_nodes = n_squares_per_row * exit_idcs[:, 0] + exit_idcs[:, 1]
-
-    # Traverse graph for each remaining point until their goal is in sight
-    for i, pt_i in enumerate(remaining_pt_idcs):
-        path = path_map[entry_nodes[i], exit_nodes[i]]
+                if path_key not in path_map:
+                    path_map[path_key] = path[:j+1]
 
         path = prune_path_forward(
             path,
@@ -539,7 +439,6 @@ def prune_path_backward(
         if ray_trace(exit_idcs, node_idcs, target_pos, node_pos, grid_edge_pairs):
             exit_ptr = ptr
 
-        else:
-            break
+        # No need to break, as target pos. within a cell does not change
 
     return path[exit_ptr:]
