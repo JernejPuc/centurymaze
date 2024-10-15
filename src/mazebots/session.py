@@ -10,14 +10,15 @@ from isaacgym import gymapi, gymutil
 import torch
 from torch import Tensor, float32
 
-from discit.optim import AnnealingScheduler, CoeffScheduler, NAdamW
-from discit.rl import PPG
+from discit.optim import AnnealingScheduler, CoeffScheduler, MultiOptimizer, MultiScheduler, NAdamW
+from discit.marl import MAXPPO
 from discit.track import CheckpointTracker
 
 import config as cfg
 from sim import MazeSim
 from task import BasicInterface, MazeTask
-from model import ActorCritic, VisNet
+from train import ComAuxTask, VisAuxTask
+from model import ActorCritic, RandomActorCritic, VisNet
 from utils import get_available_file_idx
 from utils_torch import apply_quat_rot, norm_distance
 
@@ -298,8 +299,6 @@ class Interface(BasicInterface):
         obs_vec = obs_vec[self.all_bot_idx].cpu().numpy()
         obs_map = obs_map[self.env_idx, :, xidx, yidx].cpu().numpy()
 
-        # TODO: Separate joint and individual reward
-        # joint_rwd = data['rwd'][0][self.env_idx].item()
         joint_rwd, indiv_rwd, indiv_pen = data['rwd'][self.all_bot_idx].cpu().numpy()
 
         aux_val = data['vaux'][self.all_bot_idx].cpu().numpy()
@@ -403,7 +402,13 @@ class Interface(BasicInterface):
         obs_img = self.session.last_data['obs'][0]
 
         hsvd = obs_img[self.all_bot_idx:self.all_bot_idx+1]
-        out = self.visnet(hsvd)
+
+        with torch.inference_mode():
+            out, _, _, b_obj, b_loc = self.visnet(hsvd)
+
+        if self.prev_reconstruct:
+            self.session.obj_in_mind[self.all_bot_idx] = b_obj[0, 1:]
+            self.session.goal_pos_in_mind[self.all_bot_idx] = b_loc[0]
 
         clr_logits, ent_logits, dep = out.split(cfg.DEC_IMG_CHANNEL_SPLIT, dim=1)
         clr_probs = clr_logits[0].softmax(dim=0).cpu().numpy()
@@ -412,8 +417,7 @@ class Interface(BasicInterface):
 
         dep = np.clip(dep * 255., 0., 255.)
         ent_seg = (ent_probs * self.ENT_CLASSES).sum(axis=0)
-        # TODO: Remove slice after VisNet update
-        rgb_seg = (clr_probs[:cfg.N_CLR_CLASSES, ..., None] * self.RGB_CLASSES).sum(axis=0)
+        rgb_seg = (clr_probs[..., None] * self.RGB_CLASSES).sum(axis=0)
 
         return rgb_seg, dep, ent_seg
 
@@ -650,7 +654,6 @@ class Session(MazeTask):
         {'name': '--transfer_ver', 'type': int, 'default': -1, 'help': 'Starting model ckpt. version.'},
         {'name': '--model_name', 'type': str, 'default': 'mazeai', 'help': 'Model name/ID string.'},
         {'name': '--com_mode', 'type': int, 'default': cfg.COM_TOPIC, 'help': 'Mode of inter-agent communication.'},
-        # TODO: Impl. auxiliary tasks
         {'name': '--aux_mode', 'type': int, 'default': cfg.AUX_NONE, 'help': 'Mode of auxiliary com. training.'},
         {'name': '--prob_actor', 'type': int, 'default': 1, 'help': 'Option to keep probabilistic inference.'},
         {'name': '--rng_seed', 'type': int, 'default': cfg.SEEDS[-1], 'help': 'Seed for numpy and torch RNGs.'}]
@@ -664,6 +667,7 @@ class Session(MazeTask):
 
         # Resume model state
         self.model_options = {'n_envs': args.n_envs, 'n_bots': args.n_bots, 'com_mode': args.com_mode}
+        self.aux_mode = args.aux_mode
         self.prob_actor = bool(args.prob_actor)
 
         self.ckpter = CheckpointTracker(
@@ -672,7 +676,7 @@ class Session(MazeTask):
             ver_to_transfer=args.transfer_ver if args.transfer_ver >= 0 else None,
             reset_step_on_transfer=True)
 
-        if self.ctrl_mode == self.CTRL_RL:
+        if self.ctrl_mode in (self.CTRL_GEN, self.CTRL_RL):
             self.ckpter.logger.info(f'Training with args.:\n{{{str(args)[10:-1]}}}')
 
         # Init. Isaac Gym, envs., and state tensors
@@ -690,16 +694,21 @@ class Session(MazeTask):
             args.act_freq,
             args.draw_freq,
             render_cameras=self.ctrl_mode > self.CTRL_MAN or self.rec_mode > self.REC_NONE or self.preview,
-            keep_segmentation=self.rec_mode > self.REC_NONE,
-            keep_rgb_over_hsv=self.ctrl_mode <= self.CTRL_GEN and not self.preview,
+            keep_segmentation=self.ctrl_mode == self.CTRL_GEN or self.rec_mode > self.REC_NONE,
+            keep_rgb_over_hsv=self.ctrl_mode == self.CTRL_MAN and not self.preview,
             stagger_env_resets=self.ctrl_mode == self.CTRL_RL,
             device=args.sim_device)
 
     # --------------------------------------------------------------------------
     # MARK: post_step
 
-    def post_step(self, step_data: 'dict[str, Tensor | tuple[Tensor, ...]]') -> 'tuple[Tensor, ...]':
-        obs = step_data['obs']
+    def post_step(
+        self,
+        obs: 'tuple[Tensor, ...]',
+        step_data: 'dict[str, Tensor | tuple[Tensor, ...]]'
+    ) -> 'tuple[Tensor, ...]':
+
+        step_data['obs'] = obs
 
         # Keep data for debugging via interface
         self.last_data = step_data
@@ -728,11 +737,9 @@ class Session(MazeTask):
             img = img.mean((-2, -1))
             spa = spa.mean((-2, -1))
 
-        # TODO: Separate joint and individual reward
-        # rwdj = rwdj.repeat_interleave(self.sim.n_bots, dim=0, output_size=self.sim.n_all_bots)
-        prio = prio.repeat_interleave(self.sim.n_bots, dim=0, output_size=self.sim.n_all_bots)
+        prio = prio.repeat_interleave(self.sim.n_bots, dim=0, output_size=self.sim.n_all_bots).unsqueeze(-1)
 
-        vecs = (vec, rwd, vaux, prio.unsqueeze(-1), nrst)
+        vecs = (vec, rwd, vaux, prio, nrst)
 
         img_data = img.cpu().numpy()
         vec_data = torch.hstack(vecs).cpu().numpy()
@@ -801,25 +808,40 @@ class Session(MazeTask):
     # MARK: train
 
     def train(self):
-        encoder_path = os.path.join(cfg.ASSET_DIR, 'visenc.pt')
 
-        # Load model
+        # Init. model
         model = ActorCritic(**self.model_options)
-
         model.to(self.ckpter.device)
-        model.visencoder.load_state_dict(torch.load(encoder_path, map_location=self.ckpter.device))
-        self.ckpter.load_model(model)
 
-        # Init. optimizer and LR scheduler
-        self.ckpter.optimizer = NAdamW(
-            (param for param in model.parameters() if param.requires_grad),
-            lr=1e-4,
+        # Init. optimizers
+        policy_optimizer = NAdamW(
+            (param for param in model.policy.parameters() if param.requires_grad),
+            lr=cfg.UPDATE_MAP['policy']['lr'],
             weight_decay=cfg.WEIGHT_DECAY,
             device=self.ckpter.device)
 
-        scheduler = AnnealingScheduler(
-            self.ckpter.optimizer,
+        critic_optimizer = NAdamW(
+            (param for param in model.valuator.parameters() if param.requires_grad),
+            lr=cfg.UPDATE_MAP['critic']['lr'],
+            weight_decay=cfg.WEIGHT_DECAY,
+            device=self.ckpter.device)
+
+        optimizer = MultiOptimizer(policy=policy_optimizer, critic=critic_optimizer)
+
+        # Load state
+        encoder_path = os.path.join(cfg.ASSET_DIR, 'visenc.pt')
+        model.visencoder.load_state_dict(torch.load(encoder_path, map_location=self.ckpter.device))
+        self.ckpter.load_model(model, optimizer)
+
+        # Init. schedulers
+        policy_scheduler = AnnealingScheduler(
+            policy_optimizer,
             step_milestones=cfg.UPDATE_MILESTONE_MAP['policy'],
+            starting_step=self.ckpter.meta['update_step'])
+
+        critic_scheduler = AnnealingScheduler(
+            critic_optimizer,
+            step_milestones=cfg.UPDATE_MILESTONE_MAP['critic'],
             starting_step=self.ckpter.meta['update_step'])
 
         entropy_scheduler = CoeffScheduler(
@@ -827,27 +849,41 @@ class Session(MazeTask):
             cfg.ENT_WEIGHT_MILESTONES,
             starting_step=self.ckpter.meta['update_step'])
 
-        rl_algo = PPG(
+        scheduler = MultiScheduler(policy=policy_scheduler, critic=critic_scheduler, entropy=entropy_scheduler)
+
+        # Init. aux. task
+        aux_task = None if self.aux_mode == cfg.AUX_NONE else ComAuxTask(
+            model.policy,
+            policy_optimizer,
+            self.ckpter.rng,
+            self.sim.n_envs,
+            self.sim.n_bots,
+            cfg.BATCH_SIZE,
+            cfg.COM_BUFFER_SIZE,
+            cfg.N_TRUNCATED_STEPS,
+            self.aux_mode == cfg.AUX_ONLINE)
+
+        rl_algo = MAXPPO(
             self.step,
             self.ckpter,
             scheduler,
+            self.sim.n_envs,
             self.sim.n_all_bots,
-            cfg.N_EPOCHS_MAP['policy'],
+            cfg.UPDATE_MILESTONE_MAP['policy'][-1],
             cfg.LOG_EPOCH_INTERVAL,
             cfg.CKPT_EPOCH_INTERVAL,
             cfg.BRANCH_EPOCH_INTERVAL,
             cfg.N_ROLLOUT_STEPS,
             cfg.N_TRUNCATED_STEPS,
-            cfg.N_PASSES_PER_BATCH,
-            None,
-            cfg.N_ROLLOUTS_PER_EPOCH,
-            cfg.N_AUX_ITERS_PER_EPOCH,
+            cfg.BUFFER_SIZE,
+            cfg.BATCH_SIZE,
+            aux_task,
             cfg.DISCOUNTS,
+            cfg.TRACE_LAMBDAS,
             value_weight=cfg.VALUE_WEIGHT,
             aux_weight=cfg.AUX_WEIGHT,
-            entropy_weight=entropy_scheduler,
-            log_dir=cfg.LOG_DIR,
-            accelerate=False)
+            entropy_weight=entropy_scheduler.value,
+            log_dir=cfg.LOG_DIR)
 
         try:
             rl_algo.run()
@@ -861,8 +897,47 @@ class Session(MazeTask):
 
     def train_vis(self):
 
-        # TODO: Impl. auxiliary tasks
-        raise NotImplementedError
+        # Load model, optimizer, scheduler
+        model = RandomActorCritic(**self.model_options)
+        model.to(self.ckpter.device)
+
+        optimizer = NAdamW(
+            model.visnet.parameters(),
+            lr=cfg.UPDATE_MAP['visenc']['lr'],
+            weight_decay=cfg.WEIGHT_DECAY,
+            device=self.ckpter.device)
+
+        self.ckpter.load_model(model, optimizer)
+
+        scheduler = AnnealingScheduler(
+            optimizer,
+            step_milestones=cfg.UPDATE_MILESTONE_MAP['visenc'],
+            starting_step=self.ckpter.meta['update_step'])
+
+        # Init. aux. task
+        aux_task = VisAuxTask(model.visnet, optimizer, self.device)
+
+        rl_algo = MAXPPO(
+            self.step,
+            self.ckpter,
+            scheduler,
+            self.sim.n_envs,
+            self.sim.n_all_bots,
+            cfg.UPDATE_MILESTONE_MAP['visenc'][-1],
+            cfg.N_ROLLOUT_STEPS * cfg.LOG_EPOCH_INTERVAL,
+            cfg.N_ROLLOUT_STEPS * cfg.CKPT_EPOCH_INTERVAL,
+            cfg.N_ROLLOUT_STEPS * cfg.BRANCH_EPOCH_INTERVAL,
+            batch_size=cfg.N_BOTS,
+            aux_task=aux_task,
+            policy_weight=0.,
+            log_dir=cfg.LOG_DIR)
+
+        try:
+            rl_algo.run()
+
+        except KeyboardInterrupt:
+            rl_algo.writer.close()
+            raise
 
     # --------------------------------------------------------------------------
     # MARK: eval
@@ -876,18 +951,17 @@ class Session(MazeTask):
         model.to(self.ckpter.device)
         self.ckpter.load_model(model)
 
-        mem = model.init_mem(self.sim.n_all_bots)
+        mem = model.init_mem()
 
         with torch.inference_mode():
-            obs = self.step(get_info=False)[0]['obs']
+            obs = self.step(get_info=False)[0]
             step_ctr = -1
 
             while (step_ctr := step_ctr + 1) != self.end_step:
-                act_sample, mem = model.act(obs, mem, sample=self.prob_actor)
-                actions, beliefs = model.unwrap_sample(act_sample)
+                actions, beliefs, mem = model.act(obs, mem, sample=self.prob_actor)
 
-                step_data = self.step(actions, beliefs, get_info=False)[0]
-                obs = self.post_step(step_data)
+                obs, step_data, _ = self.step(actions, beliefs, get_info=False)
+                obs = self.post_step(obs, step_data)
 
                 if not step_data['nrst'].all():
                     mem = model.reset_mem(mem, step_data['nrst'])
@@ -904,7 +978,7 @@ class Session(MazeTask):
             step_ctr = -1
 
             while (step_ctr := step_ctr + 1) != self.end_step:
-                self.post_step(self.step(self.actions, get_info=False)[0])
+                self.post_step(*self.step(self.actions, get_info=False)[:2])
 
 
 # --------------------------------------------------------------------------

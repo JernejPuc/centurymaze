@@ -62,7 +62,7 @@ ENV_HALFSPACING = 0.1
 
 STEPS_PER_SECOND = 4
 EP_DURATION = 90
-VIS_EP_DURATION = 4
+VIS_EP_DURATION = 5
 
 # Joint, inf. horizon
 OBJ_FOUND_RWD = 0.15        # So that 8 eventual rewards sum to 1.2
@@ -77,9 +77,8 @@ PROXIMITY_RWD = -0.02       # Negative of cell reached rwd.
 COLLISION_RWD = -0.01       # PROXIMITY_RWD / 2
 
 # Discount factors wrt. different reward categories
-# TODO: Separate joint and individual reward
 DISCOUNTS = (
-    1.,
+    1.,                                     # Joint rewards
     1.,                                     # Long-horizon rewards: no half-life
     0.5 ** (1. / (3 * STEPS_PER_SECOND)))   # Short-horizon rewards: half-life at 3 seconds, gamma 0.944
 
@@ -125,6 +124,10 @@ N_CLR_CLASSES = sum(len(clrs) for clrs in COLOURS.values())
 
 SKY_CLR_IDX = 0
 FLOOR_CLR_IDX = 1
+RED_CLR_IDX = 16
+GREY_CLR_IDX = 19
+BLACK_CLR_IDX = 20
+WHITE_CLR_IDX = 21
 
 
 # ------------------------------------------------------------------------------
@@ -156,18 +159,21 @@ N_CARDINALS = 4
 # 8 goal spec., 1 task completed, 1 time left until end of episode
 OBS_VEC_SIZE = N_DOF_MOT + 1 + N_DIM_POS*3 + 3 + N_RCVR_PROX + N_GOAL_CLRS + 2
 LED_ON_IDX = N_DOF_MOT
+BOT_POS_IDX = N_DOF_MOT + 1
+BOT_POS_SLICE = slice(BOT_POS_IDX, BOT_POS_IDX + 2)
+TASK_DONE_IDX = OBS_VEC_SIZE - 2
 
 # Resolution mostly important for effective viewing distance
 OBS_IMG_RES_WIDTH = 96
 OBS_IMG_RES_HEIGHT = 48
 OBS_IMG_CHANNELS = N_DIM_RGB + 1                                # RGB or HSV, depth (4)
 ENC_IMG_CHANNEL_SPLIT = (OBS_IMG_CHANNELS, 2, 1)                # HSVD, clr. seg. + ent. seg., px. weights (7)
-# TODO: Remove +1 from clr. classes after VisNet update
-DEC_IMG_CHANNEL_SPLIT = (N_CLR_CLASSES+1, N_ENT_CLASSES, 1)     # Clr. softmax, ent. softmax, depth value (30)
+DEC_IMG_CHANNEL_SPLIT = (N_CLR_CLASSES, N_ENT_CLASSES, 1)       # Clr. softmax, ent. softmax, depth value (30)
 ALL_IMG_CHANNEL_SPLIT = ENC_IMG_CHANNEL_SPLIT + DEC_IMG_CHANNEL_SPLIT
 
 # Torque cmd., LED cmd.
 ACT_SPLIT = (N_DOF_MOT, 1)
+ACT_SIZE = sum(ACT_SPLIT)
 
 ACT_VALUES = (
     [0., 0., 0., 0., 0.],
@@ -196,11 +202,12 @@ STATE_ENV_SLICE = slice(OBS_VEC_SIZE-1, OBS_VEC_SIZE-1 + STATE_ENV_SIZE)
 # 1 goal found, 1 goal belief correct, 1 diff. of path to goal within cell,
 # 1 cumulative per-cell rwd., 1 near ent. prox. sum, 1 colliding flag
 STATE_BOT_SIZE = N_GOAL_CLRS*2 + N_DIM_POS + N_DIM_DIRLEN*2 + 6
+GOAL_FOUND_IDX = OBS_VEC_SIZE + STATE_ENV_SIZE-1 + STATE_BOT_SIZE-6
+GOAL_FOUND_SLICE = slice(GOAL_FOUND_IDX, GOAL_FOUND_IDX+1)
 
 # 108 total:
 # 28 obs., 50 common, 30 specific
 STATE_VEC_SIZE = OBS_VEC_SIZE + STATE_ENV_SIZE-1 + STATE_BOT_SIZE
-GOAL_FOUND_SLICE = slice(-6, -5)
 
 # 15 total:
 # 8 obj. presence, 4 NWSE cell walls, 1 cell clr. seg., 1 bot presence, 1 cell exploration
@@ -208,8 +215,8 @@ STATE_LAYOUT_CHANNELS = N_GOAL_CLRS + N_CARDINALS + 1
 STATE_MAP_CHANNELS = STATE_LAYOUT_CHANNELS + 2
 
 # 13 total:
-# 8 obj. in frame + 1 for one-hot, 2 goal pos. xy + 2 xy std.
-AUX_VAL_SPLIT = (N_GOAL_CLRS+1, N_DIM_POS*2)
+# 8 obj. in frame + 1 for one-hot, 2 goal pos. xy
+AUX_VAL_SPLIT = (N_GOAL_CLRS+1, N_DIM_POS)
 AUX_VAL_SIZE = N_GOAL_CLRS + N_DIM_POS
 AUX_VAL_OFFSET = OBS_VEC_SIZE + STATE_ENV_SIZE-1 + N_GOAL_CLRS
 AUX_VAL_SLICE = slice(AUX_VAL_OFFSET, AUX_VAL_OFFSET + AUX_VAL_SIZE)
@@ -238,15 +245,31 @@ V_DIM = 64
 QKV_SPLIT = (K_DIM, K_DIM, V_DIM)
 N_TOPICS = 48
 
+N_HEADS = 4
+ATN_ENC_SIZE = N_HEADS * K_DIM
+
 VIS_ENC_SIZE = 224
-MAP_ENC_SIZE = 128
+MAP_ENC_SIZE = 116
 POL_ENC_SIZE = 320
 VAL_ENC_SIZE = 512
-VAL_PEN_SIZE = 256
+PRE_OUT_SIZE = 256
 
 MEM_SIZE = 256
 CHRONO_RANGES = (1/STEPS_PER_SECOND, 1, 3, 10, 30)
 CHRONO_SIZE = MEM_SIZE // (len(CHRONO_RANGES) - 1)
+
+
+# ------------------------------------------------------------------------------
+# MARK: Vis. enc.
+
+PX_WEIGHT_MAP = {
+    'SKY': 0.05,
+    'FLOOR': 0.025,
+    'WALL': 0.111,
+    'OBJ': 1.55,
+    'CHASSIS': 0.65,
+    'BODY': 1.0,
+    'BEACON': 2.575}
 
 
 # ------------------------------------------------------------------------------
@@ -260,41 +283,35 @@ N_ENVS = 9
 N_BOTS = 112
 SEEDS = (1, 3, 7, 9, 42)
 
-# GAE length etc.
-N_PASSES_PER_BATCH = 10
-N_TRUNCATED_STEPS = 15  # STEPS_PER_SECOND * 4
-N_ROLLOUT_STEPS = 120
-N_ROLLOUTS_PER_EPOCH = 6
-N_AUX_ITERS_PER_EPOCH = 8
-SECONDS_PER_EPOCH = N_ROLLOUT_STEPS * N_ROLLOUTS_PER_EPOCH // STEPS_PER_SECOND
+# RL args.
+BATCH_SIZE = 3 * N_BOTS
+N_TRUNCATED_STEPS = 20  # 5 * STEPS_PER_SECOND
+COM_BUFFER_SIZE = 7200  # 5 (N_EPS) * 9 (N_ENVS) * 8 (N_GOALS) * 20 (N_TRUNC)
+BUFFER_SIZE = 1800      # 5 (N_EPS) * 90*4 (STEPS_PER_EP); last 7.5 min
+N_ROLLOUT_STEPS = 160   # BUFFER_SIZE / 15 (N_SAMPLE_UPDATES); with slight offset
+SECONDS_PER_EPOCH = N_ROLLOUT_STEPS // STEPS_PER_SECOND
 
-# Main + aux. updates
-N_UPDATES_PER_EPOCH = (
-    N_ROLLOUT_STEPS // N_TRUNCATED_STEPS * N_ROLLOUTS_PER_EPOCH * N_PASSES_PER_BATCH
-    + N_ROLLOUT_STEPS * N_ROLLOUTS_PER_EPOCH // N_TRUNCATED_STEPS * N_AUX_ITERS_PER_EPOCH)
+# 1 plot point per 40 virtual seconds, 90 per hour, 2160 per day
+LOG_EPOCH_INTERVAL = 1
+CKPT_EPOCH_INTERVAL = 3
 
-# 1 plot point and checkpoint per 3 virtual minutes, 20 per hour, 480 per day, 3360 per week
-LOG_EPOCH_INTERVAL = max(1, 3 * 60 // SECONDS_PER_EPOCH)
-CKPT_EPOCH_INTERVAL = LOG_EPOCH_INTERVAL
-
-# 1 branch per half virtual hour, 48 per day, 336 per week
+# 1 branch per half virtual hour, 48 per day
 BRANCH_EPOCH_INTERVAL = 30 * 60 // SECONDS_PER_EPOCH
 
-# TODO: Separate schedules btw. network modules
-# 2-30 virtual minutes to warm up, 8 hours per agent to train and anneal, almost a year over all 9*112 agents
+# Separate schedules btw. network modules
+# 10 virtual minutes to warm up, 8 hours per agent to train and anneal, almost a year over all 9*112 agents
 UPDATE_MAP = {
     'policy': {'milestones': (10 * 90, 7 * 3600, 8 * 3600), 'lr': 1e-4},
     'critic': {'milestones': (5 * 90, 7 * 3600, 8 * 3600), 'lr': 3e-4},
-    'vis-offline': {'milestones': (2 * 60, 2 * 3600, 8 * 3600), 'lr': 6e-4},
-    'vis-online': {'milestones': (30 * 60, 7 * 3600, 8 * 3600), 'lr': 3e-5}}
-
-N_EPOCHS_MAP = {k: tv['milestones'][-1] // SECONDS_PER_EPOCH for k, tv in UPDATE_MAP.items()}
+    'visenc': {'milestones': (2 * 60, 2 * 3600, 8 * 3600), 'lr': 6e-4}}
 
 UPDATE_MILESTONE_MAP = {
-    k: tuple([v * N_UPDATES_PER_EPOCH // SECONDS_PER_EPOCH for v in tv['milestones']])
-    for k, tv in UPDATE_MAP.items()}
+    'policy': tuple([v // SECONDS_PER_EPOCH for v in UPDATE_MAP['policy']['milestones']]),
+    'critic': tuple([v // SECONDS_PER_EPOCH for v in UPDATE_MAP['critic']['milestones']]),
+    'visenc': tuple([v * STEPS_PER_SECOND for v in UPDATE_MAP['visenc']['milestones']])}
 
 WEIGHT_DECAY = 1e-4
 VALUE_WEIGHT = 1.
 AUX_WEIGHT = 1e-2
 ENT_WEIGHT_MILESTONES = (1e-2, 1e-3)
+TRACE_LAMBDAS = (0.9, 0.99)

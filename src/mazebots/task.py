@@ -1,7 +1,7 @@
 """Rules and state transitions"""
 
 import asyncio
-from typing import Any, Callable
+from typing import Callable
 
 import numpy as np
 from isaacgym import gymapi, gymtorch
@@ -377,7 +377,7 @@ class MazeTask:
         actions: Tensor = None,
         beliefs: Tensor = None,
         get_info: bool = True
-    ) -> 'tuple[dict[str, Tensor | tuple[Tensor, ...]], dict[str, Any]]':
+    ) -> 'tuple[tuple[Tensor, ...], dict[str, Tensor | tuple[Tensor, ...]], dict[str, float]]':
         """
         Apply actions in environments, evaluate their effects,
         step physics and graphics, gather observations and other data.
@@ -413,7 +413,7 @@ class MazeTask:
 
         # Async update tensors and colours, step physics
         self.run_async_ops(self.async_reset_and_recolour, self.async_simulate)
-        rst_mask_f = self.bot_rst_mask.unsqueeze(-1).float()
+        nrst_mask_f = (~self.bot_rst_mask.unsqueeze(-1)).float()
 
         # Async compute observations and rewards from physical state
         # NOTE: Refreshing cameras is by far the longest part of a step
@@ -421,18 +421,18 @@ class MazeTask:
         obs_vec, obs_map, aux_val, rwd, prio_event_mask = self.async_temp_result
 
         obs_img = self.get_image_observations()
+        obs = obs_img, obs_vec, obs_map
 
         # Externally handled log
-        env_stats = {'score': self.get_score(), 'resets': rst_mask_f.sum()} if get_info else self.NULL_INFO
+        log_info = {'score': self.get_score()} if get_info else self.NULL_INFO
 
         step_data = {
-            'obs': (obs_img, obs_vec, obs_map),
             'rwd': rwd,
             'prio': prio_event_mask,
             'vaux': aux_val,
-            'nrst': 1. - rst_mask_f}
+            'nrst': nrst_mask_f}
 
-        return step_data, env_stats
+        return obs, step_data, log_info
 
     # --------------------------------------------------------------------------
     # MARK: get_score
@@ -864,8 +864,7 @@ class MazeTask:
 
         indiv_pen = colliding * cfg.COLLISION_RWD + near_src_prox * cfg.PROXIMITY_RWD
 
-        # TODO: Separate joint and individual reward
-        # joint_rwd = joint_rwd.unsqueeze(-1)
+        # Stack joint and individual rewards
         joint_rwd = joint_rwd.repeat_interleave(sim.n_bots, output_size=sim.n_all_bots)
         rwd = torch.stack((joint_rwd, indiv_rwd, indiv_pen), dim=-1)
 
