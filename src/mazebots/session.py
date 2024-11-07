@@ -151,6 +151,8 @@ class Interface(BasicInterface):
         else:
             self.tk_root = self.tk_canvas = self.visnet = None
 
+        self.sky_clr = torch.tensor(cfg.COLOURS['background'][cfg.SKY_CLR_IDX], device=device).mul_(255.).round_()
+
     # --------------------------------------------------------------------------
     # MARK: cycle_target_indices
 
@@ -385,7 +387,7 @@ class Interface(BasicInterface):
         seg = self.session.img_seg_list[self.all_bot_idx]
 
         sky_mask = (seg == cfg.ENT_CLS_SKY).unsqueeze(-1)
-        rgb = torch.where(sky_mask, self.session.sky_clr, rgb.float())
+        rgb = torch.where(sky_mask, self.sky_clr, rgb.float())
 
         rgb = rgb.cpu().numpy()
         dep = 255. * norm_distance(-dep, cfg.MAX_IMG_DEPTH).cpu().numpy()
@@ -404,11 +406,11 @@ class Interface(BasicInterface):
         hsvd = obs_img[self.all_bot_idx:self.all_bot_idx+1]
 
         with torch.inference_mode():
-            out, _, _, b_obj, b_loc = self.visnet(hsvd)
+            out, _, b_obj, b_loc = self.visnet(hsvd)
 
         if self.prev_reconstruct:
-            self.session.obj_in_mind[self.all_bot_idx] = b_obj[0, 1:]
-            self.session.goal_pos_in_mind[self.all_bot_idx] = b_loc[0]
+            self.session.obj_in_mind[self.all_bot_idx] = b_obj[0, 1:] == b_obj[0].max()
+            self.session.goal_pos_in_mind[self.all_bot_idx] = b_loc[0] * cfg.MAX_COORD_VAL
 
         clr_logits, ent_logits, dep = out.split(cfg.DEC_IMG_CHANNEL_SPLIT, dim=1)
         clr_probs = clr_logits[0].softmax(dim=0).cpu().numpy()
@@ -481,6 +483,7 @@ class Interface(BasicInterface):
                         continue
 
                 self.paused = False
+                self.gym.clear_lines(self.viewer)
 
                 print('Session resumed.')
 
@@ -607,7 +610,13 @@ class Interface(BasicInterface):
     def sync_redraw(self, after_eval: bool = True):
         """Draw the scene in the viewer, syncing sim with real-time."""
 
-        self.update_view(update_lines=after_eval)
+        if self.session.ctrl_mode == Session.CTRL_AI or self.prev_reconstruct:
+            update_lines = self.paused
+
+        else:
+            update_lines = after_eval
+
+        self.update_view(update_lines=update_lines)
         self.gym.draw_viewer(self.viewer, self.sim_handle, False)
         self.gym.sync_frame_time(self.sim_handle)
 
@@ -616,7 +625,8 @@ class Interface(BasicInterface):
 
     def reset(self):
         self.key_vec.fill(0)
-        self.update_view()
+        self.update_view(update_lines=False)
+        self.gym.clear_lines(self.viewer)
 
 
 # ------------------------------------------------------------------------------
@@ -830,7 +840,11 @@ class Session(MazeTask):
 
         # Load state
         encoder_path = os.path.join(cfg.ASSET_DIR, 'visenc.pt')
+        decoder_path = os.path.join(cfg.ASSET_DIR, 'vismlp.pt')
+
         model.visencoder.load_state_dict(torch.load(encoder_path, map_location=self.ckpter.device))
+        model.visdecoder.load_state_dict(torch.load(decoder_path, map_location=self.ckpter.device))
+
         self.ckpter.load_model(model, optimizer)
 
         # Init. schedulers
@@ -842,6 +856,7 @@ class Session(MazeTask):
         critic_scheduler = AnnealingScheduler(
             critic_optimizer,
             step_milestones=cfg.UPDATE_MILESTONE_MAP['critic'],
+            lr_div_factors=cfg.UPDATE_MAP['critic']['div'],
             starting_step=self.ckpter.meta['update_step'])
 
         entropy_scheduler = CoeffScheduler(
@@ -879,7 +894,8 @@ class Session(MazeTask):
             cfg.BATCH_SIZE,
             aux_task,
             cfg.DISCOUNTS,
-            cfg.TRACE_LAMBDAS,
+            cfg.TRACE_LAMBDA,
+            cfg.CLIP_RATIO,
             value_weight=cfg.VALUE_WEIGHT,
             aux_weight=cfg.AUX_WEIGHT,
             entropy_weight=entropy_scheduler.value,
@@ -924,9 +940,9 @@ class Session(MazeTask):
             self.sim.n_envs,
             self.sim.n_all_bots,
             cfg.UPDATE_MILESTONE_MAP['visenc'][-1],
-            cfg.N_ROLLOUT_STEPS * cfg.LOG_EPOCH_INTERVAL,
-            cfg.N_ROLLOUT_STEPS * cfg.CKPT_EPOCH_INTERVAL,
-            cfg.N_ROLLOUT_STEPS * cfg.BRANCH_EPOCH_INTERVAL,
+            cfg.VIS_LOG_INTERVAL,
+            cfg.VIS_CKPT_INTERVAL,
+            cfg.VIS_BRANCH_INTERVAL,
             batch_size=cfg.N_BOTS,
             aux_task=aux_task,
             policy_weight=0.,

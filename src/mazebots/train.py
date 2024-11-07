@@ -17,11 +17,7 @@ from utils_torch import rgb_to_hsv
 # MARK: ComAuxTask
 
 class ComAuxTask(AuxTask):
-    STAT_KEYS = (
-        'Aux/loc_nll_on',
-        'Aux/loc_nll_off',
-        'Aux/obj_nll',
-        'Aux/kl_div')
+    STAT_KEYS = ('Aux/loc_nll_off',)
 
     def __init__(
         self,
@@ -55,7 +51,7 @@ class ComAuxTask(AuxTask):
         self.temp_buffers = [[] for _ in range(n_envs)]
 
     def clear(self):
-        self.buffer.clear(self.n_truncated_steps * self.n_envs)
+        self.buffer.clear(self.n_truncated_steps * self.n_envs * cfg.N_GOAL_CLRS)
 
     # --------------------------------------------------------------------------
     # MARK: collect
@@ -97,7 +93,12 @@ class ComAuxTask(AuxTask):
     # MARK: update
 
     def update(self, batches: 'list[TensorDict]', stats: 'dict[str, Tensor]'):
-        seq = self.buffer.sample(self.rng, self.n_truncated_steps, 1, self.n_envs_per_batch, True)
+        try:
+            seq = self.buffer.sample(self.rng, self.n_truncated_steps, 1, self.n_envs_per_batch, True)
+
+        except RuntimeError:
+            return
+
         qkv, memp, _ = seq[0]['mem']
 
         loss = 0.
@@ -110,14 +111,13 @@ class ComAuxTask(AuxTask):
             # Force open com. channel for bots with any obj. in frame (who should be speaking)
             forced_com_mask = batch['vaux'][:, 1:cfg.AUX_VAL_SPLIT[0]].any(1)
 
-            a, _, bg, qkv, memp, _ = self.policy(xp, qkv, memp, forced_com_mask, n_envs)
+            _, bg, qkv, memp, _ = self.policy(xp, qkv, memp, forced_com_mask, n_envs)
 
-            act = Categorical.from_raw(self.policy.act_values, a)
             bg = FixedVarNormal(bg, skip_log_shift=True)
 
-            loss = loss + self.offline_loss(batch, act, bg, stats)
+            loss = loss + self.offline_loss(batch, bg, stats)
 
-        loss = loss / self.n_truncated_steps
+        loss = loss * (cfg.AUX_WEIGHT / self.n_truncated_steps)
         loss.backward()
         self.optimizer.step()
 
@@ -127,37 +127,28 @@ class ComAuxTask(AuxTask):
     def offline_loss(
         self,
         batch: TensorDict,
-        act: Categorical,
         aux: FixedVarNormal,
         stats: 'dict[str, Tensor]'
     ) -> Tensor:
 
         # Extract goal coords. and masks
-        goal_found_mask = batch['obs'][0][:, cfg.GOAL_FOUND_IDX]
-        task_done_mask = batch['obs'][0][:, cfg.TASK_DONE_IDX]
-        _, goal_pos = batch['vaux'].split(cfg.AUX_VAL_SPLIT, dim=-1)
+        goal_found_mask = batch['obs'][1][:, cfg.GOAL_FOUND_IDX]
+        task_done_mask = batch['obs'][1][:, cfg.TASK_DONE_IDX]
+        goal_pos = batch['vaux'][:, -cfg.AUX_VAL_SPLIT[1]:]
 
         # Compare belief to target coords.
         aux_log_prob = aux.log_prob(goal_pos)
 
-        # Focal loss instead of downweighting or removing old samples
-        focal_weight = (1. - aux_log_prob.exp()).square()
-
         # Only propagate error for bots with goal found and not reached
         prop_err_mask = goal_found_mask * (1. - task_done_mask)
 
-        aux_loss = ((aux_log_prob * focal_weight) * prop_err_mask).mean()
-
-        # KL divergence constraint to prevent large distortions of the acting policy
-        old_act = Categorical(self.policy.act_values, batch['args'][0])
-        kl_div = old_act.kl_div(act).mean()
+        aux_loss = (aux_log_prob * prop_err_mask).mean()
 
         # Stats for logging
         with torch.no_grad():
             stats['Aux/loc_nll_off'] -= aux_loss
-            stats['Aux/kl_div'] += kl_div
 
-        return kl_div - aux_loss
+        return -aux_loss
 
     # --------------------------------------------------------------------------
     # MARK: loss
@@ -167,30 +158,24 @@ class ComAuxTask(AuxTask):
         batch: TensorDict,
         act: Categorical,
         val: None,
-        aux: 'tuple[Categorical, FixedVarNormal]',
+        aux: 'tuple[FixedVarNormal]',
         stats: 'dict[str, Tensor]'
     ) -> Tensor:
 
         # Extract goal coords. and masks
-        goal_found_mask = batch['obs'][0][:, cfg.GOAL_FOUND_IDX]
-        task_done_mask = batch['obs'][0][:, cfg.TASK_DONE_IDX]
-        obj_in_frame, goal_pos = batch['vaux'].split(cfg.AUX_VAL_SPLIT, dim=-1)
+        goal_found_mask = batch['obs'][1][:, cfg.GOAL_FOUND_IDX]
+        task_done_mask = batch['obs'][1][:, cfg.TASK_DONE_IDX]
+        goal_pos = batch['vaux'][:, -cfg.AUX_VAL_SPLIT[1]:]
 
         # Compare beliefs to targets
-        vis_loss = aux[0].log_prob(None, obj_in_frame.argmax(-1, keepdim=True)).mean()
-        goal_log_prob = aux[1].log_prob(goal_pos)
+        goal_log_prob = aux[0].log_prob(goal_pos)
 
         # Only propagate error for bots with goal found and not reached
         prop_err_mask = goal_found_mask * (1. - task_done_mask)
 
         goal_loss = (goal_log_prob * prop_err_mask).mean()
 
-        # Stats for logging
-        with torch.no_grad():
-            stats['Aux/obj_nll'] -= vis_loss
-            stats['Aux/loc_nll_on'] -= goal_loss
-
-        return -(vis_loss + goal_loss)
+        return -goal_loss
 
 
 # ------------------------------------------------------------------------------
@@ -301,7 +286,7 @@ class VisAuxTask(AuxTask):
         _, dep_target, ent_target, clr_target, weights, obj_in_frame, bot_pos = batch['obs']
 
         # Unpack model outputs
-        img_out, enc_mean, enc_dev, pred_obj, pred_loc = aux
+        img_out, _, pred_obj, pred_loc = aux
         clr_logits, ent_logits, dep = img_out.split(cfg.DEC_IMG_CHANNEL_SPLIT, dim=1)
 
         # Logits to probs.
@@ -330,17 +315,12 @@ class VisAuxTask(AuxTask):
         # Reconstruction: mean squared error
         dep_mse = ((dep - dep_target).square() * weights.squeeze(1)).sum() / weight_sum
 
-        # Regularisation: KL divergence (of latent to standard normal distribution)
-        enc_kl = (enc_mean.square() + enc_dev.square() - 2.*enc_dev.log() - 1.).sum(-1).mean()
-
         # Prediction: neg. log. likelihood
-        # TODO: Add focal weight to compensate rare obj. sightings
         obj_nll = Categorical.from_raw(None, pred_obj).log_prob(None, obj_in_frame).mean()
         loc_nll = FixedVarNormal(pred_loc, skip_log_shift=True).log_prob(bot_pos).mean()
 
         # Full loss
-        # TODO: Adjust weights
-        loss = 0.05 * dep_mse - 0.5 * clr_fce - ent_fce - obj_nll - loc_nll + enc_kl
+        loss = 0.05 * dep_mse - clr_fce - ent_fce - obj_nll - loc_nll
 
         # Stats for logging
         with torch.no_grad():
@@ -350,6 +330,5 @@ class VisAuxTask(AuxTask):
             stats['VisNet/ent_fce'] -= ent_fce.detach()
             stats['VisNet/obj_nll'] -= obj_nll.detach()
             stats['VisNet/loc_nll'] -= loc_nll.detach()
-            stats['VisNet/enc_kl'] += enc_kl.detach()
 
         return loss

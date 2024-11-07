@@ -234,11 +234,12 @@ AUX_ONLINE = 1
 AUX_NONE = 0
 
 AGENT_TYPE_CONFIGS = {
-    'main': {'com_mode': COM_TOPIC, 'aux_mode': AUX_PRIO},
-    'tarmac': {'com_mode': COM_TARGET, 'aux_mode': AUX_PRIO},
-    'silent': {'com_mode': COM_NONE, 'aux_mode': AUX_NONE},
-    'pbl': {'com_mode': COM_TOPIC, 'aux_mode': AUX_ONLINE},
-    'dial': {'com_mode': COM_TOPIC, 'aux_mode': AUX_NONE}}
+    'sota': {'com_mode': COM_TARGET, 'aux_mode': AUX_PRIO, 'global_spawn_prob': 0.},
+    'mixp': {'com_mode': COM_TARGET, 'aux_mode': AUX_PRIO, 'global_spawn_prob': 0.5},
+    'mixn': {'com_mode': COM_TARGET, 'aux_mode': AUX_ONLINE, 'global_spawn_prob': 0.5},
+    'base': {'com_mode': COM_NONE, 'aux_mode': AUX_NONE, 'global_spawn_prob': 0.5},
+    'dial': {'com_mode': COM_TARGET, 'aux_mode': AUX_NONE, 'global_spawn_prob': 0.5},
+    'main': {'com_mode': COM_TOPIC, 'aux_mode': AUX_ONLINE, 'global_spawn_prob': 0.5}}
 
 K_DIM = 32
 V_DIM = 64
@@ -281,29 +282,34 @@ LOG_DIR = 'runs'    # Tracked scalars
 # Runner args.
 N_ENVS = 9
 N_BOTS = 112
-SEEDS = (1, 3, 7, 9, 42)
+SEEDS = (42, 9, 7, 3, 1)
 
 # RL args.
 BATCH_SIZE = 3 * N_BOTS
 N_TRUNCATED_STEPS = 20  # 5 * STEPS_PER_SECOND
-COM_BUFFER_SIZE = 7200  # 5 (N_EPS) * 9 (N_ENVS) * 8 (N_GOALS) * 20 (N_TRUNC)
-BUFFER_SIZE = 1800      # 5 (N_EPS) * 90*4 (STEPS_PER_EP); last 7.5 min
-N_ROLLOUT_STEPS = 160   # BUFFER_SIZE / 15 (N_SAMPLE_UPDATES); with slight offset
+COM_BUFFER_SIZE = 4320  # 3 (N_EPS) * 9 (N_ENVS) * 8 (N_GOALS) * 20 (N_TRUNC)
+BUFFER_SIZE = 1000      # 3 (N_EPS) * 90*4 (STEPS_PER_EP); last 4 min
+N_ROLLOUT_STEPS = 64    # BUFFER_SIZE / 15 (N_SAMPLE_UPDATES); with slight offset
 SECONDS_PER_EPOCH = N_ROLLOUT_STEPS // STEPS_PER_SECOND
 
-# 1 plot point per 40 virtual seconds, 90 per hour, 2160 per day
+# 1 plot point per 16 virtual seconds, 225 per hour, 1350 in 6 hours
 LOG_EPOCH_INTERVAL = 1
-CKPT_EPOCH_INTERVAL = 3
+CKPT_EPOCH_INTERVAL = 4
 
-# 1 branch per half virtual hour, 48 per day
+# 1 branch per half virtual hour, 12 in 6 hours
 BRANCH_EPOCH_INTERVAL = 30 * 60 // SECONDS_PER_EPOCH
 
+# Vis. training is online and single-env.
+VIS_LOG_INTERVAL = 160
+VIS_CKPT_INTERVAL = 3 * VIS_LOG_INTERVAL
+VIS_BRANCH_INTERVAL = 45 * VIS_LOG_INTERVAL
+
 # Separate schedules btw. network modules
-# 10 virtual minutes to warm up, 8 hours per agent to train and anneal, almost a year over all 9*112 agents
+# 10 virtual minutes to warm up, 6 hours per agent to train and anneal, more than 8 months over all 9*112 agents
 UPDATE_MAP = {
-    'policy': {'milestones': (10 * 90, 7 * 3600, 8 * 3600), 'lr': 1e-4},
-    'critic': {'milestones': (5 * 90, 7 * 3600, 8 * 3600), 'lr': 3e-4},
-    'visenc': {'milestones': (2 * 60, 2 * 3600, 8 * 3600), 'lr': 6e-4}}
+    'policy': {'milestones': (10 * 90, 3 * 3600, 6 * 3600), 'lr': 8e-5, 'div': (20., 400.)},
+    'critic': {'milestones': (1 * 90, 3 * 3600, int(5.5 * 3600)), 'lr': 3e-4, 'div': (20., 6.)},
+    'visenc': {'milestones': (2 * 60, 15 * 3600, 20 * 3600), 'lr': 6e-4, 'div': (20., 400.)}}
 
 UPDATE_MILESTONE_MAP = {
     'policy': tuple([v // SECONDS_PER_EPOCH for v in UPDATE_MAP['policy']['milestones']]),
@@ -312,6 +318,7 @@ UPDATE_MILESTONE_MAP = {
 
 WEIGHT_DECAY = 1e-4
 VALUE_WEIGHT = 1.
-AUX_WEIGHT = 1e-2
-ENT_WEIGHT_MILESTONES = (1e-2, 1e-3)
-TRACE_LAMBDAS = (0.9, 0.99)
+AUX_WEIGHT = 0.2
+ENT_WEIGHT_MILESTONES = (5e-3, 1e-4)
+TRACE_LAMBDA = 0.9
+CLIP_RATIO = 0.125

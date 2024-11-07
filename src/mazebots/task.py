@@ -211,6 +211,14 @@ class MazeTask:
             self.env_step_ctrs -= self.env_step_ctrs[0].item()
             # self.env_step_ctrs = self.env_step_ctrs[torch.randperm(sim.n_envs)]
 
+        # Halve the remaining duration for envs. with global spawns
+        global_spawn_idcs = [i for i, env in enumerate(sim.envs) if env.global_spawn_flag]
+
+        if global_spawn_idcs:
+            self.env_step_ctrs[global_spawn_idcs] //= 2
+            self.env_step_ctrs[global_spawn_idcs] += self.steps_in_ep // 2
+            self.cell_rwd_sum.view(self.sim.n_envs, -1)[global_spawn_idcs] = cfg.MAX_GOAL_REACHED_RWD / 2.
+
         # Action feedback
         self.actions = torch.zeros((sim.n_all_bots, sum(cfg.ACT_SPLIT)), device=device)
         self.act_trq, self.act_led = self.actions.split(cfg.ACT_SPLIT, dim=-1)
@@ -313,12 +321,18 @@ class MazeTask:
         self.goal_pred_ok[bot_rst_subs] = 0.
         self.goal_path_delta[bot_rst_subs] = 0.
         self.goal_path_len[bot_rst_subs] = 0.
-        self.obj_found[bot_rst_subs] = False
         self.obj_in_frame[bot_rst_subs] = False
+        self.obj_found[self.env_rst_idcs] = False
 
         self.bot_done_mask[bot_rst_subs] = False
         self.bot_done_mask_f[bot_rst_subs] = 0.
         self.env_step_ctrs[self.env_rst_idcs] = 0
+
+        global_spawn_idcs = [i for i in self.env_rst_idcs if self.sim.envs[i].global_spawn_flag]
+
+        if global_spawn_idcs:
+            self.env_step_ctrs[global_spawn_idcs] = self.steps_in_ep // 2
+            self.cell_rwd_sum.view(self.sim.n_envs, -1)[global_spawn_idcs] = cfg.MAX_GOAL_REACHED_RWD / 2.
 
         # Action feedback
         self.actions[bot_rst_subs] = 0.
@@ -464,7 +478,7 @@ class MazeTask:
 
         obj_prob_in_mind, self.goal_pos_in_mind = beliefs.split(cfg.BELIEF_SPLIT, dim=1)
 
-        self.obj_in_mind = obj_prob_in_mind > 0.5
+        self.obj_in_mind = obj_prob_in_mind > 0.66
         self.goal_pos_in_mind *= cfg.MAX_COORD_VAL
 
     # --------------------------------------------------------------------------

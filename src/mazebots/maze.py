@@ -261,7 +261,9 @@ class MazeSampler:
                 cfg.OBJ_TO_WALL_GAP)
 
         # Option to spawn out of the designated area for random data collection
-        if self.global_spawn_prob and self.rng.random() < self.global_spawn_prob:
+        global_spawn_flag = self.global_spawn_prob and self.rng.random() < self.global_spawn_prob
+
+        if global_spawn_flag:
             spawn_pts = self.sample_viable_points(
                 self.free_cell_pts,
                 self.n_bots, cfg.BOT_TO_BOT_GAP,
@@ -282,7 +284,7 @@ class MazeSampler:
         obj_goal_map = np.sort(self.rng.permutation(cfg.N_GOAL_CLRS)[:self.n_goals])
         bot_goal_map = obj_goal_map[bot_obj_map]
 
-        return obj_pts, spawn_pts, spawn_angles, bot_obj_map, obj_goal_map, bot_goal_map
+        return obj_pts, spawn_pts, spawn_angles, bot_obj_map, obj_goal_map, bot_goal_map, global_spawn_flag
 
     # --------------------------------------------------------------------------
     # MARK: sample_viable_points
@@ -418,7 +420,7 @@ class MazeValidator:
 
         self.cellpair_path_map = get_numba_dict(tuple_as_key=True)
 
-        self.obj_pts, self.spawn_pts, _, self.bot_obj_map, self.obj_goal_map, _ = self.sampler.sample_tasks()
+        self.obj_pts, self.spawn_pts, _, self.bot_obj_map, self.obj_goal_map, _, _ = self.sampler.sample_tasks()
         self.obj_clrs = np.array(cfg.COLOURS['goal'])[self.obj_goal_map]
 
     # --------------------------------------------------------------------------

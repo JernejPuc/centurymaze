@@ -4,21 +4,23 @@ import os
 from argparse import ArgumentParser
 from time import sleep
 
-from src.mazebots.config import AGENT_TYPE_CONFIGS, N_BOTS, N_ENVS, SEEDS, VIS_EP_DURATION as T_VIS
+from src.mazebots.config import AGENT_TYPE_CONFIGS, N_BOTS, N_ENVS, SEEDS, VIS_EP_DURATION
 
 
 BASE_CALL = 'python src/mazebots/session.py'
 
 CMD_PRESETS: 'dict[str, list[str]]' = {
     'test': [BASE_CALL],
-    'train_vis': [f'{BASE_CALL} --ctrl_mode 1 --headless 1 --n_envs 1 --n_bots {N_BOTS} --ep_duration {T_VIS}'],
+    'train_vis': [
+        f'{BASE_CALL} --n_bots {N_BOTS} --ep_duration {VIS_EP_DURATION} '
+        '--ctrl_mode 1 --headless 1 --n_envs 1 --global_spawn_prob 0.95'],
     'train_rl': [f'{BASE_CALL} --ctrl_mode 2 --headless 1 --n_envs {N_ENVS} --n_bots {N_BOTS}'],
     'eval': [BASE_CALL + ' --ctrl_mode 3']}
 
-CMD_PRESETS['train_all'] = [*CMD_PRESETS['train_vis']]
+CMD_PRESETS['train_all'] = []
 
-for agent_type, args in AGENT_TYPE_CONFIGS.items():
-    for seed in SEEDS:
+for seed in SEEDS:
+    for agent_type, args in AGENT_TYPE_CONFIGS.items():
         com_mode, aux_mode = args.values()
 
         CMD_PRESETS['train_all'].append(

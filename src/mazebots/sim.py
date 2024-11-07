@@ -36,6 +36,7 @@ class MazeEnv:
     bot_obj_map: ndarray
     obj_goal_map: ndarray
     bot_goal_map: ndarray
+    global_spawn_flag: bool
 
     cellpair_path_map: 'dict[tuple[int, int], ndarray]'
 
@@ -81,8 +82,11 @@ class MazeEnv:
 
         self.cellpair_path_map = get_numba_dict(tuple_as_key=True)
 
-        self.obj_pts, self.spawn_pts, self.spawn_angles, self.bot_obj_map, self.obj_goal_map, self.bot_goal_map = \
-            self.sim.sampler.sample_tasks()
+        (
+            self.obj_pts, self.spawn_pts, self.spawn_angles,
+            self.bot_obj_map, self.obj_goal_map, self.bot_goal_map,
+            self.global_spawn_flag
+        ) = self.sim.sampler.sample_tasks()
 
     # --------------------------------------------------------------------------
     # MARK: create_layout
