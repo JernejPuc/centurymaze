@@ -21,8 +21,6 @@ CMD_PRESETS['train_all'] = []
 
 for seed in SEEDS:
     for agent_type, args in AGENT_TYPE_CONFIGS.items():
-        com_mode, aux_mode = args.values()
-
         CMD_PRESETS['train_all'].append(
             f'{CMD_PRESETS["train_rl"][0]} '
             f'--model_name {agent_type}{seed} --rng_seed {seed} {" ".join(f"--{k} {v}" for k, v in args.items())}')
