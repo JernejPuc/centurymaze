@@ -4,7 +4,7 @@ import os
 from argparse import ArgumentParser
 from time import sleep
 
-from src.mazebots.config import AGENT_TYPE_CONFIGS, N_BOTS, N_ENVS, SEEDS, VIS_EP_DURATION
+from src.mazebots.config import AGENT_TYPE_CONFIGS, N_BOTS, N_ENVS, N_EVAL_STEPS, SEEDS, VIS_EP_DURATION
 
 
 BASE_CALL = 'python src/mazebots/session.py'
@@ -15,7 +15,8 @@ CMD_PRESETS: 'dict[str, list[str]]' = {
         f'{BASE_CALL} --n_bots {N_BOTS} --ep_duration {VIS_EP_DURATION} '
         '--ctrl_mode 1 --headless 1 --n_envs 1 --global_spawn_prob 0.95'],
     'train_rl': [f'{BASE_CALL} --ctrl_mode 2 --headless 1 --n_envs {N_ENVS} --n_bots {N_BOTS}'],
-    'eval': [BASE_CALL + ' --ctrl_mode 3']}
+    'eval': [BASE_CALL + ' --ctrl_mode 3'],
+    'eval_perf': [f'{BASE_CALL} --ctrl_mode 3 --rec_mode 1 --headless 1 --n_bots {N_BOTS} --end_step {N_EVAL_STEPS}']}
 
 CMD_PRESETS['train_all'] = []
 

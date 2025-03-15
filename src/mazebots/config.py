@@ -124,7 +124,6 @@ N_CLR_CLASSES = sum(len(clrs) for clrs in COLOURS.values())
 
 SKY_CLR_IDX = 0
 FLOOR_CLR_IDX = 1
-RED_CLR_IDX = 16
 GREY_CLR_IDX = 19
 BLACK_CLR_IDX = 20
 WHITE_CLR_IDX = 21
@@ -229,17 +228,24 @@ COM_TOPIC = 2
 COM_TARGET = 1
 COM_NONE = 0
 
-AUX_PRIO = 2
+AUX_DETACH = 3
+AUX_REPLAY = 2
 AUX_ONLINE = 1
 AUX_NONE = 0
 
+RWD_ALL = 3
+RWD_UTIL = 2
+RWD_GAIN = 1
+RWD_DEFAULT = 0
+
 AGENT_TYPE_CONFIGS = {
-    'sota': {'com_mode': COM_TARGET, 'aux_mode': AUX_PRIO, 'global_spawn_prob': 0.},
-    'mixp': {'com_mode': COM_TARGET, 'aux_mode': AUX_PRIO, 'global_spawn_prob': 0.5},
-    'mixn': {'com_mode': COM_TARGET, 'aux_mode': AUX_ONLINE, 'global_spawn_prob': 0.5},
-    'base': {'com_mode': COM_NONE, 'aux_mode': AUX_NONE, 'global_spawn_prob': 0.5},
-    'dial': {'com_mode': COM_TARGET, 'aux_mode': AUX_NONE, 'global_spawn_prob': 0.5},
-    'main': {'com_mode': COM_TOPIC, 'aux_mode': AUX_ONLINE, 'global_spawn_prob': 0.5}}
+    'nocom': {'com_mode': COM_NONE, 'aux_mode': AUX_NONE, 'rwd_mode': RWD_DEFAULT},
+    'nobl-dial': {'com_mode': COM_TARGET, 'aux_mode': AUX_NONE, 'rwd_mode': RWD_UTIL},
+    'bl-infer': {'com_mode': COM_TARGET, 'aux_mode': AUX_DETACH, 'rwd_mode': RWD_ALL},
+    'diabl-infer': {'com_mode': COM_TARGET, 'aux_mode': AUX_REPLAY, 'rwd_mode': RWD_ALL},
+    'diabl': {'com_mode': COM_TARGET, 'aux_mode': AUX_ONLINE, 'rwd_mode': RWD_ALL},
+    'diabl-nogain': {'com_mode': COM_TARGET, 'aux_mode': AUX_ONLINE, 'rwd_mode': RWD_UTIL},
+    'diabl-noutil': {'com_mode': COM_TARGET, 'aux_mode': AUX_ONLINE, 'rwd_mode': RWD_GAIN}}
 
 K_DIM = 32
 V_DIM = 64
@@ -282,7 +288,10 @@ LOG_DIR = 'runs'    # Tracked scalars
 # Runner args.
 N_ENVS = 9
 N_BOTS = 112
-SEEDS = (42, 9, 7, 3, 1)
+SEEDS = (42, 9, 7, 5, 3, 1)  # HHGTTG + RoP + 5 to complete odd number sequence
+
+N_EVAL_EPS = 100
+N_EVAL_STEPS = N_EVAL_EPS * EP_DURATION * STEPS_PER_SECOND
 
 # RL args.
 BATCH_SIZE = 3 * N_BOTS
@@ -290,6 +299,7 @@ N_TRUNCATED_STEPS = 20  # 5 * STEPS_PER_SECOND
 COM_BUFFER_SIZE = 4320  # 3 (N_EPS) * 9 (N_ENVS) * 8 (N_GOALS) * 20 (N_TRUNC)
 BUFFER_SIZE = 1000      # 3 (N_EPS) * 90*4 (STEPS_PER_EP); last 4 min
 N_ROLLOUT_STEPS = 64    # BUFFER_SIZE / 15 (N_SAMPLE_UPDATES); with slight offset
+N_PASSES_PER_STEP = 1
 SECONDS_PER_EPOCH = N_ROLLOUT_STEPS // STEPS_PER_SECOND
 
 # 1 plot point per 16 virtual seconds, 225 per hour, 1350 in 6 hours

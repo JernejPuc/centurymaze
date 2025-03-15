@@ -14,9 +14,9 @@ from utils_torch import rgb_to_hsv
 
 
 # ------------------------------------------------------------------------------
-# MARK: ComAuxTask
+# MARK: BeliefAuxTask
 
-class ComAuxTask(AuxTask):
+class BeliefAuxTask(AuxTask):
     STAT_KEYS = ('Aux/loc_nll_off',)
 
     def __init__(
@@ -29,13 +29,15 @@ class ComAuxTask(AuxTask):
         batch_size: int,
         buffer_size: int,
         n_truncated_steps: int,
-        online_only: bool
+        online_only: bool,
+        detach_com: bool = False
     ):
         super().__init__(True, not online_only)
 
         self.policy = policy
         self.optimizer = optimizer
         self.rng = rng
+        self.detach_com = detach_com
 
         self.n_envs = n_envs
         self.n_bots = n_bots
@@ -56,7 +58,7 @@ class ComAuxTask(AuxTask):
     # --------------------------------------------------------------------------
     # MARK: collect
 
-    def collect(self, data: TensorDict):
+    def collect(self, data: TensorDict, obs: 'tuple[Tensor, ...]', mem: 'tuple[Tensor, ...]'):
 
         # Discard all unifinished seqs. on reset
         for i, nrst in enumerate(data['nrst'][::self.n_bots].tolist()):
@@ -113,6 +115,9 @@ class ComAuxTask(AuxTask):
 
             _, bg, qkv, memp, _ = self.policy(xp, qkv, memp, forced_com_mask, n_envs)
 
+            if self.detach_com:
+                qkv = qkv.detach()
+
             bg = FixedVarNormal(bg, skip_log_shift=True)
 
             loss = loss + self.offline_loss(batch, bg, stats)
@@ -157,8 +162,8 @@ class ComAuxTask(AuxTask):
         self,
         batch: TensorDict,
         act: Categorical,
-        val: None,
-        aux: 'tuple[FixedVarNormal]',
+        vals: None,
+        auxs: 'tuple[FixedVarNormal]',
         stats: 'dict[str, Tensor]'
     ) -> Tensor:
 
@@ -168,7 +173,10 @@ class ComAuxTask(AuxTask):
         goal_pos = batch['vaux'][:, -cfg.AUX_VAL_SPLIT[1]:]
 
         # Compare beliefs to targets
-        goal_log_prob = aux[0].log_prob(goal_pos)
+        goal_log_prob = auxs[0].log_prob(goal_pos)
+
+        if self.detach_com:
+            goal_log_prob = goal_log_prob.detach()
 
         # Only propagate error for bots with goal found and not reached
         prop_err_mask = goal_found_mask * (1. - task_done_mask)
@@ -179,9 +187,9 @@ class ComAuxTask(AuxTask):
 
 
 # ------------------------------------------------------------------------------
-# MARK: VisAuxTask
+# MARK: VisionAuxTask
 
-class VisAuxTask(AuxTask):
+class VisionAuxTask(AuxTask):
     PX_WEIGHT_LIST = tuple(cfg.PX_WEIGHT_MAP.values())
 
     WALL_CLR_IDX_OFFSET = len(cfg.COLOURS['background'])
@@ -242,7 +250,7 @@ class VisAuxTask(AuxTask):
 
         return weights.unsqueeze(1)
 
-    def collect(self, data: TensorDict):
+    def collect(self, data: TensorDict, obs: 'tuple[Tensor, ...]', mem: 'tuple[Tensor, ...]'):
         obs_img, obs_vec, _ = data['obs']
 
         hsv = obs_img[:, :3]
@@ -277,8 +285,8 @@ class VisAuxTask(AuxTask):
         self,
         batch: TensorDict,
         act: None,
-        val: None,
-        aux: 'tuple[Tensor, ...]',
+        vals: None,
+        auxs: 'tuple[Tensor, ...]',
         stats: 'dict[str, Tensor]'
     ) -> Tensor:
 
@@ -286,7 +294,7 @@ class VisAuxTask(AuxTask):
         _, dep_target, ent_target, clr_target, weights, obj_in_frame, bot_pos = batch['obs']
 
         # Unpack model outputs
-        img_out, _, pred_obj, pred_loc = aux
+        img_out, _, pred_obj, pred_loc = auxs
         clr_logits, ent_logits, dep = img_out.split(cfg.DEC_IMG_CHANNEL_SPLIT, dim=1)
 
         # Logits to probs.

@@ -64,6 +64,9 @@ class MazeTask:
         keep_segmentation: bool = False,
         keep_rgb_over_hsv: bool = False,
         stagger_env_resets: bool = False,
+        reward_belief_gain: bool = False,
+        reward_belief_util: bool = False,
+        track_performance: bool = False,
         device: str = 'cuda'
     ):
         self.sim = sim
@@ -74,6 +77,8 @@ class MazeTask:
         self.keep_segmentation = keep_segmentation
         self.keep_rgb_over_hsv = keep_rgb_over_hsv
         self.stagger_env_resets = stagger_env_resets
+        self.belief_gain = reward_belief_gain
+        self.belief_util = reward_belief_util
         self.device = torch.device(device)
 
         steps_per_second = min(steps_per_second, frames_per_second)
@@ -193,6 +198,9 @@ class MazeTask:
         self.env_step_ctrs = torch.zeros(sim.n_envs, dtype=torch.int64, device=device)
         self.env_rst_idcs: 'list[int]' = []
         self.scores = []
+        self.time_table = (
+            torch.zeros((1, sim.n_envs, sim.n_bots, 2), dtype=torch.int64, device=device)
+            if track_performance else None)
 
         # Force premature first env. resets by starting their counters mid-episode
         # Having envs. at different stages helps to decorrelate experience in batches
@@ -317,6 +325,9 @@ class MazeTask:
         final_scores = self.bot_done_mask_f.reshape(self.sim.n_envs, self.sim.n_bots).mean(1)[self.env_rst_idcs]
         self.scores = self.scores[self.sim.n_envs - len(self.env_rst_idcs):] + final_scores.tolist()
 
+        if self.time_table is not None:
+            self.time_table = torch.cat((self.time_table, torch.zeros_like(self.time_table[:1])), dim=0)
+
         self.cell_rwd_sum[bot_rst_subs] = 0.
         self.goal_pred_ok[bot_rst_subs] = 0.
         self.goal_path_delta[bot_rst_subs] = 0.
@@ -438,7 +449,7 @@ class MazeTask:
         obs = obs_img, obs_vec, obs_map
 
         # Externally handled log
-        log_info = {'score': self.get_score()} if get_info else self.NULL_INFO
+        log_info = self.get_metrics() if get_info else self.NULL_INFO
 
         step_data = {
             'rwd': rwd,
@@ -449,11 +460,14 @@ class MazeTask:
         return obs, step_data, log_info
 
     # --------------------------------------------------------------------------
-    # MARK: get_score
-    def get_score(self) -> float:
-        """Get the average number of tasks completed per env."""
+    # MARK: get_metrics
+    def get_metrics(self) -> 'dict[str, float]':
+        """Get the average number of tasks completed per env. and other metrics."""
 
-        return sum(self.scores) / max(1, len(self.scores))
+        return {
+                'score': sum(self.scores) / max(1, len(self.scores)),
+                'speed': torch.linalg.norm(self.bot_vel, dim=-1).mean().item(),
+                'verbosity': self.act_led.mean().item()}
 
     # --------------------------------------------------------------------------
     # MARK: apply_actions
@@ -823,38 +837,60 @@ class MazeTask:
         sim = self.sim
 
         # Joint rewards
-        goal_pred_ok = (torch.linalg.norm(self.goal_pos - self.goal_pos_in_mind, dim=-1) < cfg.GOAL_PRED_RADIUS).float()
+        if self.belief_gain:
+            goal_pred_ok = torch.linalg.norm(self.goal_pos - self.goal_pos_in_mind, dim=-1) < cfg.GOAL_PRED_RADIUS
+            goal_pred_ok = (goal_pred_ok | self.bot_done_mask).float()
 
-        goal_pred_delta = (goal_pred_ok - self.goal_pred_ok).sign()
-        goal_pred_delta = goal_pred_delta.reshape(sim.n_envs, sim.n_bots).sum(1) / sim.n_bots_per_goal
+            goal_pred_delta = (goal_pred_ok - self.goal_pred_ok).sign()
+            goal_pred_delta = goal_pred_delta.reshape(sim.n_envs, sim.n_bots).sum(1) / sim.n_bots_per_goal
 
-        self.goal_pred_ok = goal_pred_ok
+            self.goal_pred_ok = goal_pred_ok
+
+        else:
+            goal_pred_delta = 0.
 
         # Event when a bot correctly recognises that a spec. obj. is in sight
         obj_found = self.obj_in_frame & self.obj_in_mind
 
         # NxG -> ExG -> E
         obj_found = obj_found.reshape(sim.n_envs, sim.n_bots, -1).any(1)
-        new_obj_found = (~self.obj_found & obj_found).any(1)
+        new_obj_found = ~self.obj_found & obj_found
+        any_obj_found = new_obj_found.any(1)
+
+        if self.time_table is not None:
+            if any_obj_found.any():
+                goal_found_mask = new_obj_found.unsqueeze(1) * self.goal_mask_f.reshape(sim.n_envs, sim.n_bots, -1)
+                goal_found_time = goal_found_mask.sum(-1) * self.env_step_ctrs.unsqueeze(1)
+                self.time_table[-1, ..., 0] += goal_found_time.long()
+
+            if new_bot_done.any():
+                goal_reached_time = new_bot_done.reshape(sim.n_envs, sim.n_bots) * self.env_step_ctrs.unsqueeze(1)
+                self.time_table[-1, ..., 1] += goal_reached_time.long()
 
         self.obj_found |= obj_found
         goal_found = self.obj_found.repeat_interleave(
             sim.n_bots, dim=0, output_size=sim.n_all_bots)[self.row_idcs, self.goal_idx]
 
         # Mark envs. to put a short sequence of steps into the aux. task prio. buffer
-        prio_event_mask = new_obj_found
+        prio_event_mask = any_obj_found
 
-        joint_rwd = new_obj_found * cfg.OBJ_FOUND_RWD + goal_pred_delta * cfg.BLIF_DELTA_RWD
+        joint_rwd = any_obj_found * cfg.OBJ_FOUND_RWD + goal_pred_delta * cfg.BLIF_DELTA_RWD
 
         # Long-horizon indiv. rewards
         bot_cell_idcs = torch.bucketize(self.bot_pos, self.side_delims)
         bot_cell_idx_tuple = (self.row_idcs, *bot_cell_idcs.unbind(1))
 
         # Pos. before goal is found, signed after: pos. if new cell closer to goal, neg. if farther
-        signed_cell_found = torch.where(
-            goal_found,
-            (self.bot_cell_idcs != bot_cell_idcs).any(-1) * self.goal_path_delta.sign(),
-            1. - self.cell_found_map[bot_cell_idx_tuple])
+        cell_found = 1. - self.cell_found_map[bot_cell_idx_tuple]
+
+        if self.belief_util:
+            signed_cell_found = torch.where(
+                goal_found,
+                (self.bot_cell_idcs != bot_cell_idcs).any(-1) * self.goal_path_delta.sign(),
+                cell_found)
+
+        else:
+            signed_cell_found = cell_found
 
         new_cell_rwd = signed_cell_found * cfg.CELL_REACHED_RWD
 

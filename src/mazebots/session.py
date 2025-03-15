@@ -17,7 +17,7 @@ from discit.track import CheckpointTracker
 import config as cfg
 from sim import MazeSim
 from task import BasicInterface, MazeTask
-from train import ComAuxTask, VisAuxTask
+from train import BeliefAuxTask, VisionAuxTask
 from model import ActorCritic, RandomActorCritic, VisNet
 from utils import get_available_file_idx
 from utils_torch import apply_quat_rot, norm_distance
@@ -127,6 +127,8 @@ class Interface(BasicInterface):
         self.dir_line_clr_obj = torch.tensor((self.DIR_LINE_CLR_OBJ_SEEN,)*sim.n_bots, dtype=float32, device=device)
         self.dir_line_clr_done = torch.tensor((self.DIR_LINE_CLR_TASK_DONE,)*sim.n_bots, dtype=float32, device=device)
 
+        self.sky_clr = torch.tensor(cfg.COLOURS['background'][cfg.SKY_CLR_IDX], device=device).mul_(255.).round_()
+
         self.torque_states = {
             key: torch.tensor(val, dtype=torch.float32, device=device)
             for key, val in self.TORQUE_STATES.items()}
@@ -151,7 +153,7 @@ class Interface(BasicInterface):
         else:
             self.tk_root = self.tk_canvas = self.visnet = None
 
-        self.sky_clr = torch.tensor(cfg.COLOURS['background'][cfg.SKY_CLR_IDX], device=device).mul_(255.).round_()
+        self.debug_samples = []
 
     # --------------------------------------------------------------------------
     # MARK: cycle_target_indices
@@ -295,6 +297,40 @@ class Interface(BasicInterface):
             return 'State not yet evaluated.\n'
 
         obs_img, obs_vec, obs_map = data['obs']
+
+        if self.session.preview:
+            seg = obs_img[self.all_bot_idx, -1].long()
+            n_obj_px = (seg == cfg.ENT_CLS_OBJ).long().sum().item()
+
+            with torch.inference_mode():
+                _, _, b_obj, b_loc = self.visnet(obs_img[:, :-1])
+
+            b_obj = b_obj[self.all_bot_idx]
+            m_obj = b_obj == b_obj.max()
+            self.session.obj_in_mind[self.all_bot_idx] = m_obj[1:]
+
+            m_obj = m_obj.cpu().numpy()
+            p_obj = b_obj.softmax().mul_(100.).cpu().numpy()
+
+            b_loc *= cfg.MAX_COORD_VAL
+            err = self.session.bot_pos - b_loc
+            n_err = torch.linalg.norm(err, dim=-1)
+            m_err = n_err[obs_img[:, -2, 24, 48] < 0.5]
+
+            b_loc = b_loc[self.all_bot_idx].cpu().numpy()
+            err = err[self.all_bot_idx].cpu().numpy()
+            n_err = n_err[self.all_bot_idx].item()
+
+            self.debug_samples.append(m_err)
+            debug_sample_ctr = sum(len(x) for x in self.debug_samples)
+            m_err = torch.cat(self.debug_samples).cpu().numpy()
+            m_err = [m_err.mean(), m_err.std()]
+
+        else:
+            n_obj_px = n_err = 0
+            m_obj = p_obj = [0.]*9
+            b_loc = err = m_err = [0.]*2
+
         xidx, yidx = torch.bucketize(self.session.bot_pos[self.all_bot_idx], self.session.side_delims)
 
         obs_img = obs_img[self.all_bot_idx].cpu().mean((-2, -1)).numpy()
@@ -307,7 +343,7 @@ class Interface(BasicInterface):
         prio_event_flag = data['prio'][self.env_idx].item()
         nrst_mask_f = data['nrst'][self.all_bot_idx].item()
 
-        score = self.session.get_score()
+        score = self.session.get_metrics()[0]
 
         return (
             '\n--------------------------------------------------------------\n'
@@ -316,7 +352,12 @@ class Interface(BasicInterface):
             f'Joint reward    | {joint_rwd: .2f}\n'
             f'Indiv. reward   | {indiv_rwd: .2f}\n'
             f'Indiv. penalty  | {indiv_pen: .2f}\n'
-            f'Obj. sight tgt. | {"|".join(" X " if flag else " _ " for flag in aux_val[:9])}\n'
+            f'Obj. sight tgt. | {"|".join("  X " if flag else " __ " for flag in aux_val[:9])}\n'
+            f'Obj. sight b.m. | {"|".join("  X " if flag else " __ " for flag in m_obj)}\n'
+            f'Obj. sight b.p. | {"|".join(f" {val:2.0f} " for val in p_obj)}\n'
+            f'Obj. sight npx. | {n_obj_px} ({100 * n_obj_px / (96*48):.2f}%)\n'
+            f'Bot pos. blf.   | {b_loc[0]:.2f} ({err[0]:.2f}) | {b_loc[1]:.2f} ({err[1]:.2f}) | {n_err:.2f}\n'
+            f'Bot pos. err.   | {m_err[0]:.2f} +/- {m_err[1]:.2f} ({debug_sample_ctr} samples)\n'
             f'Goal pos. tgt.  | X: {aux_val[9] * cfg.MAX_GOAL_DIST: .2f} | Y: {aux_val[10] * cfg.MAX_GOAL_DIST: .2f}\n'
             f'Prio. evt. flag | {prio_event_flag}\n'
             f'Reset flag      | {not bool(nrst_mask_f)}\n\n'
@@ -408,7 +449,7 @@ class Interface(BasicInterface):
         with torch.inference_mode():
             out, _, b_obj, b_loc = self.visnet(hsvd)
 
-        if self.prev_reconstruct:
+        if self.prev_reconstruct and self.session.ctrl_mode == Session.CTRL_MAN:
             self.session.obj_in_mind[self.all_bot_idx] = b_obj[0, 1:] == b_obj[0].max()
             self.session.goal_pos_in_mind[self.all_bot_idx] = b_loc[0] * cfg.MAX_COORD_VAL
 
@@ -643,8 +684,9 @@ class Session(MazeTask):
     CTRL_GEN = 1
     CTRL_MAN = 0
 
-    REC_ALL = 2
-    REC_VEC = 1
+    REC_ALL = 3
+    REC_VEC = 2
+    REC_PERF = 1
     REC_NONE = 0
 
     ARGS = [
@@ -663,8 +705,9 @@ class Session(MazeTask):
         {'name': '--transfer_name', 'type': str, 'default': '', 'help': 'Starting model name/ID string.'},
         {'name': '--transfer_ver', 'type': int, 'default': -1, 'help': 'Starting model ckpt. version.'},
         {'name': '--model_name', 'type': str, 'default': 'mazeai', 'help': 'Model name/ID string.'},
-        {'name': '--com_mode', 'type': int, 'default': cfg.COM_TOPIC, 'help': 'Mode of inter-agent communication.'},
+        {'name': '--com_mode', 'type': int, 'default': cfg.COM_NONE, 'help': 'Mode of inter-agent communication.'},
         {'name': '--aux_mode', 'type': int, 'default': cfg.AUX_NONE, 'help': 'Mode of auxiliary com. training.'},
+        {'name': '--rwd_mode', 'type': int, 'default': cfg.RWD_DEFAULT, 'help': 'Mode of reward composition.'},
         {'name': '--prob_actor', 'type': int, 'default': 1, 'help': 'Option to keep probabilistic inference.'},
         {'name': '--rng_seed', 'type': int, 'default': cfg.SEEDS[-1], 'help': 'Seed for numpy and torch RNGs.'}]
 
@@ -678,6 +721,7 @@ class Session(MazeTask):
         # Resume model state
         self.model_options = {'n_envs': args.n_envs, 'n_bots': args.n_bots, 'com_mode': args.com_mode}
         self.aux_mode = args.aux_mode
+        self.rwd_mode = args.rwd_mode
         self.prob_actor = bool(args.prob_actor)
 
         self.ckpter = CheckpointTracker(
@@ -703,10 +747,13 @@ class Session(MazeTask):
             args.ep_duration,
             args.act_freq,
             args.draw_freq,
-            render_cameras=self.ctrl_mode > self.CTRL_MAN or self.rec_mode > self.REC_NONE or self.preview,
-            keep_segmentation=self.ctrl_mode == self.CTRL_GEN or self.rec_mode > self.REC_NONE,
+            render_cameras=self.ctrl_mode > self.CTRL_MAN or self.rec_mode > self.REC_PERF or self.preview,
+            keep_segmentation=self.ctrl_mode == self.CTRL_GEN or self.rec_mode > self.REC_PERF or self.preview,
             keep_rgb_over_hsv=self.ctrl_mode == self.CTRL_MAN and not self.preview,
             stagger_env_resets=self.ctrl_mode == self.CTRL_RL,
+            reward_belief_gain=self.rwd_mode in (cfg.RWD_GAIN, cfg.RWD_ALL),
+            reward_belief_util=self.rwd_mode in (cfg.RWD_UTIL, cfg.RWD_ALL),
+            track_performance=self.rec_mode == self.REC_PERF,
             device=args.sim_device)
 
     # --------------------------------------------------------------------------
@@ -715,20 +762,22 @@ class Session(MazeTask):
     def post_step(
         self,
         obs: 'tuple[Tensor, ...]',
-        step_data: 'dict[str, Tensor | tuple[Tensor, ...]]'
+        step_data: 'dict[str, Tensor | tuple[Tensor, ...]]' = None
     ) -> 'tuple[Tensor, ...]':
 
-        step_data['obs'] = obs
+        if step_data is not None:
+            step_data['obs'] = obs
 
-        # Keep data for debugging via interface
-        self.last_data = step_data
+            # Keep data for debugging via interface
+            self.last_data = step_data
 
-        # Keep data to save
-        if self.rec_mode:
-            self.update_rec_data_queue(step_data)
+            # Keep data to save
+            if self.rec_mode:
+                self.update_rec_data_queue(step_data)
 
-            # Remove segmentation channel
-            return (obs[0][:, :-1], *obs[1:])
+        # Remove segmentation channel
+        if self.keep_segmentation:
+            obs = (obs[0][:, :-1], *obs[1:])
 
         return obs
 
@@ -742,6 +791,12 @@ class Session(MazeTask):
         prio = step_data['prio']
         nrst = step_data['nrst']
 
+        if self.rec_mode == self.REC_PERF:
+            vec_data = torch.hstack((self.goal_pos, self.goal_pos_in_mind)).cpu().numpy()
+            self.rec_data_queue.append(vec_data)
+
+            return
+
         # Images are stored in full or vector form (as means)
         if self.rec_mode == self.REC_VEC:
             img = img.mean((-2, -1))
@@ -749,7 +804,7 @@ class Session(MazeTask):
 
         prio = prio.repeat_interleave(self.sim.n_bots, dim=0, output_size=self.sim.n_all_bots).unsqueeze(-1)
 
-        vecs = (vec, rwd, vaux, prio, nrst)
+        vecs = (vec, rwd, vaux, prio, nrst, self.goal_pos_in_mind)
 
         img_data = img.cpu().numpy()
         vec_data = torch.hstack(vecs).cpu().numpy()
@@ -767,12 +822,20 @@ class Session(MazeTask):
         file_idx = get_available_file_idx(cfg.DATA_DIR, 'rec')
         filename = os.path.join(cfg.DATA_DIR, f'rec_{file_idx:02d}.npz')
 
-        img = np.stack(self.rec_data_queue[0::3])
-        vec = np.stack(self.rec_data_queue[1::3])
-        spa = np.stack(self.rec_data_queue[2::3])
-        self.rec_data_queue.clear()
+        if self.rec_mode == self.REC_PERF:
+            tab = self.time_table.cpu().numpy()
+            vec = np.stack(self.rec_data_queue)
+            self.rec_data_queue.clear()
 
-        np.savez_compressed(filename, img=img, vec=vec, map=spa)
+            np.savez_compressed(filename, tab=tab, vec=vec)
+
+        else:
+            img = np.stack(self.rec_data_queue[0::3])
+            vec = np.stack(self.rec_data_queue[1::3])
+            spa = np.stack(self.rec_data_queue[2::3])
+            self.rec_data_queue.clear()
+
+            np.savez_compressed(filename, img=img, vec=vec, map=spa)
 
         print(f'Saved data to: {filename}')
 
@@ -795,10 +858,10 @@ class Session(MazeTask):
             else:
                 self.test()
 
-            print('Ending...')
+            print('\nEnding...')
 
         except KeyboardInterrupt:
-            print('Interrupted...')
+            print('\nInterrupted...')
 
         self.save_rec_data()
 
@@ -867,7 +930,7 @@ class Session(MazeTask):
         scheduler = MultiScheduler(policy=policy_scheduler, critic=critic_scheduler, entropy=entropy_scheduler)
 
         # Init. aux. task
-        aux_task = None if self.aux_mode == cfg.AUX_NONE else ComAuxTask(
+        aux_task = None if self.aux_mode == cfg.AUX_NONE else BeliefAuxTask(
             model.policy,
             policy_optimizer,
             self.ckpter.rng,
@@ -876,7 +939,8 @@ class Session(MazeTask):
             cfg.BATCH_SIZE,
             cfg.COM_BUFFER_SIZE,
             cfg.N_TRUNCATED_STEPS,
-            self.aux_mode == cfg.AUX_ONLINE)
+            self.aux_mode == cfg.AUX_ONLINE,
+            self.aux_mode == cfg.AUX_DETACH)
 
         rl_algo = MAXPPO(
             self.step,
@@ -890,16 +954,18 @@ class Session(MazeTask):
             cfg.BRANCH_EPOCH_INTERVAL,
             cfg.N_ROLLOUT_STEPS,
             cfg.N_TRUNCATED_STEPS,
+            cfg.N_PASSES_PER_STEP,
             cfg.BUFFER_SIZE,
             cfg.BATCH_SIZE,
-            aux_task,
             cfg.DISCOUNTS,
             cfg.TRACE_LAMBDA,
             cfg.CLIP_RATIO,
             value_weight=cfg.VALUE_WEIGHT,
             aux_weight=cfg.AUX_WEIGHT,
             entropy_weight=entropy_scheduler.value,
-            log_dir=cfg.LOG_DIR)
+            aux_task=aux_task,
+            log_dir=cfg.LOG_DIR,
+            accelerate=True)
 
         try:
             rl_algo.run()
@@ -931,7 +997,7 @@ class Session(MazeTask):
             starting_step=self.ckpter.meta['update_step'])
 
         # Init. aux. task
-        aux_task = VisAuxTask(model.visnet, optimizer, self.device)
+        aux_task = VisionAuxTask(model.visnet, optimizer, self.device)
 
         rl_algo = MAXPPO(
             self.step,
@@ -944,8 +1010,8 @@ class Session(MazeTask):
             cfg.VIS_CKPT_INTERVAL,
             cfg.VIS_BRANCH_INTERVAL,
             batch_size=cfg.N_BOTS,
-            aux_task=aux_task,
             policy_weight=0.,
+            aux_task=aux_task,
             log_dir=cfg.LOG_DIR)
 
         try:
@@ -970,7 +1036,7 @@ class Session(MazeTask):
         mem = model.init_mem()
 
         with torch.inference_mode():
-            obs = self.step(get_info=False)[0]
+            obs = self.post_step(self.step(get_info=False)[0])
             step_ctr = -1
 
             while (step_ctr := step_ctr + 1) != self.end_step:
@@ -982,6 +1048,9 @@ class Session(MazeTask):
                 if not step_data['nrst'].all():
                     mem = model.reset_mem(mem, step_data['nrst'])
 
+                if self.REC_PERF:
+                    print(f'\rStep {step_ctr} of {self.end_step} | {100*step_ctr/self.end_step:.2f}%', end='')
+
     # --------------------------------------------------------------------------
     # MARK: test
 
@@ -990,7 +1059,6 @@ class Session(MazeTask):
             self.interface.set_top_view()
 
         with torch.inference_mode():
-            self.step(get_info=False)
             step_ctr = -1
 
             while (step_ctr := step_ctr + 1) != self.end_step:

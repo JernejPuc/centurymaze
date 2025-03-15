@@ -453,7 +453,8 @@ class Policy(Module):
             self.rnn.bias_hh[cfg.MEM_SIZE:-cfg.MEM_SIZE] = chrono_bias.mul_(cfg.STEPS_PER_SECOND).log_()
 
     def forward(
-        self, x: Tensor,
+        self,
+        x: Tensor,
         qkv: Tensor,
         mem: Tensor,
         forced_com_mask: Tensor = None,
@@ -688,7 +689,7 @@ class ActorCritic(ActorCriticTemplate):
         self.policy.random_init()
         self.valuator.random_init()
 
-    def init_mem(self, n_envs: int = None, n_all_bots: int = None) -> 'tuple[Tensor, ...]':
+    def init_mem(self, n_all_bots: int = None, n_envs: int = None) -> 'tuple[Tensor, ...]':
         qkv = self.policy.qkv_initial.detach().expand(self.n_all_bots, -1).clone()
         memp = self.policy.mem_initial.detach().expand(self.n_all_bots, -1).clone()
         memv = self.valuator.mem_initial.detach().expand(self.n_all_bots, -1).clone()
