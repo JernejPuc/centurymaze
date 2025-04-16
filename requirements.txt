@@ -1,8 +1,7 @@
-pillow
-numpy
-scipy
-numba
-torch >= 2.0
-tensorboard
-isaacgym
-discit @ git+https://github.com/jernejpuc/discit@main
+numpy <= 1.24.4
+numba <= 0.58.1
+scipy <= 1.10.1
+opencv-python-headless <= 4.11.0.86
+torch >= 2.0.0, <= 2.4.1
+isaacgym == 1.0rc4
+discit @ git+https://github.com/jernejpuc/discit@v0.2.2

@@ -5,7 +5,7 @@ import os
 from argparse import Namespace
 
 import numpy as np
-from PIL import Image
+from cv2 import VideoWriter, VideoWriter_fourcc, imwrite
 from isaacgym import gymapi, gymutil
 import torch
 from torch import Tensor, float32
@@ -40,8 +40,8 @@ class Interface(BasicInterface):
         np.arctan2(-1, -1): [0., -1., 0., -1.],
         np.arctan2(1, -1): [-1., 0., -1., 0.]}
 
-    OFFSET_BOT_AHEAD = [[cfg.CAM_OFFSET[0], 0., 0.]]
-    OFFSET_BOT_ABOVE = [[0., 0., cfg.CAM_OFFSET[2]]]
+    OFFSET_CAM_AHEAD = [[cfg.CAM_OFFSET[0], 0., 0.]]
+    OFFSET_CAM_ABOVE = [[0., 0., cfg.CAM_OFFSET[2]]]
 
     OFFSET_3RD_AHEAD = [[-cfg.BOT_WIDTH*2, 0., 0.]]
     OFFSET_3RD_ABOVE = [[0., 0., cfg.WALL_HEIGHT/2]]
@@ -81,9 +81,9 @@ class Interface(BasicInterface):
     MKBD_EVENTS = OBS_EVENTS + ACT_EVENTS
     MKBD_KEYS = OBS_KEYS | ACT_KEYS
 
-    VIEW_BOT = 2
-    VIEW_TOP = 1
-    VIEW_3RD = 0
+    VIEW_CAMERA = 2
+    VIEW_FOLLOW = 1
+    VIEW_FREE = 0
 
     # --------------------------------------------------------------------------
     # MARK: init
@@ -94,25 +94,30 @@ class Interface(BasicInterface):
         self.session = session
         self.sim = sim
 
-        # Init viewer
+        # Initial view
+        self.view = self.VIEW_FREE
+        self.env_idx = 0
+        self.bot_idx = 0
+        self.all_bot_idx = 0
+
         side_length = sim.data['spec'].item()['grid']['side_length']
-        self.viewer_top_pos = gymapi.Vec3(side_length*0.6, 0., side_length*0.6)
-        self.viewer_top_target = gymapi.Vec3(side_length*0.15, 0., 0.)
+        self.viewer_top_pos = gymapi.Vec3(0., -side_length*0.6, side_length*0.6)
+        self.viewer_top_target = gymapi.Vec3(0., -side_length*0.15, 0.)
+
+        self.set_top_view()
 
         # Setup input events for user interaction
         for key, name in self.MKBD_EVENTS:
             self.gym.subscribe_viewer_keyboard_event(self.viewer, key, name)
 
-        self.view = self.VIEW_TOP
-        self.env_idx = 0
-        self.bot_idx = 0
-        self.all_bot_idx = 0
-
-        self.offset_bot_ahead = torch.tensor(self.OFFSET_BOT_AHEAD, dtype=torch.float32)
-        self.offset_bot_above = torch.tensor(self.OFFSET_BOT_ABOVE, dtype=torch.float32)
+        self.offset_cam_ahead = torch.tensor(self.OFFSET_CAM_AHEAD, dtype=torch.float32)
+        self.offset_cam_above = torch.tensor(self.OFFSET_CAM_ABOVE, dtype=torch.float32)
         self.offset_3rd_ahead = torch.tensor(self.OFFSET_3RD_AHEAD, dtype=torch.float32)
         self.offset_3rd_above = torch.tensor(self.OFFSET_3RD_ABOVE, dtype=torch.float32)
 
+        self.sky_clr = torch.tensor(cfg.COLOURS['background'][cfg.SKY_CLR_IDX], device=device).mul_(255.).round_()
+
+        # Debugging
         self.obj_line_num = sim.n_goals * self.OBJ_LINE_NUM
         obj_line_angles = np.array([i*2.*np.pi/self.OBJ_LINE_NUM for i in range(self.OBJ_LINE_NUM)], dtype=np.float32)
         obj_line_pts = np.stack((np.cos(obj_line_angles), np.sin(obj_line_angles)), axis=-1) * cfg.GOAL_ZONE_RADIUS
@@ -127,8 +132,9 @@ class Interface(BasicInterface):
         self.dir_line_clr_obj = torch.tensor((self.DIR_LINE_CLR_OBJ_SEEN,)*sim.n_bots, dtype=float32, device=device)
         self.dir_line_clr_done = torch.tensor((self.DIR_LINE_CLR_TASK_DONE,)*sim.n_bots, dtype=float32, device=device)
 
-        self.sky_clr = torch.tensor(cfg.COLOURS['background'][cfg.SKY_CLR_IDX], device=device).mul_(255.).round_()
+        self.debug_samples = []
 
+        # Manual control
         self.torque_states = {
             key: torch.tensor(val, dtype=torch.float32, device=device)
             for key, val in self.TORQUE_STATES.items()}
@@ -153,8 +159,6 @@ class Interface(BasicInterface):
         else:
             self.tk_root = self.tk_canvas = self.visnet = None
 
-        self.debug_samples = []
-
     # --------------------------------------------------------------------------
     # MARK: cycle_target_indices
 
@@ -167,7 +171,7 @@ class Interface(BasicInterface):
     # MARK: set_top_view
 
     def set_top_view(self):
-        if self.view != self.VIEW_TOP:
+        if self.view != self.VIEW_FREE:
             return
 
         self.gym.viewer_camera_look_at(
@@ -238,8 +242,8 @@ class Interface(BasicInterface):
     # --------------------------------------------------------------------------
     # MARK: update_view
 
-    def update_view(self, update_lines: bool = True):
-        if self.view == self.VIEW_TOP:
+    def update_view(self, update_lines: bool = True) -> 'tuple[np.ndarray, np.ndarray] | None':
+        if self.view == Interface.VIEW_FREE:
             if update_lines:
                 self.gym.clear_lines(self.viewer)
                 self.update_obj_lines()
@@ -247,30 +251,34 @@ class Interface(BasicInterface):
 
             return
 
-        elif self.view == self.VIEW_BOT:
-            offset_ahead = self.offset_bot_ahead
-            offset_above = self.offset_bot_above
+        elif self.view == Interface.VIEW_CAMERA:
+            offset_ahead = self.offset_cam_ahead
+            offset_above = self.offset_cam_above
 
         else:
             offset_ahead = self.offset_3rd_ahead
             offset_above = self.offset_3rd_above
 
+        self.gym.fetch_results(self.sim_handle, True)
         self.gym.refresh_actor_root_state_tensor(self.sim_handle)
 
         bot_pos = self.session.env_bot_pos3[self.env_idx, self.bot_idx].cpu()
         bot_ori = self.session.env_bot_ori[None, self.env_idx, self.bot_idx].cpu()
 
         vec_ahead = apply_quat_rot(bot_ori, offset_ahead)[0]
-        ref_ahead = apply_quat_rot(bot_ori, self.offset_bot_ahead)[0]
+        ref_ahead = apply_quat_rot(bot_ori, self.offset_cam_ahead)[0]
 
         pos_view = bot_pos + offset_above[0] + vec_ahead
         pos_target = pos_view + ref_ahead
 
-        self.gym.viewer_camera_look_at(
-            self.viewer,
-            self.sim.envs[self.env_idx].handle,
-            gymapi.Vec3(*pos_view.numpy()),
-            gymapi.Vec3(*pos_target.numpy()))
+        pos_view = gymapi.Vec3(*pos_view.numpy())
+        pos_target = gymapi.Vec3(*pos_target.numpy())
+
+        # Used by VideoRecorder
+        if self.viewer is None:
+            return pos_view, pos_target
+
+        self.gym.viewer_camera_look_at(self.viewer, self.sim.envs[self.env_idx].handle, pos_view, pos_target)
 
     # --------------------------------------------------------------------------
     # MARK: get_torque_from_key_vec
@@ -303,7 +311,7 @@ class Interface(BasicInterface):
             n_obj_px = (seg == cfg.ENT_CLS_OBJ).long().sum().item()
 
             with torch.inference_mode():
-                _, _, b_obj, b_loc = self.visnet(obs_img[:, :-1])
+                _, _, b_obj, b_loc = self.visnet(obs_img[:, :cfg.OBS_IMG_CHANNELS])
 
             b_obj = b_obj[self.all_bot_idx]
             m_obj = b_obj == b_obj.max()
@@ -442,7 +450,7 @@ class Interface(BasicInterface):
     # MARK: get_visnet_images
 
     def get_visnet_images(self) -> 'tuple[np.ndarray, np.ndarray, np.ndarray]':
-        obs_img = self.session.last_data['obs'][0]
+        obs_img = self.session.last_data['obs'][0][:, :cfg.OBS_IMG_CHANNELS]
 
         hsvd = obs_img[self.all_bot_idx:self.all_bot_idx+1]
 
@@ -468,27 +476,17 @@ class Interface(BasicInterface):
     # MARK: save_camera_images
 
     def save_camera_images(self, reconstruct: bool = False) -> 'tuple[str, str, str]':
-        rgb, dep, seg = (self.get_visnet_images if reconstruct else self.get_rendered_images)()
+        images = (self.get_visnet_images if reconstruct else self.get_rendered_images)()
+        filenames = []
 
-        # RGB
-        file_idx = get_available_file_idx(cfg.DATA_DIR, 'img_rgbcam')
-        filename_rgb = os.path.join(cfg.DATA_DIR, f'img_rgbcam_{file_idx:02d}.png')
+        for img, cam_type in zip(images, ('rgb', 'dep', 'seg')):
+            file_idx = get_available_file_idx(cfg.DATA_DIR, f'img_{cam_type}cam')
+            filename = os.path.join(cfg.DATA_DIR, f'img_{cam_type}cam_{file_idx:02d}.png')
 
-        Image.fromarray(rgb.astype(np.uint8), mode='RGB').save(filename_rgb)
+            imwrite(filename, img.astype(np.uint8))
+            filenames.append(filename)
 
-        # Depth
-        file_idx = get_available_file_idx(cfg.DATA_DIR, 'img_depcam')
-        filename_dep = os.path.join(cfg.DATA_DIR, f'img_depcam_{file_idx:02d}.png')
-
-        Image.fromarray(dep.astype(np.uint8), mode='L').save(filename_dep)
-
-        # Entity seg.
-        file_idx = get_available_file_idx(cfg.DATA_DIR, 'img_segcam')
-        filename_seg = os.path.join(cfg.DATA_DIR, f'img_segcam_{file_idx:02d}.png')
-
-        Image.fromarray(seg.astype(np.uint8), mode='L').save(filename_seg)
-
-        return filename_rgb, filename_dep, filename_seg
+        return tuple(filenames)
 
     # --------------------------------------------------------------------------
     # MARK: save_viewer_image
@@ -555,6 +553,9 @@ class Interface(BasicInterface):
                 elif cmd_key == 'cycle_env':
                     self.cycle_target_indices(env_inc=-1 if self.key_vec[-1] else 1)
 
+                    if not self.key_vec[-1]:
+                        self.set_top_view()
+
                     print(f'Env/agent index switched to {self.env_idx}/{self.all_bot_idx}.')
 
                 # NOTE: Previous bot torques are not automatically reset to zero
@@ -565,13 +566,15 @@ class Interface(BasicInterface):
 
                 elif cmd_key == 'cycle_view':
                     self.view = (self.view + (-1 if self.key_vec[-1] else 1)) % 3
-                    # self.set_top_view()
 
-                    if self.view == self.VIEW_BOT:
+                    if not self.key_vec[-1]:
+                        self.set_top_view()
+
+                    if self.view == self.VIEW_CAMERA:
                         self.gym.clear_lines(self.viewer)
 
                 elif cmd_key == 'save_view':
-                    if self.view != self.VIEW_TOP and self.session.render_cameras:
+                    if self.view != self.VIEW_FREE and self.session.render_cameras:
                         for reconstruct in (False, True):
                             filename_rgb, filename_dep, filename_seg = self.save_camera_images(reconstruct)
 
@@ -662,12 +665,90 @@ class Interface(BasicInterface):
         self.gym.sync_frame_time(self.sim_handle)
 
     # --------------------------------------------------------------------------
-    # MARK: reset
+    # MARK: reset & cleanup
 
     def reset(self):
         self.key_vec.fill(0)
         self.update_view(update_lines=False)
         self.gym.clear_lines(self.viewer)
+
+    def cleanup(self):
+        if self.tk_root is not None:
+            self.tk_root.destroy()
+
+        self.gym.destroy_viewer(self.viewer)
+
+
+# ------------------------------------------------------------------------------
+# MARK: VideoRecorder
+
+class VideoRecorder(BasicInterface):
+    """Workaround as `get_viewer_camera_handle` produces a segmentation fault."""
+
+    VIDEO_WINDOW_SIZE = (2560, 1440)
+
+    def __init__(self, session: 'Session', sim: MazeSim, draw_freq: int):
+        self.session = session
+        self.gym = sim.gym
+        self.sim_handle = sim.handle
+        self.env_handle = sim.envs[0].handle
+        self.env_idx = 0
+        self.bot_idx = 0
+        self.viewer = None
+        self.paused = False
+        self.skip = True
+        self.view = Interface.VIEW_FREE
+
+        self.offset_cam_ahead = torch.tensor(Interface.OFFSET_CAM_AHEAD, dtype=torch.float32)
+        self.offset_cam_above = torch.tensor(Interface.OFFSET_CAM_ABOVE, dtype=torch.float32)
+        self.offset_3rd_ahead = torch.tensor(Interface.OFFSET_3RD_AHEAD, dtype=torch.float32)
+        self.offset_3rd_above = torch.tensor(Interface.OFFSET_3RD_ABOVE, dtype=torch.float32)
+        self.sky_clr = (np.array(cfg.COLOURS['background'][cfg.SKY_CLR_IDX])[::-1] * 255.).round()
+
+        camera_props = gymapi.CameraProperties()
+        camera_props.width, camera_props.height = self.VIDEO_WINDOW_SIZE
+        self.cam_handle = self.gym.create_camera_sensor(self.env_handle, camera_props)
+
+        side_length = sim.data['spec'].item()['grid']['side_length']
+        viewer_top_pos = gymapi.Vec3(0., -side_length*0.6, side_length*0.6)
+        viewer_top_target = gymapi.Vec3(0., -side_length*0.15, 0.)
+
+        self.gym.set_camera_location(self.cam_handle, self.env_handle, viewer_top_pos, viewer_top_target)
+
+        file_idx = get_available_file_idx(cfg.DATA_DIR, 'vid')
+
+        self.video_out = VideoWriter(
+            os.path.join(cfg.DATA_DIR, f'vid_{file_idx:02d}.mp4'),
+            VideoWriter_fourcc(*'avc1'),
+            draw_freq,
+            self.VIDEO_WINDOW_SIZE)
+
+    def eval_events(self):
+        pass
+
+    def sync_redraw(self, after_eval: bool = True):
+        if self.skip:
+            self.skip = False
+            return
+
+        if (pos := Interface.update_view(self, update_lines=False)) is not None:
+            self.gym.set_camera_location(self.cam_handle, self.env_handle, *pos)
+
+        self.gym.step_graphics(self.sim_handle)
+        self.gym.render_all_camera_sensors(self.sim_handle)
+
+        rgb = self.gym.get_camera_image(self.sim_handle, self.env_handle, self.cam_handle, gymapi.IMAGE_COLOR)
+        seg = self.gym.get_camera_image(self.sim_handle, self.env_handle, self.cam_handle, gymapi.IMAGE_SEGMENTATION)
+
+        sky_mask = (seg == cfg.ENT_CLS_SKY)[..., None]
+        rgb = rgb.reshape(*self.VIDEO_WINDOW_SIZE[::-1], 4)[..., :3]
+        rgb = np.where(sky_mask, self.sky_clr, np.flip(rgb, axis=-1))
+
+        self.video_out.write(rgb.astype(np.uint8))
+
+    def cleanup(self):
+        self.video_out.release()
+        self.gym.destroy_camera_sensor(self.sim_handle, self.env_handle, self.cam_handle)
 
 
 # ------------------------------------------------------------------------------
@@ -684,9 +765,10 @@ class Session(MazeTask):
     CTRL_GEN = 1
     CTRL_MAN = 0
 
-    REC_ALL = 3
-    REC_VEC = 2
-    REC_PERF = 1
+    REC_IMG = 4
+    REC_VEC = 3
+    REC_PERF = 2
+    REC_VIDEO = 1
     REC_NONE = 0
 
     ARGS = [
@@ -700,16 +782,16 @@ class Session(MazeTask):
         {'name': '--rec_mode', 'type': int, 'default': REC_NONE, 'help': 'Data category to record.'},
         {'name': '--preview', 'type': int, 'default': 0, 'help': 'Option to view input or recons. images in side GUI.'},
         {'name': '--headless', 'type': int, 'default': 0, 'help': 'Option to run without a viewer.'},
-        {'name': '--draw_freq', 'type': int, 'default': 64, 'help': 'Viewer frames per second.'},
+        {'name': '--draw_freq', 'type': int, 'default': 60, 'help': 'Viewer frames per second.'},
         {'name': '--act_freq', 'type': int, 'default': cfg.STEPS_PER_SECOND, 'help': 'Inference steps per second.'},
         {'name': '--transfer_name', 'type': str, 'default': '', 'help': 'Starting model name/ID string.'},
         {'name': '--transfer_ver', 'type': int, 'default': -1, 'help': 'Starting model ckpt. version.'},
-        {'name': '--model_name', 'type': str, 'default': 'mazeai', 'help': 'Model name/ID string.'},
-        {'name': '--com_mode', 'type': int, 'default': cfg.COM_NONE, 'help': 'Mode of inter-agent communication.'},
-        {'name': '--aux_mode', 'type': int, 'default': cfg.AUX_NONE, 'help': 'Mode of auxiliary com. training.'},
-        {'name': '--rwd_mode', 'type': int, 'default': cfg.RWD_DEFAULT, 'help': 'Mode of reward composition.'},
+        {'name': '--model_name', 'type': str, 'default': 'diabl42', 'help': 'Model name/ID string.'},
+        {'name': '--com_mode', 'type': int, 'default': cfg.COM_TARGET, 'help': 'Mode of inter-agent communication.'},
+        {'name': '--aux_mode', 'type': int, 'default': cfg.AUX_REPLAY, 'help': 'Mode of auxiliary com. training.'},
+        {'name': '--rwd_mode', 'type': int, 'default': cfg.RWD_ALL, 'help': 'Mode of reward composition.'},
         {'name': '--prob_actor', 'type': int, 'default': 1, 'help': 'Option to keep probabilistic inference.'},
-        {'name': '--rng_seed', 'type': int, 'default': cfg.SEEDS[-1], 'help': 'Seed for numpy and torch RNGs.'}]
+        {'name': '--rng_seed', 'type': int, 'default': 128, 'help': 'Seed for numpy and torch RNGs.'}]
 
     def __init__(self, args: Namespace):
         self.end_step: int = args.end_step
@@ -734,12 +816,20 @@ class Session(MazeTask):
             self.ckpter.logger.info(f'Training with args.:\n{{{str(args)[10:-1]}}}')
 
         # Init. Isaac Gym, envs., and state tensors
-        if args.headless:
+        if args.headless and self.rec_mode != self.REC_VIDEO:
             args.draw_freq = args.act_freq
 
         sim = MazeSim(args, self.ckpter.rng)
-        interface = Interface(self, sim, args.sim_device) if not args.headless else None
         self.last_data = None
+
+        if not args.headless:
+            interface = Interface(self, sim, args.sim_device)
+
+        elif self.rec_mode == self.REC_VIDEO:
+            interface = VideoRecorder(self, sim, args.draw_freq)
+
+        else:
+            interface = None
 
         super().__init__(
             sim,
@@ -777,7 +867,7 @@ class Session(MazeTask):
 
         # Remove segmentation channel
         if self.keep_segmentation:
-            obs = (obs[0][:, :-1], *obs[1:])
+            obs = (obs[0][:, :cfg.OBS_IMG_CHANNELS], *obs[1:])
 
         return obs
 
@@ -816,7 +906,7 @@ class Session(MazeTask):
     # MARK: save_rec_data
 
     def save_rec_data(self):
-        if self.rec_mode == self.REC_NONE or not self.rec_data_queue:
+        if self.rec_mode < self.REC_PERF or not self.rec_data_queue:
             return
 
         file_idx = get_available_file_idx(cfg.DATA_DIR, 'rec')
@@ -867,10 +957,7 @@ class Session(MazeTask):
 
         # Cleanup
         if self.interface is not None:
-            self.gym.destroy_viewer(self.interface.viewer)
-
-            if self.interface.tk_root is not None:
-                self.interface.tk_root.destroy()
+            self.interface.cleanup()
 
         self.sim.cleanup()
         self.async_event_loop.close()
@@ -908,7 +995,7 @@ class Session(MazeTask):
         model.visencoder.load_state_dict(torch.load(encoder_path, map_location=self.ckpter.device))
         model.visdecoder.load_state_dict(torch.load(decoder_path, map_location=self.ckpter.device))
 
-        self.ckpter.load_model(model, optimizer)
+        self.ckpter.restore(model, optimizer)
 
         # Init. schedulers
         policy_scheduler = AnnealingScheduler(
@@ -989,7 +1076,7 @@ class Session(MazeTask):
             weight_decay=cfg.WEIGHT_DECAY,
             device=self.ckpter.device)
 
-        self.ckpter.load_model(model, optimizer)
+        self.ckpter.restore(model, optimizer)
 
         scheduler = AnnealingScheduler(
             optimizer,
@@ -1025,9 +1112,6 @@ class Session(MazeTask):
     # MARK: eval
 
     def eval(self):
-        if not self.headless:
-            self.interface.set_top_view()
-
         model = ActorCritic(**self.model_options)
 
         model.to(self.ckpter.device)
@@ -1037,9 +1121,9 @@ class Session(MazeTask):
 
         with torch.inference_mode():
             obs = self.post_step(self.step(get_info=False)[0])
-            step_ctr = -1
+            step_ctr = 0
 
-            while (step_ctr := step_ctr + 1) != self.end_step:
+            while step_ctr != self.end_step:
                 actions, beliefs, mem = model.act(obs, mem, sample=self.prob_actor)
 
                 obs, step_data, _ = self.step(actions, beliefs, get_info=False)
@@ -1048,16 +1132,15 @@ class Session(MazeTask):
                 if not step_data['nrst'].all():
                     mem = model.reset_mem(mem, step_data['nrst'])
 
-                if self.REC_PERF:
+                step_ctr += 1
+
+                if self.end_step > 0:
                     print(f'\rStep {step_ctr} of {self.end_step} | {100*step_ctr/self.end_step:.2f}%', end='')
 
     # --------------------------------------------------------------------------
     # MARK: test
 
     def test(self):
-        if not self.headless:
-            self.interface.set_top_view()
-
         with torch.inference_mode():
             step_ctr = -1
 

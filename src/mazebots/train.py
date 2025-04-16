@@ -17,6 +17,8 @@ from utils_torch import rgb_to_hsv
 # MARK: BeliefAuxTask
 
 class BeliefAuxTask(AuxTask):
+    """DIABL & InfER"""
+
     STAT_KEYS = ('Aux/loc_nll_off',)
 
     def __init__(
@@ -190,6 +192,8 @@ class BeliefAuxTask(AuxTask):
 # MARK: VisionAuxTask
 
 class VisionAuxTask(AuxTask):
+    """Image encoder pretraining"""
+
     PX_WEIGHT_LIST = tuple(cfg.PX_WEIGHT_MAP.values())
 
     WALL_CLR_IDX_OFFSET = len(cfg.COLOURS['background'])

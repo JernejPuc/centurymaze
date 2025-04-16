@@ -44,6 +44,9 @@ class BasicInterface:
     def reset(self):
         pass
 
+    def cleanup(self):
+        pass
+
 
 # ------------------------------------------------------------------------------
 # MARK: MazeTask
@@ -926,11 +929,11 @@ class MazeTask:
     async def async_step_graphics(self, other_task: asyncio.Task):
         self.gym.step_graphics(self.sim.handle)
 
-        if not self.headless:
-            self.interface.sync_redraw()
-
         if self.render_cameras:
             self.gym.render_all_camera_sensors(self.sim.handle)
+
+        if not self.headless:
+            self.interface.sync_redraw()
 
         await other_task
         self.async_event_loop.stop()

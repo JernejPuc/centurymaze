@@ -1,0 +1,1 @@
+{"2024-11-11 00:34:26": {"ckpt_ctr": 338, "ckpt_ver": 12, "name": "diabl42", "epoch_step": 1350, "update_step": 1350, "perf_score": 0.7402339577674866, "model_path": "data/diabl42/model_012.pt", "ckpt_path": "data/diabl42/ckpt_012.pt"}}
