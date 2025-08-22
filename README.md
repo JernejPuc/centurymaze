@@ -53,8 +53,10 @@ The result is presented by the following examples in multiple perspectives:
 </p>
 
 <p align="center">
-<video controls src="data/vid_02.mp4" width="48%"></video>
-<video controls src="data/vid_03.mp4" width="48%"></video>
+<!-- <video controls src="data/vid_02.mp4" width="48%"></video> -->
+<!-- <video controls src="data/vid_03.mp4" width="48%"></video> -->
+<video controls src="https://github.com/user-attachments/assets/ae2b903b-5722-43fc-bffc-c194413d7716" width="48%"></video>
+<video controls src="https://github.com/user-attachments/assets/d59ba695-5bac-4006-9dd0-190e84fa2379" width="48%"></video>
 </p>
 
 
