@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<robot name="wall">
+<link name="wall">
+    <visual>
+        <origin rpy="-1.57079632675 0 0" xyz="0 0 0"/>
+        <geometry>
+            <mesh filename="border/cuboid_rep1d.obj" scale="0.025 0.9 18.05"/>
+        </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0"/>
+      <geometry>
+            <box size="0.05 36.1 1.8"/>
+        </geometry>
+    </collision>
+    <inertial>
+        <density value="1000.0"/>
+    </inertial>
+</link>
+</robot>

@@ -1,22 +1,31 @@
 # Century Maze: Large-Scale Multi-Robot Navigation
 
 <p align="center">
-<img src="data/img_viewer_00.png" width="80%">
+<img src="data/img_viewer_00.png" width="48%">
+<img src="data/img_viewer_01.png" width="48%">
 </p>
 
 Century Maze is a virtual environment for multi-agent object-goal navigation,
 characterised by a large explorable area with many visual embodied agents.
-It is designed to challenge cooperative multi-robot systems on a scale of more than 100 agents
-by emphasising the role of long-distance communication in the overall system performance.
+It is designed to push the scalability and efficiency of cooperative multi-robot systems
+on a scale of over 100 robots by only permitting them to achieve
+a high level of performance when they communicate efficiently.
 
-The task requires each of the 4-wheeled robotic agents in a group
-to reach the target specifically assigned to it
-(a spherical object distinguished by its unique colour)
-in a limited time frame.
+The underlying task requires each of the 4-wheeled robotic agents in a group
+to explore an unknown environment and reach the target specifically assigned to it
+(an object distinguished by its unique colour) in a limited time frame.
 As many agents explore the environment simultaneously,
-locating and sharing the locations of the targets
-should reduce the search times of the other agents
-and help them all reach their targets in time.
+locating and sharing information on discovered objects
+should reduce the search times of the agents assigned to them
+and help everyone in the group in turn.
+
+We evaluate our methods on two variants of Century Maze:
+1. The hand-designed prototype maze without textures or I/O imperfection
+emphasises visual clarity and limits the effect of confounding variables.
+2. Procedurally generated mazes with realistic textures,
+multiple scale configurations, layout randomisation, varying physical
+and lighting conditions, noised interactions, and imperfect communication
+present robustness challenges closer to practical settings.
 
 
 ## Reinforcement Learning
@@ -34,13 +43,18 @@ to retain experience conducive to communication in the learning process.
 
 A decentralized policy was trained in 9 parallel environments of 112 agents each,
 for a total of 1,008 agents in simultaneous simulation.
-The result is presented by the following example in two perspectives:
+The result is presented by the following examples in multiple perspectives:
 
 <p align="center">
 <!-- <video controls src="data/vid_00.mp4" width="48%"></video> -->
 <!-- <video controls src="data/vid_01.mp4" width="48%"></video> -->
 <video controls src="https://github.com/user-attachments/assets/6e4d5bce-b434-4f12-ae1c-d535791b575b" width="48%"></video>
 <video controls src="https://github.com/user-attachments/assets/6e43a527-964d-4219-bf50-0168da71e4fa" width="48%"></video>
+</p>
+
+<p align="center">
+<video controls src="data/vid_02.mp4" width="48%"></video>
+<video controls src="data/vid_03.mp4" width="48%"></video>
 </p>
 
 
@@ -79,7 +93,7 @@ The different modes can be run through the runner with:
 python runner.py --spec mode --args "additional args for specified mode"
 ```
 
-See the code of [`runner`](runner.py) and [`session`](src/mazebots/session.py) files
+See the code of [`runner`](runner.py) and [`session`](src/mazebotsgen/session.py) files
 for all argument options.
 
 

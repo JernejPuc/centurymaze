@@ -1,0 +1,1 @@
+{"2025-07-11 16:03:59": {"ckpt_ctr": 301, "ckpt_ver": 12, "name": "diablg3", "epoch_step": 3600, "update_step": 3600, "perf_score": 0.8307726979255676, "model_path": "data/diablg3/model_012.pt", "ckpt_path": "data/diablg3/ckpt_012.pt"}}
