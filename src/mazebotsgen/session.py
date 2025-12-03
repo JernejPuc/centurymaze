@@ -847,8 +847,10 @@ class Session(MazeTask):
             ver_to_transfer=args.transfer_ver if args.transfer_ver >= 0 else None,
             reset_step_on_transfer=True)
 
+        self.metastr = str(args)
+
         if self.ctrl_mode in (self.CTRL_GEN, self.CTRL_RL):
-            self.ckpter.logger.info(f'Training with args.:\n{{{str(args)[10:-1]}}}')
+            self.ckpter.logger.info(f'Training with args.:\n{{{self.metastr[10:-1]}}}')
 
         # Init. Isaac Gym, envs., and state tensors
         if args.headless and self.rec_mode != self.REC_VIDEO:
@@ -963,7 +965,7 @@ class Session(MazeTask):
             vec = np.stack(self.rec_data_queue)
             self.rec_data_queue.clear()
 
-            np.savez_compressed(filename, tab=tab, vec=vec)
+            np.savez_compressed(filename, tab=tab, vec=vec, meta=self.metastr)
 
         else:
             img = np.stack(self.rec_data_queue[0::3])
@@ -1058,7 +1060,8 @@ class Session(MazeTask):
         entropy_scheduler = CoeffScheduler(
             cfg.UPDATE_MILESTONE_MAP['policy'][-1],
             cfg.ENT_WEIGHT_MILESTONES,
-            starting_step=self.ckpter.meta['update_step'])
+            starting_step=self.ckpter.meta['update_step'],
+            device=self.ckpter.device)
 
         scheduler = MultiScheduler(policy=policy_scheduler, critic=critic_scheduler, entropy=entropy_scheduler)
 

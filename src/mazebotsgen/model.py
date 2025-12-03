@@ -380,7 +380,7 @@ class TarMAC(Module):
 # MARK: NoMAC
 
 class NoMAC(Module):
-    def __init__(self, bot_slices: 'list[slice]'):
+    def __init__(self, bot_slices: 'list[slice]', com_range: float, kv_noise: float):
         super().__init__()
 
         self.zeros = nn.Parameter(torch.zeros(1, cfg.V_DIM), requires_grad=False)
@@ -832,13 +832,13 @@ if __name__ == '__main__':
 
     parser = ArgumentParser(description='VisNet disassembler.')
     parser.add_argument('--model_name', type=str, default='visgen', help='Model name/ID string.')
-    model_name = parser.parse_known_args().model_name
+    model_name = parser.parse_known_args()[0].model_name
 
     vis_dir = os.path.join(cfg.DATA_DIR, model_name)
     vis_file = sorted(os.listdir(vis_dir))[-1]
 
     vis_dict = torch.load(os.path.join(vis_dir, vis_file), map_location='cuda')
-    act_model = RandomActorCritic([], None)
+    act_model = RandomActorCritic([], *[None]*4)
     act_model.load_state_dict(vis_dict)
     vis_model = act_model.visnet
 

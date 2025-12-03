@@ -88,7 +88,7 @@ if __name__ == '__main__':
         ('' if parsed.gpu_id < 0 else f'--sim_device "cuda:{parsed.gpu_id}" --graphics_device_id {parsed.gpu_id} ') +
         parsed.args)
 
-    for sys_call in preset:
+    for i, sys_call in enumerate(preset, start=1):
         sys_call = prefix + sys_call + suffix
 
         print(f'Running: {sys_call}')
@@ -110,7 +110,7 @@ if __name__ == '__main__':
             print(f'Process errored out with exit flag {exit_flag}.')
             break
 
-        if len(preset) > 1:
+        if i != len(preset):
             print()
 
             for i in range(5, 0, -1):

@@ -295,6 +295,7 @@ RWD_DEFAULT = 0
 
 AGENT_TYPE_CONFIGS = {
     'base-nocom': {'com_mode': COM_NONE, 'aux_mode': AUX_NONE, 'rwd_mode': RWD_DEFAULT},
+    'nobl-dial': {'com_mode': COM_TARGET, 'aux_mode': AUX_NONE, 'rwd_mode': RWD_UTIL},
     'dial-oracle': {'com_mode': COM_ORACULAR, 'aux_mode': AUX_NONE, 'rwd_mode': RWD_ALL},
     'diabl-infer': {'com_mode': COM_TARGET, 'aux_mode': AUX_REPLAY, 'rwd_mode': RWD_ALL}}
 
@@ -342,6 +343,11 @@ ENV_NUM_LVL_PRESETS = {
     '1x3': {3: 1},
     '1x4': {4: 1},
     '1x5': {5: 1},
+    '44x1+4': {1: 44, 2: 1, 3: 1, 4: 1, 5: 1},
+    '21x2+3': {2: 21, 3: 1, 4: 1, 5: 1},
+    '10x3+2': {3: 10, 4: 1, 5: 1},
+    '5x4+1': {4: 5, 5: 1},
+    '3x5+0': {5: 3},
     'all': {1: 1, 2: 1, 3: 1, 4: 1, 5: 1},
     'prog': {1: 5, 2: 4, 3: 3, 4: 2, 5: 1}}
 

@@ -23,11 +23,8 @@ class MazeEnv:
     GOAL_CLRS = np.array([gymapi.Vec3(*clr) for clr in cfg.COLOURS['goal']], dtype=object)
 
     MAX_SIDE_LENGTH = cfg.LEVEL_PARAMS[max(cfg.LEVEL_PARAMS)]['side_length']
-    FLOOR_LENGTH = MAX_SIDE_LENGTH + cfg.WALL_WIDTH * 2.
 
-    FLOOR_DIMS = (FLOOR_LENGTH, FLOOR_LENGTH, cfg.WALL_WIDTH)
     FLOOR_POSE = (0., 0., -cfg.WALL_WIDTH / 2.)
-
     BORDER_POSES = {}
 
     for lvl, params in cfg.LEVEL_PARAMS.items():
@@ -165,7 +162,7 @@ class MazeEnv:
                 -1,
                 cfg.ENT_CLS_WALL)
 
-            self.base_idcs[i] = gym.get_actor_index(self.handle, border_handle, gymapi.DOMAIN_SIM)
+            self.base_idcs[i+1] = gym.get_actor_index(self.handle, border_handle, gymapi.DOMAIN_SIM)
 
         for i in range(self.sampler.n_side_divs):
             for j in range(self.sampler.n_side_divs):
@@ -526,6 +523,17 @@ class MazeSim:
             'brd': [
                 gym.create_texture_from_file(self.handle, os.path.join(cfg.ASSET_DIR, 'border', fname))
                 for fname in sorted(os.listdir(cfg.ASSET_DIR + '/border')) if fname[-1] == 'g']}
+
+        # Override for const. num. training
+        if '+' in args.env_cfg:
+            params = cfg.LEVEL_PARAMS[int(args.env_cfg.split('+')[0].split('x')[1])]
+            n_bots_override = params['n_bots']
+            n_goals_override = params['n_goals']
+
+            for level in tuple(cfg.LEVEL_PARAMS):
+                params = cfg.LEVEL_PARAMS[level]
+                params['n_bots'] = n_bots_override
+                params['n_goals'] = n_goals_override
 
         # Create parallel envs.
         self.n_envs = sum(n_envs for n_envs in cfg.ENV_NUM_LVL_PRESETS[args.env_cfg].values())
