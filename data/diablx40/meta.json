@@ -1,0 +1,1 @@
+{"2025-12-26 22:34:08": {"ckpt_ctr": 301, "ckpt_ver": 12, "name": "diablx40", "epoch_step": 3600, "update_step": 3600, "perf_score": 0.6834899187088013, "model_path": "data/diablx40/model_012.pt", "ckpt_path": "data/diablx40/ckpt_012.pt"}}

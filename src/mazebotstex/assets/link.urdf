@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<robot name="link">
+<link name="link">
+    <visual>
+        <origin rpy="-1.57079632675 0 0" xyz="0 0 0"/>
+        <geometry>
+            <mesh filename="cube.obj" scale="0.025 0.375 0.025"/>
+        </geometry>
+    </visual>
+    <collision>
+        <origin xyz="0 0 0"/>
+        <geometry>
+            <box size="0.05 0.05 0.75"/>
+        </geometry>
+    </collision>
+    <inertial>
+        <density value="1000.0"/>
+    </inertial>
+</link>
+</robot>

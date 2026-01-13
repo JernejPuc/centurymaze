@@ -1,0 +1,165 @@
+<?xml version="1.0"?>
+<robot name="bot">
+<link name="body">
+    <inertial>
+        <mass value="3.0"/>
+        <origin rpy="0 0 0" xyz="0 0 0.125"/>
+        <inertia ixx="0.02882" ixy="0.0" ixz="0.0" iyy="0.02882" iyz="0.0" izz="0.045"/>
+    </inertial>
+    <visual>
+        <origin rpy="-1.57079632675 0 0" xyz="0 0 0.19"/>
+        <geometry>
+            <mesh filename="cube.obj" scale="0.2125 0.045 0.1795"/>
+        </geometry>
+    </visual>
+    <collision>
+        <origin rpy="0 0 0" xyz="0 0 0.19"/>
+        <geometry>
+            <box size="0.425 0.425 0.095"/>
+        </geometry>
+    </collision>
+</link>
+<link name="motors_fused">
+    <visual>
+        <origin rpy="-1.57079632675 0 0" xyz="0 0 -0.06"/>
+        <geometry>
+            <mesh filename="cube.obj" scale="0.2125 0.06 0.1465"/>
+        </geometry>
+    </visual>
+</link>
+<link name="board">
+    <visual>
+        <origin rpy="-1.57079632675 0 0" xyz="0 0 0.095"/>
+        <geometry>
+            <mesh filename="cube.obj" scale="0.025 0.095 0.025"/>
+        </geometry>
+    </visual>
+</link>
+<link name="sensor">
+    <visual>
+        <origin rpy="-1.57079632675 0 0" xyz="0.02 0 0.02"/>
+        <geometry>
+            <mesh filename="cube.obj" scale="0.02 0.02 0.125"/>
+        </geometry>
+    </visual>
+</link>
+<link name="wheel_1_left">
+    <inertial>
+        <mass value="0.75"/>
+        <origin rpy="1.57079632675 0 0" xyz="0 0.02 0.0"/>
+        <inertia ixx="0.000667" ixy="0.0" ixz="0.0" iyy="0.000667" iyz="0.0" izz="0.001134"/>
+    </inertial>
+    <visual>
+        <origin rpy="0 0 0" xyz="0 0.033 0"/>
+        <geometry>
+            <mesh filename="cylinder.obj" scale="0.065 0.066 0.065"/>
+        </geometry>
+    </visual>
+    <collision>
+        <origin rpy="1.57079632675 0 0" xyz="0 0.02 0.0"/>
+        <geometry>
+            <cylinder radius="0.065" length="0.066" />
+        </geometry>
+    </collision>
+</link>
+<link name="wheel_2_right">
+    <inertial>
+        <mass value="0.75"/>
+        <origin rpy="1.57079632675 0 0" xyz="0 -0.02 0.0"/>
+        <inertia ixx="0.000667" ixy="0.0" ixz="0.0" iyy="0.000667" iyz="0.0" izz="0.001134"/>
+    </inertial>
+    <visual>
+        <origin rpy="0 0 0" xyz="0 -0.033 0"/>
+        <geometry>
+            <mesh filename="cylinder.obj" scale="0.065 0.066 0.065"/>
+        </geometry>
+    </visual>
+    <collision>
+        <origin rpy="1.57079632675 0 0" xyz="0 -0.033 0.0"/>
+        <geometry>
+            <cylinder radius="0.065" length="0.066"/>
+        </geometry>
+    </collision>
+</link>
+<link name="wheel_3_left">
+    <inertial>
+        <mass value="0.75"/>
+        <origin rpy="1.57079632675 0 0" xyz="0 0.02 0.0"/>
+        <inertia ixx="0.000667" ixy="0.0" ixz="0.0" iyy="0.000667" iyz="0.0" izz="0.001134"/>
+    </inertial>
+    <visual>
+        <origin rpy="0 0 0" xyz="0 0.033 0"/>
+        <geometry>
+            <mesh filename="cylinder.obj" scale="0.065 0.066 0.065"/>
+        </geometry>
+    </visual>
+    <collision>
+        <origin rpy="1.57079632675 0 0" xyz="0 0.033 0.0"/>
+        <geometry>
+            <cylinder radius="0.065" length="0.066"/>
+        </geometry>
+    </collision>
+</link>
+<link name="wheel_4_right">
+    <inertial>
+        <mass value="0.75"/>
+        <origin rpy="1.57079632675 0 0" xyz="0 -0.02 0.0"/>
+        <inertia ixx="0.000667" ixy="0.0" ixz="0.0" iyy="0.000667" iyz="0.0" izz="0.001134"/>
+    </inertial>
+    <visual>
+        <origin rpy="0 0 0" xyz="0 -0.033 0"/>
+        <geometry>
+            <mesh filename="cylinder.obj" scale="0.065 0.066 0.065"/>
+        </geometry>
+    </visual>
+    <collision>
+        <origin rpy="1.57079632675 0 0" xyz="0 -0.033 0.0"/>
+        <geometry>
+            <cylinder radius="0.065" length="0.066"/>
+        </geometry>
+    </collision>
+</link>
+<joint name="body_motors_glue" type="fixed">
+    <parent link="body"/>
+    <child link="motors_fused"/>
+    <origin xyz="0.0 0.0 0.145"/>
+</joint>
+<joint name="body_board_glue" type="fixed">
+    <parent link="body"/>
+    <child link="board"/>
+    <origin xyz="-0.1875 0 0.235"/>
+</joint>
+<joint name="board_sensor_glue" type="fixed">
+    <parent link="board"/>
+    <child link="sensor"/>
+    <origin xyz="0.025 0 0.17"/>
+</joint>
+<joint name="wheel_1_axis" type="continuous">
+    <parent link="body"/>
+    <child link="wheel_1_left"/>
+    <origin xyz="0.15 0.1465 0.065" rpy="0 0 0" />
+    <axis xyz="0 1 0" rpy="0 0 0" />
+    <dynamics damping="0.0" friction="0.0" />
+</joint>
+<joint name="wheel_2_axis" type="continuous">
+    <parent link="body"/>
+    <child link="wheel_2_right"/>
+    <origin xyz="0.15 -0.1465 0.065" rpy="0 0 0" />
+    <axis xyz="0 1 0" rpy="0 0 0" />
+    <dynamics damping="0.0" friction="0.0" />
+</joint>
+<joint name="wheel_3_axis" type="continuous">
+    <parent link="body"/>
+    <child link="wheel_3_left"/>
+    <origin xyz="-0.15 0.1465 0.065" rpy="0 0 0" />
+    <axis xyz="0 1 0" rpy="0 0 0" />
+    <dynamics damping="0.0" friction="0.0" />
+</joint>
+<joint name="wheel_4_axis" type="continuous">
+    <parent link="body"/>
+    <child link="wheel_4_right"/>
+    <origin xyz="-0.15 -0.1465 0.065" rpy="0 0 0" />
+    <axis xyz="0 1 0" rpy="0 0 0" />
+    <dynamics damping="0.0" friction="0.0" />
+</joint>
+</robot>

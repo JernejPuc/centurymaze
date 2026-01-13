@@ -1,0 +1,605 @@
+"""Core/numpy utilities"""
+
+import os
+import numpy as np
+import numba
+import cv2
+from numpy import ndarray
+from numba.core import types
+from numba.typed import Dict
+from scipy.spatial import Delaunay
+
+
+# ------------------------------------------------------------------------------
+# MARK: get_available_file_idx
+
+def get_available_file_idx(data_dir: str, prefix: str) -> int:
+    """Get the index of the first/next file with the given prefix."""
+
+    filenames = os.listdir(data_dir)
+
+    return 1 + max((
+        int(name.split('_')[-1].split('.')[0])
+        for name in filenames if name.startswith(prefix)), default=-1)
+
+
+# ------------------------------------------------------------------------------
+# MARK: urquhart
+
+def urquhart(pts: ndarray) -> ndarray:
+    """
+    Form the (cyclical, connected) Urquhart graph from the Delaunay
+    triangulation of given points.
+    """
+
+    tri = Delaunay(pts)
+
+    # Get unique edges in the triangulation
+    edges = set()
+
+    for i, j, k in tri.simplices:
+        edges.add(tuple(sorted((i, j))))
+        edges.add(tuple(sorted((i, k))))
+        edges.add(tuple(sorted((j, k))))
+
+    # Remove the longest edge from each triangle in the triangulation
+    for simplex in tri.simplices:
+        i, j, k = simplex
+        pi, pj, pk = pts[simplex]
+
+        argmax = np.argmax(np.linalg.norm((pi - pj, pi - pk, pj - pk), axis=1))
+
+        if argmax == 0:
+            u, v = i, j
+
+        elif argmax == 1:
+            u, v = i, k
+
+        else:
+            u, v = j, k
+
+        try:
+            edges.remove(tuple(sorted((u, v))))
+
+        except KeyError:
+            pass
+
+    # Return remaining edges as pairs of coordinates
+    return np.array([[pts[idx] for idx in edge] for edge in edges])
+
+
+# ------------------------------------------------------------------------------
+# MARK: any_intersections
+
+def any_intersections(p1: ndarray, p2: ndarray, edges: ndarray) -> bool:
+    """Check for intersections between a segment and a set of edges."""
+
+    return any(intersection(p1, p2, q1, q2) for q1, q2 in edges)
+
+
+# ------------------------------------------------------------------------------
+# MARK: intersection
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def intersection(p1: ndarray, p2: ndarray, q1: ndarray, q2: ndarray) -> bool:
+    """Check for an intersection between two line segments."""
+
+    # Null edge case
+    if q1[0] == q2[0] and q1[1] == q2[1]:
+        return False
+
+    o1 = orientation(p1, p2, q1)
+    o2 = orientation(p1, p2, q2)
+    o3 = orientation(q1, q2, p1)
+    o4 = orientation(q1, q2, p2)
+
+    return (
+        (o1 != o2 and o3 != o4) or
+        (o1 == 0 and on_segment(p1, p2, q1)) or
+        (o2 == 0 and on_segment(p1, p2, q2)) or
+        (o3 == 0 and on_segment(q1, q2, p1)) or
+        (o4 == 0 and on_segment(q1, q2, p2)))
+
+
+# ------------------------------------------------------------------------------
+# MARK: orientation
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def orientation(p: ndarray, q: ndarray, r: ndarray) -> int:
+    """Get the orientation (order class) of a pqr point triplet."""
+
+    val = ((q[1] - p[1]) * (r[0] - q[0])) - ((q[0] - p[0]) * (r[1] - q[1]))
+
+    return 1 if val > 0 else (2 if val < 0 else 0)
+
+
+# ------------------------------------------------------------------------------
+# MARK: on_segment
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def on_segment(p: ndarray, q: ndarray, r: ndarray) -> bool:
+    """Check if point r lies on the segment of points pq."""
+
+    return (
+        min(p[0], q[0]) <= r[0] <= max(p[0], q[0]) and
+        min(p[1], q[1]) <= r[1] <= max(p[1], q[1]))
+
+
+# ------------------------------------------------------------------------------
+# MARK: min_distance
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def min_distance(p: ndarray, q: ndarray, r: ndarray) -> float:
+    """Get the distance of point r to the segment of points pq."""
+
+    # Null edge case
+    if p[0] == q[0] and p[1] == q[1]:
+        return np.inf
+
+    pq = q - p
+    qr = r - q
+    pr = r - p
+
+    if np.dot(pq, qr) > 0.:
+        return np.linalg.norm(qr)
+
+    elif np.dot(pq, pr) < 0.:
+        return np.linalg.norm(pr)
+
+    return abs(pq[0]*pr[1] - pq[1]*pr[0]) / np.linalg.norm(pq)
+
+
+# ------------------------------------------------------------------------------
+# MARK: ray_trace
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def ray_trace(
+    i0: ndarray,
+    i1: ndarray,
+    p0: ndarray,
+    p1: ndarray,
+    grid_edge_pairs: ndarray
+) -> bool:
+    """
+    Bresenham line tracer checking for possible intersections on the go.
+
+    Expects an aux. array of `(N_rows+1, N_cols+1, 2 edges, 2 points, 2 coords)`,
+    where the 2 edges are the left (western) vertical and the upper (northern)
+    horizontal side (wall) of a cell in a grid of `N_rows` by `N_cols`,
+    and masked with zeros to denote a clearing.
+    """
+
+    # Starting and ending coordinates
+    x, y = i0[0], i0[1]
+    x1, y1 = i1[0], i1[1]
+
+    # Opposite-signed coordinate distances
+    dx = -abs(x1 - x)
+    dy = abs(y1 - y)
+
+    # Initial balanced incremental error
+    e = dx + dy
+
+    # Signed steps
+    sx = 1 if x < x1 else -1
+    sy = 1 if y < y1 else -1
+
+    # Cache to avoid repetition
+    cache = {}
+
+    # Trace until the end is reached
+    while x != x1 or y != y1:
+
+        # Broad sweep around regardless of movement
+        # TODO: Bresenham's path may differ from path covered by line btw. cont. pts.
+        x_next = min(20, x + sx)
+        y_next = min(20, y + sy)
+
+        x_prev = max(0, x - sx)
+        y_prev = max(0, y - sy)
+
+        for tx in (x_prev, x, x_next):
+            for ty in (y_prev, y, y_next):
+                for tc in (0, 1):
+                    key = (tx, ty, tc)
+
+                    if key in cache:
+                        continue
+
+                    cache[key] = False
+
+                    if intersection(p0, p1, grid_edge_pairs[tx, ty, tc, 0], grid_edge_pairs[tx, ty, tc, 1]):
+                        return False
+
+        # Infer movement from error, increment coordinates and error
+        e2 = 2*e
+
+        if e2 <= dy:
+            e += dy
+            x = x_next
+
+        if e2 >= dx:
+            e += dx
+            y = y_next
+
+    return True
+
+
+# ------------------------------------------------------------------------------
+# MARK: eval_line_of_sight
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def eval_line_of_sight(
+    origin_pos: ndarray,
+    target_pos: ndarray,
+    target_idcs: ndarray,
+    open_grid_delims: ndarray,
+    grid_edge_pairs: ndarray
+) -> ndarray:
+    """Run ray tracing from multiple origins to their targets."""
+
+    origin_idcs = np.digitize(origin_pos, open_grid_delims)
+
+    return np.array([
+        ray_trace(
+            origin_idcs[i],
+            target_idcs[i],
+            origin_pos[i],
+            target_pos[i],
+            grid_edge_pairs)
+        for i in range(len(origin_pos))])
+
+
+# ------------------------------------------------------------------------------
+# MARK: get_numba_dict
+
+def get_numba_dict(tuple_as_key: bool = False) -> 'dict[int | tuple[int, int], ndarray]':
+    """Create a typed dictionary for use in njit functions."""
+
+    key_type = types.UniTuple(types.int64, 2) if tuple_as_key else types.int64
+
+    return Dict.empty(key_type=key_type, value_type=types.int64[:])
+
+
+# ------------------------------------------------------------------------------
+# MARK: astar
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def astar(
+    graph: 'dict[int, ndarray]',
+    node_pos: ndarray,
+    entry_node: int,
+    exit_node: int
+) -> ndarray:
+    """A* with air distance heuristic returning a reversed path."""
+
+    entry_pos = node_pos[entry_node]
+    exit_pos = node_pos[exit_node]
+
+    # If no path can be found, use air path estimate
+    if len(graph) == 0:
+        return np.array([exit_node, entry_node])
+
+    # Set of discovered nodes (impl. as dict due to a persisting bug)
+    # See: https://github.com/numba/numba/issues/8627)
+    candidate_set = Dict.empty(key_type=types.int64, value_type=types.int64)
+    candidate_set[entry_node] = 0
+
+    # Map of immediately preceding node on the cheapest path to key
+    preceders = Dict.empty(key_type=types.int64, value_type=types.int64)
+
+    # Map of the cheapest path cost to key
+    g_scores = {entry_node: 0.}
+
+    # Map of the estimated cost for the cheapest path through key (default inf)
+    f_scores = {entry_node: np.linalg.norm(entry_pos - exit_pos)}
+
+    # Argmin should always exist, this just avoids it looking unbound
+    current_node = entry_node
+
+    # Repeat until exit is reached or nodes are exhausted
+    while len(candidate_set) > 0:
+
+        # Find node in candidate_set with the lowest f_score
+        min_score = np.inf
+
+        for key in candidate_set:
+            val = f_scores[key]
+
+            if val < min_score:
+                min_score = val
+                current_node = key
+
+        # Check terminal condition and reconstruct the path
+        if current_node == exit_node:
+            path = [current_node]
+
+            while current_node in preceders:
+                current_node = preceders[current_node]
+                path.append(current_node)
+
+            return np.array(path)
+
+        # Update neighbours
+        del candidate_set[current_node]
+        current_pos = node_pos[current_node]
+        current_g_score = g_scores[current_node]
+
+        for neigh_node in graph[current_node]:
+            neigh_pos = node_pos[neigh_node]
+
+            old_g_score = g_scores[neigh_node] if neigh_node in g_scores else np.inf
+            new_g_score = current_g_score + np.linalg.norm(current_pos - neigh_pos)
+
+            if new_g_score < old_g_score:
+                g_scores[neigh_node] = new_g_score
+                f_scores[neigh_node] = new_g_score + np.linalg.norm(neigh_pos - exit_pos)
+                preceders[neigh_node] = current_node
+
+                candidate_set[neigh_node] = 0
+
+    # If no path can be found, use air path estimate
+    return np.array([exit_node, entry_node])
+
+
+# ------------------------------------------------------------------------------
+# MARK: get_cached_paths
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def get_cached_paths(
+    origin_pos: ndarray,
+    target_pos: ndarray,
+    sight_mask: ndarray,
+    graph: 'dict[int, ndarray]',
+    path_map: 'dict[tuple[int, int], ndarray]',
+    open_grid_delims: ndarray,
+    grid_square_centres: ndarray,
+    grid_edge_pairs: ndarray
+) -> 'tuple[ndarray, ndarray]':
+    """
+    Estimate path length and starting direction from valid starting points
+    to target end points based on computed and cached A* reference paths.
+    """
+
+    # Compute air distance to goal
+    diffs = target_pos - origin_pos
+    dists = np.sqrt(np.sum(diffs**2, axis=1))
+    dirs = diffs / np.expand_dims(dists, 1)
+
+    # Check for points without their goal in sight
+    remaining_pt_idcs = np.where(~sight_mask)[0]
+
+    if len(remaining_pt_idcs) == 0:
+        return dists, dirs
+
+    # For remaining points, find entry and exit nodes (bounding squares)
+    origin_pos = origin_pos[remaining_pt_idcs]
+    target_pos = target_pos[remaining_pt_idcs]
+
+    entry_idcs = np.digitize(origin_pos, open_grid_delims)
+    exit_idcs = np.digitize(target_pos, open_grid_delims)
+
+    # Node IDs are flattened grid indices
+    n_squares_per_row = len(open_grid_delims) + 1
+    entry_nodes = n_squares_per_row * entry_idcs[:, 0] + entry_idcs[:, 1]
+    exit_nodes = n_squares_per_row * exit_idcs[:, 0] + exit_idcs[:, 1]
+
+    # Get or compute astar path from a shared dict, then prune and eval wrt. local positions
+    for i, pt_i in enumerate(remaining_pt_idcs):
+        entry_node = entry_nodes[i]
+        exit_node = exit_nodes[i]
+        path_key = entry_node, exit_node
+
+        if path_key in path_map:
+            path = path_map[path_key]
+
+        else:
+            path = astar(graph, grid_square_centres, entry_node, exit_node)
+
+            path = prune_path_backward(
+                path,
+                exit_idcs[i],
+                target_pos[i],
+                grid_square_centres,
+                grid_edge_pairs,
+                n_squares_per_row)
+
+            path_map[path_key] = path
+
+            # Add entries for all cells on the path as starting nodes
+            for j in range(1, len(path)-1):
+                path_key = path[j], exit_node
+
+                if path_key not in path_map:
+                    path_map[path_key] = path[:j+1]
+
+        path = prune_path_forward(
+            path,
+            entry_idcs[i],
+            origin_pos[i],
+            grid_square_centres,
+            grid_edge_pairs,
+            n_squares_per_row)
+
+        dists[pt_i], dirs[pt_i] = eval_path(
+            path,
+            origin_pos[i],
+            target_pos[i],
+            grid_square_centres)
+
+    return dists, dirs
+
+
+# ------------------------------------------------------------------------------
+# MARK: eval_path
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def eval_path(
+    path: ndarray,
+    origin_pos: ndarray,
+    target_pos: ndarray,
+    grid_square_centres: ndarray
+) -> 'tuple[float, ndarray]':
+    """
+    Sum the distances between consecutive points on a path from the origin
+    to the target and get a starting direction.
+    """
+
+    # Convert to coordinates
+    path_pts = grid_square_centres[path]
+
+    # Distances between points on the path
+    if len(path) == 1:
+        dist_sum = 0.
+
+    else:
+        diffs = path_pts[:-1] - path_pts[1:]
+        dist_sum = np.sum(np.sqrt(np.sum(diffs**2, axis=1)))
+
+    # Starting direction
+    diff_to_next = path_pts[-1] - origin_pos
+    dir_to_next = diff_to_next / np.linalg.norm(diff_to_next)
+
+    # Distances wrt. entry and exit nodes
+    dist_sum += np.linalg.norm(diff_to_next) + np.linalg.norm(target_pos - path_pts[0])
+
+    return dist_sum, dir_to_next
+
+
+# ------------------------------------------------------------------------------
+# MARK: prune_path_forward
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def prune_path_forward(
+    path: ndarray,
+    entry_idcs: ndarray,
+    origin_pos: ndarray,
+    grid_square_centres: ndarray,
+    grid_edge_pairs: ndarray,
+    n_squares_per_row: int
+) -> ndarray:
+    """
+    Once a path is constructed, a line can be traced from the origin
+    to succeeding points and they are removed if sight is established,
+    effectively shortening the path.
+    """
+
+    entry_ptr = len(path)-1
+
+    node_idcs = np.array([0, 0], dtype=np.int64)
+
+    for ptr in range(len(path)-2, -1, -1):
+        node_idx = path[ptr]
+        node_idcs[0] = node_idx // n_squares_per_row
+        node_idcs[1] = node_idx % n_squares_per_row
+        node_pos = grid_square_centres[node_idx]
+
+        if ray_trace(entry_idcs, node_idcs, origin_pos, node_pos, grid_edge_pairs):
+            entry_ptr = ptr
+
+        else:
+            break
+
+    return path[:entry_ptr+1]
+
+
+# ------------------------------------------------------------------------------
+# MARK: prune_path_backward
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def prune_path_backward(
+    path: ndarray,
+    exit_idcs: ndarray,
+    target_pos: ndarray,
+    grid_square_centres: ndarray,
+    grid_edge_pairs: ndarray,
+    n_squares_per_row: int
+) -> ndarray:
+    """
+    Once a path is constructed, a line can be traced from the target
+    to preceding points and they are removed if sight is established,
+    effectively shortening the path.
+    """
+
+    exit_ptr = 0
+
+    node_idcs = np.array([0, 0], dtype=np.int64)
+
+    for ptr in range(1, len(path)):
+        node_idx = path[ptr]
+        node_idcs[0] = node_idx // n_squares_per_row
+        node_idcs[1] = node_idx % n_squares_per_row
+        node_pos = grid_square_centres[node_idx]
+
+        if ray_trace(exit_idcs, node_idcs, target_pos, node_pos, grid_edge_pairs):
+            exit_ptr = ptr
+
+        # No need to break, as target pos. within a cell does not change
+
+    return path[exit_ptr:]
+
+
+# --------------------------------------------------------------------------
+# MARK: read_texture_file
+
+def read_texture_file(pth: str, clr: bool = True) -> ndarray:
+    img = cv2.imread(pth, cv2.IMREAD_COLOR)[..., ::-1] if clr else cv2.imread(pth, cv2.IMREAD_GRAYSCALE)
+    img = cv2.resize(img, (256, 256), interpolation=cv2.INTER_AREA)
+
+    return np.flipud(img) / 255.
+
+
+# ------------------------------------------------------------------------------
+# MARK: warp_basic
+
+def warp_basic(img: ndarray, rng: np.random.Generator, out_shape: 'tuple[int, ...]' = None) -> ndarray:
+    h, w = img.shape[:2]
+
+    scale_xy = rng.uniform(1., 2.)
+    max_x = (scale_xy - 1.) * w / 2.
+    max_y = (scale_xy - 1.) * h / 2.
+
+    tx = rng.uniform(-max_x, max_x)
+    ty = rng.uniform(-max_y, max_y)
+
+    m = cv2.getRotationMatrix2D((w//2, h//2), rng.choice([0., 90., 180., -90.]), scale_xy)
+    m[0, 2] += tx
+    m[1, 2] += ty
+
+    if out_shape is not None:
+        h, w = out_shape[:2]
+
+    return cv2.warpAffine(img, m, (w, h), flags=cv2.INTER_LINEAR)
+
+
+# ------------------------------------------------------------------------------
+# MARK: warp_shear
+
+def warp_shear(img: ndarray, rng: np.random.Generator, out_shape: 'tuple[int, ...]' = None) -> ndarray:
+    h, w = img.shape[:2]
+
+    scale_x = rng.uniform(0.1, 1.)
+    scale_y = rng.uniform(0.1, 1.)
+
+    shear_x = rng.uniform(-0.5, 0.5)
+    shear_y = rng.uniform(-0.5, 0.5)
+
+    tx = rng.uniform(-w/4, w/4)
+    ty = rng.uniform(-h/4, h/4)
+
+    angle = rng.uniform(-np.pi, np.pi)
+    np_sin_angle = np.sin(angle)
+    np_cos_angle = np.cos(angle)
+
+    m = cv2.getRotationMatrix2D((w//2, h//2), angle*180./np.pi, 1.)
+    m[0, 0] = m[0, 0] * scale_x + shear_x * np_sin_angle
+    m[0, 1] = m[0, 1] * scale_y + shear_y * np_cos_angle
+    m[1, 0] = m[1, 0] * scale_x + shear_x * np_cos_angle
+    m[1, 1] = m[1, 1] * scale_y + shear_y * -np_sin_angle
+    m[0, 2] += tx
+    m[1, 2] += ty
+
+    if out_shape is not None:
+        h, w = out_shape[:2]
+
+    return cv2.warpAffine(img, m, (w, h), flags=cv2.INTER_LINEAR)

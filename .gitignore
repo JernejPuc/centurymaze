@@ -6,6 +6,9 @@ data/**
 !data/diablg3/
 !data/diablg3/meta.json
 !data/diablg3/model_012.pt
+!data/diablx40/
+!data/diablx40/meta.json
+!data/diablx40/model_012.pt
 !data/img_viewer_00.png
 !data/img_viewer_01.png
 !data/vid_00.mp4
@@ -17,4 +20,5 @@ pres
 runs
 src/mazebots/__pycache__
 src/mazebotsgen/__pycache__
+src/mazebotstex/__pycache__
 temp
