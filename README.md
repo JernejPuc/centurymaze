@@ -19,23 +19,26 @@ locating and sharing information on discovered objects
 should reduce the search times of the agents assigned to them
 and help everyone in the group in turn.
 
-We evaluate our methods on two variants of Century Maze:
+We evaluate our methods on three variants of Century Maze:
 1. The hand-designed prototype maze without textures or I/O imperfection
 emphasises visual clarity and limits the effect of confounding variables.
 2. Procedurally generated mazes with realistic textures,
 multiple scale configurations, layout randomisation, varying physical
 and lighting conditions, noised interactions, and imperfect communication
 present robustness challenges closer to practical settings.
+3. Procedurally generated mazes with high textural diversity,
+based on a larger set of augmented textures, require a more robust visual model
+that could function in both prior variants, as well as transfer to real-world conditions.
 
 
 ## Reinforcement Learning
 
-This repository includes a multi-agent reinforcement learning solution (currently under review)
+This repository includes a multi-agent reinforcement learning solution (currently awaiting publication)
 that is able to overcome the difficulties in the scale and complexity of Century Maze:
 - The base algorithm is a custom implementation of Proximal Policy Optimization (PPO, MAPPO),
 augmented with advantage decomposition (QPLEX, ACPPO).
 - Differentiable Inter-Agent Belief Learning (DIABL)
-is a self-supervised auxiliary task that facilitates the development of communication
+is a supervised auxiliary task that facilitates the development of communication
 by deterministically associating goal-oriented beliefs with remote observers
 through a differentiable communication channel.
 - Informative Event Replay (InfER) complements DIABL with a dedicated buffer
@@ -104,8 +107,8 @@ for all argument options.
 If you use or reference Century Maze, DIABL, or InfER in your work,
 please cite the following paper (under review):
 ```
-@article{puc2025centurymaze,
+@article{puc2026centurymaze,
  title={Century Maze: ...},
  author={Puc, Jernej and ...},
- year={2025}}
+ year={2026}}
 ```

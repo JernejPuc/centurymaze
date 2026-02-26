@@ -10,7 +10,7 @@ with open(os.path.join(os.path.dirname(__file__), 'requirements.txt'), 'r') as f
 
 setup(
     name='mazebots',
-    version='0.6.0',
+    version='1.0.0',
     description='MazeBots: Multi-Robot Maze Navigation',
     long_description=readme,
     long_description_content_type='text/markdown',
@@ -20,7 +20,7 @@ setup(
     license='MPL 2.0',
     classifiers=[
         'License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)',
-        'Development Status :: 4 - Beta',
+        'Development Status :: 7 - Inactive',
         'Environment :: Console',
         'Intended Audience :: Education',
         'Intended Audience :: Science/Research',
