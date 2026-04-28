@@ -5,7 +5,8 @@
 <img src="data/img_viewer_01.png" width="48%">
 </p>
 
-Century Maze is a virtual environment for multi-agent object-goal navigation,
+[Century Maze](https://ieeexplore.ieee.org/document/11456614)
+is a virtual environment for multi-agent object-goal navigation,
 characterised by a large explorable area with many visual embodied agents.
 It is designed to push the scalability and efficiency of cooperative multi-robot systems
 on a scale of over 100 robots by only permitting them to achieve
@@ -33,7 +34,8 @@ that could function in both prior variants, as well as transfer to real-world co
 
 ## Reinforcement Learning
 
-This repository includes a multi-agent reinforcement learning solution (currently awaiting publication)
+This repository includes
+[a multi-agent reinforcement learning solution](https://ieeexplore.ieee.org/document/11456614)
 that is able to overcome the difficulties in the scale and complexity of Century Maze:
 - The base algorithm is a custom implementation of Proximal Policy Optimization (PPO, MAPPO),
 augmented with advantage decomposition (QPLEX, ACPPO).
@@ -105,10 +107,15 @@ for all argument options.
 ## Citation
 
 If you use or reference Century Maze, DIABL, or InfER in your work,
-please cite the following paper (under review):
+please cite [the following paper](https://ieeexplore.ieee.org/document/11456614):
 ```
-@article{puc2026centurymaze,
- title={Century Maze: ...},
- author={Puc, Jernej and ...},
- year={2026}}
+@article{puc2026,
+ author={Puc, Jernej and Škulj, Gašper and Pleterski, Jan and Podržaj, Primož and Vrabič, Rok},
+ journal={IEEE Transactions on Robotics}, 
+ title={Interagent Beliefs for Learning to Communicate in Large-Scale Multirobot Visual Object Search}, 
+ year={2026},
+ volume={42},
+ pages={1729-1748},
+ doi={10.1109/TRO.2026.3677944},
+ ISSN={1941-0468}}
 ```

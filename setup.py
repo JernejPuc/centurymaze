@@ -9,12 +9,12 @@ with open(os.path.join(os.path.dirname(__file__), 'requirements.txt'), 'r') as f
     requirements = f.read().splitlines()
 
 setup(
-    name='mazebots',
+    name='centurymaze',
     version='1.0.0',
-    description='MazeBots: Multi-Robot Maze Navigation',
+    description='CenturyMaze: Multi-Robot Maze Navigation',
     long_description=readme,
     long_description_content_type='text/markdown',
-    url='https://github.com/jernejpuc/mazebots',
+    url='https://github.com/jernejpuc/centurymaze',
     author='Jernej Puc',
     author_email='jernej.puc@fs.uni-lj.si',
     license='MPL 2.0',
